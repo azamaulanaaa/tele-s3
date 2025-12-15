@@ -8,3 +8,4 @@ clap = { version = "4.5.53", features = ["derive"] }
 thiserror = "2.0.17"
 grammers-client = "0.8.1"
 grammers-mtsender = "0.8.1"
+futures = "0.3.31"
