@@ -1,12 +1,17 @@
 use std::{fmt::Display, path::Path, sync::Arc};
 
 use futures::Stream;
-use grammers_client::{Client, session::storages::SqliteSession, types::User};
+use grammers_client::{
+    Client, InputMessage,
+    session::{defs::PeerRef, storages::SqliteSession},
+    types::User,
+};
 pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
     types::Media,
 };
 use grammers_mtsender::SenderPool;
+use tokio::io::AsyncRead;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrammersErrorKind {
@@ -18,6 +23,8 @@ pub enum GrammersErrorKind {
     InvalidConfig(&'static str),
     #[error("Download: {0}")]
     Download(&'static str),
+    #[error("Upload: {0}")]
+    Upload(&'static str),
     #[error("Other: {0}")]
     Other(&'static str),
 }
@@ -141,5 +148,40 @@ impl Grammers {
         });
 
         Ok(media_download)
+    }
+
+    pub async fn upload_media<S: AsyncRead + Unpin, C: Into<PeerRef>>(
+        &self,
+        stream: &mut S,
+        size: usize,
+        name: String,
+        peer: C,
+    ) -> Result<Media, GrammersError> {
+        let uploaded = self
+            .client
+            .upload_stream(stream, size, name)
+            .await
+            .map_err(|e| GrammersError {
+                kind: GrammersErrorKind::Upload("Unable to upload file"),
+                source: Some(Box::new(e)),
+            })?;
+
+        let message = InputMessage::new().file(uploaded).silent(true);
+
+        let message = self
+            .client
+            .send_message(peer, message)
+            .await
+            .map_err(|e| GrammersError {
+                kind: GrammersErrorKind::Upload("Unable to send message"),
+                source: Some(Box::new(e)),
+            })?;
+
+        let media = message.media().ok_or(GrammersError {
+            kind: GrammersErrorKind::Upload("Unable to find media from message sent"),
+            source: None,
+        })?;
+
+        Ok(media)
     }
 }
