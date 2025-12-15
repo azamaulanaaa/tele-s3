@@ -3,6 +3,7 @@ use std::{fmt::Display, path::Path, sync::Arc};
 use futures::Stream;
 use grammers_client::{
     Client, InputMessage,
+    client::updates::UpdateStream,
     session::{defs::PeerRef, storages::SqliteSession},
     types::{Media, User},
 };
@@ -10,8 +11,8 @@ pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
     types::media::Document,
 };
-use grammers_mtsender::SenderPool;
-use tokio::io::AsyncRead;
+use grammers_mtsender::{SenderPool, SenderPoolHandle};
+use tokio::{io::AsyncRead, task::JoinHandle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrammersErrorKind {
@@ -44,8 +45,10 @@ impl Display for GrammersError {
 
 pub struct Grammers {
     session: Arc<SqliteSession>,
-    pool: SenderPool,
+    sender_pool_handle: SenderPoolHandle,
+    sender_pool_runner_handle: JoinHandle<()>,
     client: Client,
+    update_stream: UpdateStream,
     user: Option<User>,
 }
 
@@ -64,10 +67,20 @@ impl Grammers {
 
         let client = Client::new(&pool);
 
+        let SenderPool {
+            runner,
+            handle,
+            updates,
+        } = pool;
+        let sender_pool_runner_handle = tokio::spawn(async { runner.run().await });
+        let update_stream = client.stream_updates(updates, Default::default());
+
         Ok(Self {
             session,
-            pool,
+            sender_pool_handle: handle,
+            sender_pool_runner_handle,
             client,
+            update_stream,
             user: None,
         })
     }
@@ -92,6 +105,11 @@ impl Grammers {
         }
 
         Ok(grammers)
+    }
+
+    pub async fn close(self: Self) {
+        self.sender_pool_handle.quit();
+        let _ = self.sender_pool_runner_handle.await;
     }
 
     pub fn is_authorized(&self) -> bool {
