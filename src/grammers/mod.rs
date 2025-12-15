@@ -4,11 +4,11 @@ use futures::Stream;
 use grammers_client::{
     Client, InputMessage,
     session::{defs::PeerRef, storages::SqliteSession},
-    types::User,
+    types::{Media, User},
 };
 pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
-    types::Media,
+    types::media::Document,
 };
 use grammers_mtsender::SenderPool;
 use tokio::io::AsyncRead;
@@ -117,9 +117,9 @@ impl Grammers {
         Ok(())
     }
 
-    pub async fn download_media(
+    pub async fn download_document(
         &self,
-        media: &Media,
+        document: &Document,
         chunk_size: i32,
     ) -> Result<impl Stream<Item = Result<Vec<u8>, GrammersError>>, GrammersError> {
         if !(chunk_size >= MIN_CHUNK_SIZE
@@ -132,7 +132,7 @@ impl Grammers {
             });
         }
 
-        let download_iter = self.client.iter_download(media).chunk_size(chunk_size);
+        let download_iter = self.client.iter_download(document).chunk_size(chunk_size);
 
         let media_download = futures::stream::unfold(download_iter, |mut this| async move {
             let result = this
@@ -150,13 +150,13 @@ impl Grammers {
         Ok(media_download)
     }
 
-    pub async fn upload_media<S: AsyncRead + Unpin, C: Into<PeerRef>>(
+    pub async fn upload_document<S: AsyncRead + Unpin, C: Into<PeerRef>>(
         &self,
         stream: &mut S,
         size: usize,
         name: String,
         peer: C,
-    ) -> Result<Media, GrammersError> {
+    ) -> Result<Document, GrammersError> {
         let uploaded = self
             .client
             .upload_stream(stream, size, name)
@@ -182,6 +182,16 @@ impl Grammers {
             source: None,
         })?;
 
-        Ok(media)
+        let document = match media {
+            Media::Document(v) => v,
+            _ => {
+                return Err(GrammersError {
+                    kind: GrammersErrorKind::Upload("The media is not a document"),
+                    source: None,
+                });
+            }
+        };
+
+        Ok(document)
     }
 }
