@@ -1022,7 +1022,6 @@ dependencies = [
  "clap",
  "grammers-client",
  "grammers-mtsender",
- "grammers-session",
  "thiserror",
 ]
 

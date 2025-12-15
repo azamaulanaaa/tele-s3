@@ -1,8 +1,7 @@
 use std::{fmt::Display, path::Path, sync::Arc};
 
-use grammers_client::{Client, types::User};
+use grammers_client::{Client, session::storages::SqliteSession, types::User};
 use grammers_mtsender::SenderPool;
-use grammers_session::storages::SqliteSession;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrammersErrorKind {
