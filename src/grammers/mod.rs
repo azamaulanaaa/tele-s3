@@ -107,6 +107,11 @@ impl Grammers {
         Ok(grammers)
     }
 
+    pub async fn close(self: Self) {
+        self.sender_pool_handle.quit();
+        let _ = self.sender_pool_runner_handle.await;
+    }
+
     pub fn is_authorized(&self) -> bool {
         self.user.is_some()
     }
