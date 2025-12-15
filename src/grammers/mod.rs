@@ -1,6 +1,11 @@
 use std::{fmt::Display, path::Path, sync::Arc};
 
+use futures::Stream;
 use grammers_client::{Client, session::storages::SqliteSession, types::User};
+pub use grammers_client::{
+    client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
+    types::Media,
+};
 use grammers_mtsender::SenderPool;
 
 #[derive(Debug, thiserror::Error)]
@@ -9,6 +14,10 @@ pub enum GrammersErrorKind {
     SessionFile(&'static str),
     #[error("Authentication: {0}")]
     Authentication(&'static str),
+    #[error("Invalid Config: {0}")]
+    InvalidConfig(&'static str),
+    #[error("Download: {0}")]
+    Download(&'static str),
     #[error("Other: {0}")]
     Other(&'static str),
 }
@@ -99,5 +108,38 @@ impl Grammers {
         self.user = Some(user);
 
         Ok(())
+    }
+
+    pub async fn download_media(
+        &self,
+        media: &Media,
+        chunk_size: i32,
+    ) -> Result<impl Stream<Item = Result<Vec<u8>, GrammersError>>, GrammersError> {
+        if !(chunk_size >= MIN_CHUNK_SIZE
+            && chunk_size <= MAX_CHUNK_SIZE
+            && chunk_size % MIN_CHUNK_SIZE == 0)
+        {
+            return Err(GrammersError {
+                kind: GrammersErrorKind::InvalidConfig("Invalid download chunk size"),
+                source: None,
+            });
+        }
+
+        let download_iter = self.client.iter_download(media).chunk_size(chunk_size);
+
+        let media_download = futures::stream::unfold(download_iter, |mut this| async move {
+            let result = this
+                .next()
+                .await
+                .map_err(|e| GrammersError {
+                    kind: GrammersErrorKind::Download("Something wrong"),
+                    source: Some(Box::new(e)),
+                })
+                .transpose();
+
+            result.map(|v| (v, this))
+        });
+
+        Ok(media_download)
     }
 }
