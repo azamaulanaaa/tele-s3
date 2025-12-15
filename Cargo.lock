@@ -1095,6 +1095,7 @@ dependencies = [
  "grammers-client",
  "grammers-mtsender",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
