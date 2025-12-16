@@ -5,7 +5,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "channel_state")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub peer_id: i32,
+    pub peer_id: i64,
     pub pts: i32,
 }
 

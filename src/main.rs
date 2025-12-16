@@ -5,7 +5,6 @@ use clap::Parser;
 use crate::grammers::Grammers;
 
 mod config;
-mod database;
 mod grammers;
 
 #[derive(Debug, Clone, Parser)]

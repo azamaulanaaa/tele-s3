@@ -5,9 +5,9 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "peer_info")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub peer_id: i32,
-    pub hash: Option<i32>,
-    pub subtype: Option<i32>,
+    pub peer_id: i64,
+    pub hash: Option<i64>,
+    pub subtype: Option<u8>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
