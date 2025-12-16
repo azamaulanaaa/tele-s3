@@ -4,7 +4,7 @@ use futures::Stream;
 use grammers_client::{
     Client, InputMessage,
     client::updates::UpdateStream,
-    session::storages::SqliteSession,
+    session::storages::MemorySession,
     types::{Media, User},
 };
 pub use grammers_client::{
@@ -46,7 +46,7 @@ impl Display for GrammersError {
 }
 
 pub struct Grammers {
-    session: Arc<SqliteSession>,
+    session: Arc<MemorySession>,
     sender_pool_handle: SenderPoolHandle,
     sender_pool_runner_handle: JoinHandle<()>,
     client: Client,
@@ -57,10 +57,7 @@ pub struct Grammers {
 impl Grammers {
     fn new(api_id: i32, session_file: &Path) -> Result<Self, GrammersError> {
         let session = {
-            let session = SqliteSession::open(session_file).map_err(|e| GrammersError {
-                kind: GrammersErrorKind::SessionFile("Something wrong with it"),
-                source: Some(Box::new(e)),
-            })?;
+            let session = MemorySession::default();
 
             Arc::new(session)
         };
