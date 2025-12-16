@@ -3,6 +3,8 @@ use std::ops::Deref;
 use sea_orm::DatabaseConnection;
 pub use sea_orm::DbErr;
 
+pub mod entity;
+
 pub struct Database {
     inner: DatabaseConnection,
 }
@@ -14,6 +16,18 @@ impl Database {
         Self::sync_grammers_table(&connection).await?;
 
         Ok(Self { inner: connection })
+    }
+
+    async fn sync_grammers_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
+        connection
+            .get_schema_builder()
+            .register(entity::dc_home::Entity)
+            .register(entity::dc_option::Entity)
+            .register(entity::peer_info::Entity)
+            .register(entity::update_state::Entity)
+            .register(entity::channel_state::Entity)
+            .apply(connection)
+            .await
     }
 }
 
