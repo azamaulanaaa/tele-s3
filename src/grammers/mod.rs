@@ -36,7 +36,7 @@ pub enum GrammersErrorKind {
 pub struct GrammersError {
     pub kind: GrammersErrorKind,
     #[source]
-    pub source: Option<Box<dyn std::error::Error>>,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl Display for GrammersError {
@@ -121,11 +121,11 @@ impl Grammers {
     pub async fn authenticate(
         &mut self,
         bot_token: &str,
-        bot_api_hash: &str,
+        api_hash: &str,
     ) -> Result<(), GrammersError> {
         let user = self
             .client
-            .bot_sign_in(bot_token, bot_api_hash)
+            .bot_sign_in(bot_token, api_hash)
             .await
             .map_err(|e| GrammersError {
                 kind: GrammersErrorKind::Authentication("Something wrong with it"),
