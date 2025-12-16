@@ -5,7 +5,7 @@ use grammers_client::{
     Client, InputMessage,
     client::updates::UpdateStream,
     session::{defs::PeerRef, storages::SqliteSession},
-    types::{Media, User},
+    types::{Media, Peer, User},
 };
 pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
@@ -26,6 +26,8 @@ pub enum GrammersErrorKind {
     Download(&'static str),
     #[error("Upload: {0}")]
     Upload(&'static str),
+    #[error("Peer Resolve: {0}")]
+    PeerResolve(&'static str),
     #[error("Other: {0}")]
     Other(&'static str),
 }
@@ -211,5 +213,21 @@ impl Grammers {
         };
 
         Ok(document)
+    }
+
+    pub async fn get_peer_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<Peer>, GrammersError> {
+        let peer = self
+            .client
+            .resolve_username(username)
+            .await
+            .map_err(|e| GrammersError {
+                kind: GrammersErrorKind::PeerResolve("Unable to resolve per by username"),
+                source: Some(Box::new(e)),
+            })?;
+
+        Ok(peer)
     }
 }
