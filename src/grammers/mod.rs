@@ -14,6 +14,8 @@ pub use grammers_client::{
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
 use tokio::{io::AsyncRead, task::JoinHandle};
 
+mod session;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GrammersErrorKind {
     #[error("Session file: {0}")]
