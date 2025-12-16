@@ -2693,6 +2693,7 @@ name = "tele-s3"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "futures",
  "grammers-client",
