@@ -1,10 +1,9 @@
-use std::{fmt::Display, path::Path, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 
 use futures::Stream;
 use grammers_client::{
     Client, InputMessage,
     client::updates::UpdateStream,
-    session::storages::MemorySession,
     types::{Media, User},
 };
 pub use grammers_client::{
@@ -12,14 +11,15 @@ pub use grammers_client::{
     types::{Peer, media::Document},
 };
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
+use sea_orm::DatabaseConnection;
 use tokio::{io::AsyncRead, task::JoinHandle};
 
 mod session;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrammersErrorKind {
-    #[error("Session file: {0}")]
-    SessionFile(&'static str),
+    #[error("Session Storage: {0}")]
+    SessionStorage(&'static str),
     #[error("Authentication: {0}")]
     Authentication(&'static str),
     #[error("Invalid Config: {0}")]
@@ -48,7 +48,7 @@ impl Display for GrammersError {
 }
 
 pub struct Grammers {
-    session: Arc<MemorySession>,
+    session: Arc<session::SessionStorage>,
     sender_pool_handle: SenderPoolHandle,
     sender_pool_runner_handle: JoinHandle<()>,
     client: Client,
@@ -57,9 +57,14 @@ pub struct Grammers {
 }
 
 impl Grammers {
-    fn new(api_id: i32, session_file: &Path) -> Result<Self, GrammersError> {
+    pub async fn init(api_id: i32, connection: DatabaseConnection) -> Result<Self, GrammersError> {
         let session = {
-            let session = MemorySession::default();
+            let session = session::SessionStorage::init(connection)
+                .await
+                .map_err(|e| GrammersError {
+                    kind: GrammersErrorKind::SessionStorage("unable to initiate session storage"),
+                    source: Some(Box::new(e)),
+                })?;
 
             Arc::new(session)
         };
@@ -76,36 +81,32 @@ impl Grammers {
         let sender_pool_runner_handle = tokio::spawn(async { runner.run().await });
         let update_stream = client.stream_updates(updates, Default::default());
 
+        let user = {
+            let is_authorized = client.is_authorized().await.map_err(|e| GrammersError {
+                kind: GrammersErrorKind::Other("Unable to check authorization"),
+                source: Some(Box::new(e)),
+            })?;
+
+            if is_authorized {
+                let user = client.get_me().await.map_err(|e| GrammersError {
+                    kind: GrammersErrorKind::Other("Unable to get user as me"),
+                    source: Some(Box::new(e)),
+                })?;
+
+                Some(user)
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             session,
             sender_pool_handle: handle,
             sender_pool_runner_handle,
             client,
             update_stream,
-            user: None,
+            user,
         })
-    }
-
-    pub async fn init(api_id: i32, session_file: &Path) -> Result<Self, GrammersError> {
-        let mut grammers = Self::new(api_id, session_file)?;
-
-        let is_authorized = grammers
-            .client
-            .is_authorized()
-            .await
-            .map_err(|e| GrammersError {
-                kind: GrammersErrorKind::Other("Unable to check authorization"),
-                source: Some(Box::new(e)),
-            })?;
-        if is_authorized {
-            let user = grammers.client.get_me().await.map_err(|e| GrammersError {
-                kind: GrammersErrorKind::Other("Unable to get user as me"),
-                source: Some(Box::new(e)),
-            })?;
-            grammers.user = Some(user);
-        }
-
-        Ok(grammers)
     }
 
     pub async fn close(self: Self) {
