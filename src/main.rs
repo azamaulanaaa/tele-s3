@@ -2,6 +2,8 @@ use std::path::Path;
 
 use clap::Parser;
 
+use crate::grammers::Grammers;
+
 mod config;
 mod grammers;
 
@@ -12,7 +14,8 @@ struct Args {
     config: String,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let config = {
@@ -22,7 +25,15 @@ fn main() -> anyhow::Result<()> {
         config
     };
 
-    println!("{:?}", config);
+    let _grammers = {
+        let session_path = Path::new(&config.session_file);
+        let mut grammers = Grammers::init(config.api_id, &session_path).await?;
+        grammers
+            .authenticate(&config.bot_token, &config.api_hash)
+            .await?;
+
+        grammers
+    };
 
     Ok(())
 }
