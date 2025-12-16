@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use clap::Parser;
+use sea_orm::Database;
 
 use crate::grammers::Grammers;
 
 mod config;
-mod database;
 mod grammers;
 
 #[derive(Debug, Clone, Parser)]
@@ -26,9 +26,10 @@ async fn main() -> anyhow::Result<()> {
         config
     };
 
+    let db = Database::connect(config.database_uri).await?;
+
     let _grammers = {
-        let session_path = Path::new(&config.session_file);
-        let mut grammers = Grammers::init(config.api_id, &session_path).await?;
+        let mut grammers = Grammers::init(config.api_id, db).await?;
         grammers
             .authenticate(&config.bot_token, &config.api_hash)
             .await?;

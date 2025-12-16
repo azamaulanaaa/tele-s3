@@ -26,7 +26,7 @@ pub struct Config {
     pub api_id: i32,
     pub api_hash: String,
     pub bot_token: String,
-    pub session_file: String,
+    pub database_uri: String,
 }
 
 impl TryFrom<&Path> for Config {
