@@ -36,7 +36,7 @@ pub enum GrammersErrorKind {
 pub struct GrammersError {
     pub kind: GrammersErrorKind,
     #[source]
-    pub source: Option<Box<dyn std::error::Error>>,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl Display for GrammersError {
