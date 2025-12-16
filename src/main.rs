@@ -1,5 +1,6 @@
 use clap::Parser;
 
+mod config;
 mod grammers;
 
 #[derive(Debug, Clone, Parser)]
