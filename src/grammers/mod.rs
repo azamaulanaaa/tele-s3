@@ -4,12 +4,12 @@ use futures::Stream;
 use grammers_client::{
     Client, InputMessage,
     client::updates::UpdateStream,
-    session::{defs::PeerRef, storages::SqliteSession},
-    types::{Media, Peer, User},
+    session::storages::SqliteSession,
+    types::{Media, User},
 };
 pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
-    types::media::Document,
+    types::{Peer, media::Document},
 };
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
 use tokio::{io::AsyncRead, task::JoinHandle};
@@ -170,12 +170,12 @@ impl Grammers {
         Ok(media_download)
     }
 
-    pub async fn upload_document<S: AsyncRead + Unpin, C: Into<PeerRef>>(
+    pub async fn upload_document<S: AsyncRead + Unpin>(
         &self,
         stream: &mut S,
         size: usize,
         name: String,
-        peer: C,
+        peer: Peer,
     ) -> Result<Document, GrammersError> {
         let uploaded = self
             .client
