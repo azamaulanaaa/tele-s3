@@ -13,3 +13,9 @@ tokio = { version = "1.48.0", features = ["io-util", "rt-multi-thread"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9.8"
 anyhow = "1.0.100"
+sea-orm = { version = "2.0.0-rc", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+
+[patch.crates-io]
+grammers-client = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-client" }
+grammers-mtsender = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-mtsender" }
+grammers-session = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-session" }
