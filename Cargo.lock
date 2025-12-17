@@ -2927,6 +2927,7 @@ dependencies = [
  "futures",
  "grammers-client",
  "grammers-mtsender",
+ "mime",
  "s3s",
  "sea-orm",
  "serde",
