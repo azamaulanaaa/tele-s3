@@ -1,17 +1,14 @@
 use std::{fmt::Display, sync::Arc};
 
 use futures::Stream;
-use grammers_client::{
-    Client, InputMessage,
-    client::updates::UpdateStream,
-    types::{Media, User},
-};
+use grammers_client::{Client, InputMessage, client::updates::UpdateStream, types::User};
 pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
-    types::{Peer, media::Document},
+    types::Peer,
 };
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
 use sea_orm::DatabaseConnection;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncRead, task::JoinHandle};
 
 mod session;
@@ -30,6 +27,8 @@ pub enum GrammersErrorKind {
     Upload(&'static str),
     #[error("Peer Resolve: {0}")]
     PeerResolve(&'static str),
+    #[error("Message Resolve: {0}")]
+    MsgResolve(&'static str),
     #[error("Other: {0}")]
     Other(&'static str),
 }
@@ -45,6 +44,11 @@ impl Display for GrammersError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.kind)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageId {
+    id: i32,
 }
 
 pub struct Grammers {
@@ -139,7 +143,8 @@ impl Grammers {
 
     pub async fn download_document(
         &self,
-        document: &Document,
+        peer: Peer,
+        message_id: MessageId,
         chunk_size: i32,
     ) -> Result<impl Stream<Item = Result<Vec<u8>, GrammersError>>, GrammersError> {
         if !(chunk_size >= MIN_CHUNK_SIZE
@@ -152,7 +157,28 @@ impl Grammers {
             });
         }
 
-        let download_iter = self.client.iter_download(document).chunk_size(chunk_size);
+        let message = self
+            .client
+            .get_messages_by_id(peer, &[message_id.id])
+            .await
+            .map_err(|e| GrammersError {
+                kind: GrammersErrorKind::MsgResolve("Unable to get the message"),
+                source: Some(Box::new(e)),
+            })?
+            .get(0)
+            .cloned()
+            .flatten()
+            .ok_or(GrammersError {
+                kind: GrammersErrorKind::MsgResolve("message does not found"),
+                source: None,
+            })?;
+
+        let document = message.media().ok_or(GrammersError {
+            kind: GrammersErrorKind::MsgResolve("media does not found in the message"),
+            source: None,
+        })?;
+
+        let download_iter = self.client.iter_download(&document).chunk_size(chunk_size);
 
         let media_download = futures::stream::unfold(download_iter, |mut this| async move {
             let result = this
@@ -176,7 +202,7 @@ impl Grammers {
         size: usize,
         name: String,
         peer: Peer,
-    ) -> Result<Document, GrammersError> {
+    ) -> Result<MessageId, GrammersError> {
         let uploaded = self
             .client
             .upload_stream(stream, size, name)
@@ -190,29 +216,18 @@ impl Grammers {
 
         let message = self
             .client
-            .send_message(peer, message)
+            .send_message(peer.clone(), message)
             .await
             .map_err(|e| GrammersError {
                 kind: GrammersErrorKind::Upload("Unable to send message"),
                 source: Some(Box::new(e)),
             })?;
 
-        let media = message.media().ok_or(GrammersError {
-            kind: GrammersErrorKind::Upload("Unable to find media from message sent"),
-            source: None,
-        })?;
-
-        let document = match media {
-            Media::Document(v) => v,
-            _ => {
-                return Err(GrammersError {
-                    kind: GrammersErrorKind::Upload("The media is not a document"),
-                    source: None,
-                });
-            }
+        let message_id = MessageId {
+            id: message.id(),
         };
 
-        Ok(document)
+        Ok(message_id)
     }
 
     pub async fn get_peer_by_username(
