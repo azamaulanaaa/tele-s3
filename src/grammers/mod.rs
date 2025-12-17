@@ -147,7 +147,10 @@ impl Grammers {
         peer: Peer,
         message_id: MessageId,
         chunk_size: i32,
-    ) -> Result<impl Stream<Item = Result<Vec<u8>, GrammersError>>, GrammersError> {
+    ) -> Result<
+        impl Stream<Item = Result<Vec<u8>, GrammersError>> + Send + Sync + 'static,
+        GrammersError,
+    > {
         if !(chunk_size >= MIN_CHUNK_SIZE
             && chunk_size <= MAX_CHUNK_SIZE
             && chunk_size % MIN_CHUNK_SIZE == 0)
@@ -179,7 +182,8 @@ impl Grammers {
             source: None,
         })?;
 
-        let download_iter = self.client.iter_download(&document).chunk_size(chunk_size);
+        let client = self.client.clone();
+        let download_iter = client.iter_download(&document).chunk_size(chunk_size);
 
         let media_download = futures::stream::unfold(download_iter, |mut this| async move {
             let result = this
