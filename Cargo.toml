@@ -15,6 +15,7 @@ toml = "0.9.8"
 anyhow = "1.0.100"
 sea-orm = { version = "2.0.0-rc", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 async-trait = "0.1.89"
+chrono = "0.4.42"
 
 [patch.crates-io]
 grammers-client = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-client" }
