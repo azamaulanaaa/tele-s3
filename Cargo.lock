@@ -2701,6 +2701,7 @@ dependencies = [
  "grammers-mtsender",
  "sea-orm",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",
