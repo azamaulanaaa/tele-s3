@@ -7,6 +7,7 @@ use crate::grammers::Grammers;
 
 mod config;
 mod grammers;
+mod s3;
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about)]
