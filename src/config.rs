@@ -27,6 +27,7 @@ pub struct Config {
     pub api_hash: String,
     pub bot_token: String,
     pub database_uri: String,
+    pub listen_port: u16,
 }
 
 impl TryFrom<&Path> for Config {

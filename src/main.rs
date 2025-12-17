@@ -1,9 +1,14 @@
 use std::path::Path;
 
 use clap::Parser;
+use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use sea_orm::Database;
+use tokio::net::TcpListener;
 
-use crate::grammers::Grammers;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+
+use crate::{grammers::Grammers, s3::TeleS3};
 
 mod config;
 mod grammers;
@@ -29,14 +34,41 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Database::connect(config.database_uri).await?;
 
-    let _grammers = {
-        let mut grammers = Grammers::init(config.api_id, db).await?;
+    let grammers = {
+        let mut grammers = Grammers::init(config.api_id, db.clone()).await?;
         grammers
             .authenticate(&config.bot_token, &config.api_hash)
             .await?;
 
         grammers
     };
+
+    let s3_service = {
+        let teles3 = TeleS3::init(grammers, db).await?;
+        let mut builder = S3ServiceBuilder::new(teles3);
+
+        let auth = SimpleAuth::from_single("YOUR_ACCESS_KEY", "YOUR_SECRET_KEY");
+        builder.set_auth(auth);
+
+        let service = builder.build();
+
+        service.into_shared()
+    };
+
+    let listener = TcpListener::bind(("0.0.0.0", config.listen_port)).await?;
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let svc = s3_service.clone();
+
+        tokio::spawn(async move {
+            let builder = Builder::new(TokioExecutor::new());
+            if let Err(err) = builder.serve_connection(io, svc).await {
+                eprintln!("Error serving connection: {:?}", err);
+            }
+        });
+    }
 
     Ok(())
 }
