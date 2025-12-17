@@ -1,6 +1,6 @@
 use std::{fmt::Display, sync::Arc};
 
-use futures::Stream;
+use futures::{Stream, io::AsyncRead};
 use grammers_client::{Client, InputMessage, client::updates::UpdateStream, types::User};
 pub use grammers_client::{
     client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
@@ -9,7 +9,8 @@ pub use grammers_client::{
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncRead, task::JoinHandle};
+use tokio::task::JoinHandle;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 mod session;
 
@@ -203,9 +204,11 @@ impl Grammers {
         name: String,
         peer: Peer,
     ) -> Result<MessageId, GrammersError> {
+        let mut compat_stream = stream.compat();
+
         let uploaded = self
             .client
-            .upload_stream(stream, size, name)
+            .upload_stream(&mut compat_stream, size, name)
             .await
             .map_err(|e| GrammersError {
                 kind: GrammersErrorKind::Upload("Unable to upload file"),
@@ -223,9 +226,7 @@ impl Grammers {
                 source: Some(Box::new(e)),
             })?;
 
-        let message_id = MessageId {
-            id: message.id(),
-        };
+        let message_id = MessageId { id: message.id() };
 
         Ok(message_id)
     }
