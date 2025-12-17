@@ -18,6 +18,7 @@ async-trait = "0.1.89"
 chrono = "0.4.42"
 serde_json = "1.0.145"
 s3s = "0.11.1"
+tokio-util = { version = "0.7.17", features = ["compat", "io"] }
 
 [patch.crates-io]
 grammers-client = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-client" }
