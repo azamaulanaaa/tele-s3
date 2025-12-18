@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
         let teles3 = TeleS3::init(grammers, db).await?;
         let mut builder = S3ServiceBuilder::new(teles3);
 
-        let auth = SimpleAuth::from_single("YOUR_ACCESS_KEY", "YOUR_SECRET_KEY");
+        let auth = SimpleAuth::from_single(&config.auth_access_key, config.auth_secret_key);
         builder.set_auth(auth);
 
         let service = builder.build();
