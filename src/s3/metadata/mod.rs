@@ -78,7 +78,7 @@ pub struct MetadataDb {
 
 impl MetadataDb {
     pub async fn init(connection: DatabaseConnection) -> Result<Self, MetadataStorageError> {
-        Self::apply_table(&connection)
+        Self::sync_table(&connection)
             .await
             .map_err(|e| MetadataStorageError {
                 kind: MetadataStorageErrorKind::Database("Unable to apply table"),
@@ -88,12 +88,13 @@ impl MetadataDb {
         Ok(Self { inner: connection })
     }
 
-    async fn apply_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
         connection
-            .get_schema_builder()
-            .register(entity::metadata::Entity)
-            .apply(connection)
-            .await
+            .get_schema_registry(concat!(module_path!(), "::entity"))
+            .sync(connection)
+            .await?;
+
+        Ok(())
     }
 }
 
