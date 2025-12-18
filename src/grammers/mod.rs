@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use futures::{Stream, io::AsyncRead};
 use grammers_client::{Client, InputMessage, client::updates::UpdateStream, types::User};
@@ -9,7 +9,7 @@ pub use grammers_client::{
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 mod session;
@@ -59,6 +59,7 @@ pub struct Grammers {
     client: Client,
     update_stream: UpdateStream,
     user: Option<User>,
+    peer_cache: Mutex<HashMap<String, Option<Peer>>>,
 }
 
 impl Grammers {
@@ -83,7 +84,7 @@ impl Grammers {
             handle,
             updates,
         } = pool;
-        let sender_pool_runner_handle = tokio::spawn(async { runner.run().await });
+        let sender_pool_runner_handle = tokio::spawn(runner.run());
         let update_stream = client.stream_updates(updates, Default::default());
 
         let user = {
@@ -111,6 +112,7 @@ impl Grammers {
             client,
             update_stream,
             user,
+            peer_cache: Default::default(),
         })
     }
 
@@ -240,6 +242,17 @@ impl Grammers {
         username: &str,
     ) -> Result<Option<Peer>, GrammersError> {
         let peer = self
+            .peer_cache
+            .lock()
+            .await
+            .get(username)
+            .cloned()
+            .flatten();
+        if peer.is_some() {
+            return Ok(peer);
+        }
+
+        let peer = self
             .client
             .resolve_username(username)
             .await
@@ -247,6 +260,11 @@ impl Grammers {
                 kind: GrammersErrorKind::PeerResolve("Unable to resolve per by username"),
                 source: Some(Box::new(e)),
             })?;
+        let _ = self
+            .peer_cache
+            .lock()
+            .await
+            .insert(username.to_string(), peer.clone());
 
         Ok(peer)
     }
