@@ -7,8 +7,8 @@ use s3s::{
     dto::{
         CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
         DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
-        HeadBucketOutput, ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput,
-        PutObjectOutput, StreamingBlob, Timestamp,
+        HeadBucketOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -202,6 +202,76 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
+    }
+
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let limit = req.input.max_keys.map(|m| m as u64).unwrap_or(1000);
+
+        let result = self
+            .metadata_storage
+            .list(
+                &req.input.bucket,
+                req.input.prefix.as_deref(),
+                req.input.delimiter.as_deref(),
+                limit,
+                req.input.marker.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    e.source.map(|v| v.to_string()).unwrap_or_default(),
+                )
+            })?;
+
+        let contents: Vec<Object> = result
+            .metadatas
+            .into_iter()
+            .map(|m| {
+                let last_modified = {
+                    let last_modified: SystemTime = m.last_modified.into();
+                    let last_modified = Timestamp::from(last_modified);
+                    Some(last_modified)
+                };
+
+                Object {
+                    key: Some(m.key),
+                    size: Some(m.size as i64),
+                    last_modified,
+                    e_tag: m.etag,
+                    owner: None,
+                    storage_class: None,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefix
+            .into_iter()
+            .map(|p| CommonPrefix { prefix: Some(p) })
+            .collect();
+
+        let output = ListObjectsOutput {
+            name: Some(req.input.bucket),
+            prefix: req.input.prefix,
+            delimiter: req.input.delimiter,
+            max_keys: Some(limit as i32),
+            marker: req.input.marker,
+
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+
+            is_truncated: Some(result.next_token.is_some()),
+            next_marker: result.next_token,
+
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
     }
 
     async fn list_objects_v2(
