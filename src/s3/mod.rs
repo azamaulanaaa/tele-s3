@@ -194,9 +194,10 @@ impl S3 for TeleS3 {
             Box::pin(body_stream.map_err(map_err).into_async_read())
         };
 
+        let name = format!("{}.{:03}", req.input.key.clone(), part_number);
         let message_id = self
             .grammers
-            .upload_document(&mut stream, size, req.input.key.clone(), peer)
+            .upload_document(&mut stream, size, name, peer)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
