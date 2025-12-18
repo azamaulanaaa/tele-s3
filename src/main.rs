@@ -36,9 +36,11 @@ async fn main() -> anyhow::Result<()> {
 
     let grammers = {
         let mut grammers = Grammers::init(config.api_id, db.clone()).await?;
-        grammers
-            .authenticate(&config.bot_token, &config.api_hash)
-            .await?;
+        if !grammers.is_authorized() {
+            grammers
+                .authenticate(&config.bot_token, &config.api_hash)
+                .await?;
+        }
 
         grammers
     };
