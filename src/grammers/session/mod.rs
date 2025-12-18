@@ -12,7 +12,6 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait,
     QueryFilter, Set, TransactionTrait,
 };
-use tokio::runtime::Runtime;
 
 mod entity;
 
@@ -26,19 +25,13 @@ pub enum SessionStorageError {
 
 pub struct SessionStorage {
     inner: DatabaseConnection,
-    rt: Runtime,
 }
 
 impl SessionStorage {
     pub async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
         Self::sync_table(&connection).await?;
 
-        let rt = Runtime::new()?;
-
-        Ok(Self {
-            inner: connection,
-            rt,
-        })
+        Ok(Self { inner: connection })
     }
 
     async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
@@ -48,6 +41,14 @@ impl SessionStorage {
             .await?;
 
         Ok(())
+    }
+
+    fn run_blocking<F, R>(&self, future: F) -> R
+    where
+        F: std::future::Future<Output = R> + Send,
+        R: Send,
+    {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
     }
 }
 
@@ -69,22 +70,22 @@ enum PeerSubtype {
     Gigagroup = 12,
 }
 
+
 impl Session for SessionStorage {
     fn home_dc_id(&self) -> i32 {
-        self.rt
-            .block_on(async {
-                entity::dc_home::Entity::find()
-                    .one(&self.inner)
-                    .await
-                    .map(|v| v.map(|v| v.dc_id))
-            })
-            .ok()
-            .flatten()
-            .unwrap_or(2)
+        self.run_blocking(async {
+            entity::dc_home::Entity::find()
+                .one(&self.inner)
+                .await
+                .map(|v| v.map(|v| v.dc_id))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(DEFAULT_DC)
     }
 
     fn set_home_dc_id(&self, dc_id: i32) {
-        let _: Result<(), DbErr> = self.rt.block_on(async {
+        let _: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             let _ = entity::dc_home::Entity::delete_many().exec(&txn).await?;
@@ -99,7 +100,7 @@ impl Session for SessionStorage {
     }
 
     fn dc_option(&self, dc_id: i32) -> Option<grammers_client::session::types::DcOption> {
-        let result: Result<Option<_>, DbErr> = self.rt.block_on(async {
+        let result: Result<Option<_>, DbErr> = self.run_blocking(async {
             let dc_option = entity::dc_option::Entity::find()
                 .filter(entity::dc_option::Column::DcId.eq(dc_id))
                 .one(&self.inner)
@@ -117,7 +118,7 @@ impl Session for SessionStorage {
     }
 
     fn set_dc_option(&self, dc_option: &DcOption) {
-        let _: Result<(), DbErr> = self.rt.block_on(async {
+        let _: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             entity::dc_option::Entity::delete_many()
@@ -140,7 +141,7 @@ impl Session for SessionStorage {
     }
 
     fn peer(&self, peer: PeerId) -> Option<PeerInfo> {
-        let peer_info: Result<Option<_>, DbErr> = self.rt.block_on(async {
+        let peer_info: Result<Option<_>, DbErr> = self.run_blocking(async {
             let peer_info = match peer.kind() {
                 PeerKind::UserSelf => {
                     entity::peer_info::Entity::find()
@@ -218,7 +219,7 @@ impl Session for SessionStorage {
             hash
         };
 
-        let _: Result<(), DbErr> = self.rt.block_on(async {
+        let _: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             entity::peer_info::Entity::delete_many()
@@ -240,7 +241,7 @@ impl Session for SessionStorage {
     }
 
     fn updates_state(&self) -> UpdatesState {
-        let result: Result<_, DbErr> = self.rt.block_on(async {
+        let result: Result<_, DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             let update_state = entity::update_state::Entity::find().one(&txn).await?;
@@ -271,7 +272,7 @@ impl Session for SessionStorage {
     }
 
     fn set_update_state(&self, update: UpdateState) {
-        let _: Result<(), DbErr> = self.rt.block_on(async {
+        let _: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             match update {
