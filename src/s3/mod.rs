@@ -7,8 +7,9 @@ use s3s::{
     dto::{
         CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
         DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
-        HeadBucketOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
+        StreamingBlob, Timestamp,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -182,6 +183,40 @@ impl S3 for TeleS3 {
 
         let output = GetObjectOutput {
             body: Some(body),
+            content_length: Some(metadata.size as i64),
+            content_type,
+            last_modified,
+            e_tag: metadata.etag,
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let metadata = self
+            .metadata_storage
+            .get(&req.input.bucket, &req.input.key)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .ok_or(S3Error::new(S3ErrorCode::NoSuchKey))?;
+
+        let content_type = metadata
+            .content_type
+            .map(|v| mime::Mime::from_str(&v))
+            .transpose()
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let last_modified = {
+            let last_modified: SystemTime = metadata.last_modified.into();
+            let last_modified = Timestamp::from(last_modified);
+            Some(last_modified)
+        };
+
+        let output = HeadObjectOutput {
             content_length: Some(metadata.size as i64),
             content_type,
             last_modified,
