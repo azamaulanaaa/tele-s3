@@ -1,4 +1,8 @@
-use std::{default::Default, ops::Deref};
+use std::{
+    default::Default,
+    net::{Ipv4Addr, SocketAddrV4, SocketAddrV6},
+    ops::Deref,
+};
 
 use grammers_client::session::{
     Session,
@@ -70,6 +74,64 @@ enum PeerSubtype {
     Gigagroup = 12,
 }
 
+const DEFAULT_DC: i32 = 2;
+const KNOWN_DC_OPTIONS: [DcOption; 5] = [
+    DcOption {
+        id: 1,
+        ipv4: SocketAddrV4::new(Ipv4Addr::new(149, 154, 175, 53), 443),
+        ipv6: SocketAddrV6::new(
+            Ipv4Addr::new(149, 154, 175, 53).to_ipv6_compatible(),
+            443,
+            0,
+            0,
+        ),
+        auth_key: None,
+    },
+    DcOption {
+        id: 2,
+        ipv4: SocketAddrV4::new(Ipv4Addr::new(149, 154, 167, 41), 443),
+        ipv6: SocketAddrV6::new(
+            Ipv4Addr::new(149, 154, 167, 41).to_ipv6_compatible(),
+            443,
+            0,
+            0,
+        ),
+        auth_key: None,
+    },
+    DcOption {
+        id: 3,
+        ipv4: SocketAddrV4::new(Ipv4Addr::new(149, 154, 175, 100), 443),
+        ipv6: SocketAddrV6::new(
+            Ipv4Addr::new(149, 154, 175, 100).to_ipv6_compatible(),
+            443,
+            0,
+            0,
+        ),
+        auth_key: None,
+    },
+    DcOption {
+        id: 4,
+        ipv4: SocketAddrV4::new(Ipv4Addr::new(149, 154, 167, 92), 443),
+        ipv6: SocketAddrV6::new(
+            Ipv4Addr::new(149, 154, 167, 92).to_ipv6_compatible(),
+            443,
+            0,
+            0,
+        ),
+        auth_key: None,
+    },
+    DcOption {
+        id: 5,
+        ipv4: SocketAddrV4::new(Ipv4Addr::new(91, 108, 56, 104), 443),
+        ipv6: SocketAddrV6::new(
+            Ipv4Addr::new(91, 108, 56, 104).to_ipv6_compatible(),
+            443,
+            0,
+            0,
+        ),
+        auth_key: None,
+    },
+];
 
 impl Session for SessionStorage {
     fn home_dc_id(&self) -> i32 {
@@ -114,7 +176,10 @@ impl Session for SessionStorage {
 
             Ok(dc_option)
         });
-        result.ok().flatten()
+        result.ok().flatten().or(KNOWN_DC_OPTIONS
+            .iter()
+            .find(|dc_option| dc_option.id == dc_id)
+            .cloned())
     }
 
     fn set_dc_option(&self, dc_option: &DcOption) {
