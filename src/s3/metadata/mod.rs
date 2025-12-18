@@ -112,7 +112,7 @@ impl MetadataStorage for MetadataDb {
             id: NotSet,
             key: Set(metadata.key),
             bucket: Set(metadata.bucket),
-            size: Set(metadata.size),
+            size: Set(metadata.size as _),
             last_modified: Set(metadata.last_modified),
             content_type: Set(metadata.content_type),
             etag: Set(metadata.etag),
@@ -144,7 +144,7 @@ impl MetadataStorage for MetadataDb {
         let metadata = metadata.map(|v| Metadata {
             key: v.key,
             bucket: v.bucket,
-            size: v.size,
+            size: v.size as _,
             last_modified: v.last_modified,
             content_type: v.content_type,
             etag: v.etag,
@@ -212,7 +212,7 @@ impl MetadataStorage for MetadataDb {
             .into_iter()
             .map(|v| MetadataSummary {
                 key: v.key,
-                size: v.size,
+                size: v.size as _,
                 last_modified: v.last_modified,
                 etag: v.etag,
             })
