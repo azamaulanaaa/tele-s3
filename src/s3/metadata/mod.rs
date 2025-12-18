@@ -109,22 +109,39 @@ impl Deref for MetadataDb {
 #[async_trait::async_trait]
 impl MetadataStorage for MetadataDb {
     async fn put(&self, metadata: Metadata) -> Result<(), MetadataStorageError> {
-        entity::metadata::ActiveModel {
+        let active_model = entity::metadata::ActiveModel {
             id: NotSet,
-            key: Set(metadata.key),
-            bucket: Set(metadata.bucket),
+            key: Set(metadata.key.clone()),
+            bucket: Set(metadata.bucket.clone()),
             size: Set(metadata.size as _),
             last_modified: Set(metadata.last_modified),
             content_type: Set(metadata.content_type),
             etag: Set(metadata.etag),
             inner: Set(metadata.inner),
+        };
+
+        let count_changed = entity::metadata::Entity::update_many()
+            .filter(
+                Condition::all()
+                    .add(entity::metadata::Column::Bucket.eq(metadata.bucket))
+                    .add(entity::metadata::Column::Key.eq(metadata.key)),
+            )
+            .exec_with_returning(&self.inner)
+            .await
+            .map_err(|e| MetadataStorageError {
+                kind: MetadataStorageErrorKind::Database("Unable to update object"),
+                source: Some(Box::new(e)),
+            })?
+            .len();
+        if count_changed == 0 {
+            active_model
+                .insert(&self.inner)
+                .await
+                .map_err(|e| MetadataStorageError {
+                    kind: MetadataStorageErrorKind::Database("Unable to insert object"),
+                    source: Some(Box::new(e)),
+                })?;
         }
-        .insert(&self.inner)
-        .await
-        .map_err(|e| MetadataStorageError {
-            kind: MetadataStorageErrorKind::Database("Unable to insert object"),
-            source: Some(Box::new(e)),
-        })?;
 
         Ok(())
     }
