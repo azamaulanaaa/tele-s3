@@ -5,11 +5,14 @@ use grammers_client::client::files::MAX_CHUNK_SIZE;
 use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
-        CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-        DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
-        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
-        StreamingBlob, Timestamp,
+        AbortMultipartUploadInput, AbortMultipartUploadOutput, CommonPrefix,
+        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
+        GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+        HeadObjectOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
+        UploadPartInput, UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -41,7 +44,7 @@ impl TeleS3 {
 
         Ok(Self {
             metadata_storage,
-            grammers,
+            grammers: grammers,
         })
     }
 }
@@ -117,7 +120,7 @@ impl S3 for TeleS3 {
             .upload_document(&mut stream, size, req.input.key.clone(), peer)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
-        let message_id = serde_json::to_value(message_id)
+        let message_ids = serde_json::to_value(vec![message_id])
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let metadata = Metadata {
@@ -127,7 +130,7 @@ impl S3 for TeleS3 {
             last_modified: chrono::Utc::now(),
             content_type: req.input.content_type.map(|v| v.to_string()),
             etag: None,
-            inner: message_id,
+            inner: message_ids,
         };
 
         self.metadata_storage
@@ -136,6 +139,184 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         Ok(S3Response::new(PutObjectOutput::default()))
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let _ = self
+            .grammers
+            .get_peer_by_username(&req.input.bucket)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .ok_or(S3Error::new(S3ErrorCode::NoSuchBucket))?;
+
+        let upload_id = uuid::Uuid::new_v4().to_string();
+
+        let output = CreateMultipartUploadOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
+            upload_id: Some(upload_id),
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let peer = self
+            .grammers
+            .get_peer_by_username(&req.input.bucket)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .ok_or(S3Error::new(S3ErrorCode::NoSuchBucket))?;
+
+        let size = req
+            .input
+            .content_length
+            .ok_or(S3Error::new(S3ErrorCode::MissingContentLength))? as usize;
+        let body_stream = req
+            .input
+            .body
+            .ok_or(S3Error::new(S3ErrorCode::IncompleteBody))?;
+
+        let upload_id = req.input.upload_id;
+        let part_number = req.input.part_number;
+
+        let mut stream = {
+            fn map_err(e: Box<dyn std::error::Error + Sync + Send>) -> std::io::Error {
+                std::io::Error::other(e)
+            }
+            Box::pin(body_stream.map_err(map_err).into_async_read())
+        };
+
+        let message_id = self
+            .grammers
+            .upload_document(&mut stream, size, req.input.key.clone(), peer)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let part_key = format!("{}_part_{}_{}", req.input.key, upload_id, part_number);
+
+        let inner_json = serde_json::to_value(message_id)
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let metadata = Metadata {
+            key: part_key,
+            bucket: req.input.bucket,
+            size: size as u64,
+            last_modified: chrono::Utc::now(),
+            content_type: None,
+            etag: Some(format!("\"{upload_id}-{part_number}\"")),
+            inner: inner_json,
+        };
+
+        self.metadata_storage
+            .put(metadata)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let output = UploadPartOutput {
+            e_tag: Some(format!("\"{upload_id}-{part_number}\"")),
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let upload_id = req.input.upload_id;
+        let multipart = req
+            .input
+            .multipart_upload
+            .ok_or(S3Error::new(S3ErrorCode::InvalidRequest))?;
+        let mut parts = multipart
+            .parts
+            .ok_or(S3Error::new(S3ErrorCode::InvalidRequest))?;
+
+        parts.sort_by_key(|p| p.part_number);
+
+        let mut final_message_ids = Vec::new();
+        let mut total_size: u64 = 0;
+
+        for part in parts {
+            let part_number = part
+                .part_number
+                .ok_or(S3Error::new(S3ErrorCode::InvalidRequest))?;
+            let part_key = format!("{}_part_{}_{}", req.input.key, upload_id, part_number);
+
+            let metadata = self
+                .metadata_storage
+                .get(&req.input.bucket, &part_key)
+                .await
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+                .ok_or(S3Error::new(S3ErrorCode::InvalidPart))?;
+
+            let msg_id: MessageId = serde_json::from_value(metadata.inner)
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+            final_message_ids.push(msg_id);
+            total_size += metadata.size;
+
+            self.metadata_storage
+                .delete(&req.input.bucket, &part_key)
+                .await
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+        }
+
+        let inner = serde_json::to_value(final_message_ids)
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let final_metadata = Metadata {
+            key: req.input.key.clone(),
+            bucket: req.input.bucket.clone(),
+            size: total_size,
+            last_modified: chrono::Utc::now(),
+            content_type: None,
+            etag: Some(format!("\"{}-{}\"", upload_id, total_size)),
+            inner,
+        };
+
+        self.metadata_storage
+            .put(final_metadata)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        Ok(S3Response::new(CompleteMultipartUploadOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
+            e_tag: None,
+            ..Default::default()
+        }))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let prefix = format!("{}_part_{}_", req.input.key, req.input.upload_id);
+
+        let result = self
+            .metadata_storage
+            .list(&req.input.bucket, Some(&prefix), None, 1000, None)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        for metadata in result.metadatas {
+            self.metadata_storage
+                .delete(&req.input.bucket, &metadata.key)
+                .await
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+        }
+
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
     async fn get_object(
@@ -149,7 +330,7 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
             .ok_or(S3Error::new(S3ErrorCode::NoSuchKey))?;
 
-        let message_id: MessageId = serde_json::from_value(metadata.inner)
+        let message_ids: Vec<MessageId> = serde_json::from_value(metadata.inner)
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let peer = self
@@ -159,14 +340,20 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
             .ok_or(S3Error::new(S3ErrorCode::NoSuchBucket))?;
 
-        let stream = self
-            .grammers
-            .download_document(peer, message_id, MAX_CHUNK_SIZE)
+        let download_futures = message_ids.into_iter().map(|msg_id| {
+            self.grammers
+                .download_document(peer.clone(), msg_id, MAX_CHUNK_SIZE)
+        });
+
+        let streams: Vec<_> = futures::future::try_join_all(download_futures)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
-        let s3_stream = stream.map(|chunk_res| chunk_res.map(|vec| bytes::Bytes::from(vec)));
-        let body = StreamingBlob::wrap(s3_stream);
+        let merged_stream = futures::stream::iter(streams)
+            .flatten()
+            .map(|chunk_res| chunk_res.map(|vec| bytes::Bytes::from(vec)));
+
+        let body = StreamingBlob::wrap(merged_stream);
 
         let content_type = metadata
             .content_type
@@ -357,7 +544,7 @@ impl S3 for TeleS3 {
             common_prefixes: Some(common_prefixes),
             is_truncated: Some(result.next_token.is_some()),
             next_continuation_token: result.next_token,
-            key_count: None, // Optional
+            key_count: None,
             max_keys: Some(limit as i32),
             name: Some(req.input.bucket),
             prefix: req.input.prefix,
