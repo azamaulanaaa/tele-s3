@@ -31,7 +31,7 @@ pub struct SessionStorage {
 
 impl SessionStorage {
     pub async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
-        Self::apply_table(&connection).await?;
+        Self::sync_table(&connection).await?;
 
         let rt = Runtime::new()?;
 
@@ -41,16 +41,13 @@ impl SessionStorage {
         })
     }
 
-    async fn apply_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
         connection
-            .get_schema_builder()
-            .register(entity::dc_home::Entity)
-            .register(entity::dc_option::Entity)
-            .register(entity::peer_info::Entity)
-            .register(entity::update_state::Entity)
-            .register(entity::channel_state::Entity)
-            .apply(connection)
-            .await
+            .get_schema_registry(concat!(module_path!(), "::entity"))
+            .sync(connection)
+            .await?;
+
+        Ok(())
     }
 }
 
