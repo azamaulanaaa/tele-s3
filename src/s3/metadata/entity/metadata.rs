@@ -10,7 +10,7 @@ pub struct Model {
     pub bucket: String,
     #[sea_orm(indexed, unique_key = "bucket_key")]
     pub key: String,
-    pub size: u64,
+    pub size: u32,
     pub last_modified: chrono::DateTime<chrono::Utc>,
     pub content_type: Option<String>,
     pub etag: Option<String>,

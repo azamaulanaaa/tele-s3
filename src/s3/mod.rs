@@ -220,12 +220,7 @@ impl S3 for TeleS3 {
                 req.input.marker.as_deref(),
             )
             .await
-            .map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    e.source.map(|v| v.to_string()).unwrap_or_default(),
-                )
-            })?;
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let contents: Vec<Object> = result
             .metadatas
