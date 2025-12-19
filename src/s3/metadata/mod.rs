@@ -6,15 +6,17 @@ use futures::TryStreamExt;
 use s3s::{
     Body, S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
+        Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
         DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
         DeletedObject, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-        ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
-        PutObjectInput, PutObjectOutput, Timestamp,
+        ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
+        Timestamp,
     },
 };
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    sea_query::OnConflict,
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, sea_query::OnConflict,
 };
 
 mod entity;
@@ -50,6 +52,101 @@ impl Deref for MetadataStorage {
 
 #[async_trait]
 impl S3 for MetadataStorage {
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        let active_model = entity::bucket::ActiveModel {
+            id: Set(req.input.bucket.clone()),
+            region: Set(req.region),
+            created_at: Set(chrono::Local::now().to_utc()),
+        };
+
+        match entity::bucket::Entity::insert(active_model)
+            .exec(&self.inner)
+            .await
+        {
+            Ok(_) => {
+                let res = S3Response::new(CreateBucketOutput::default());
+                Ok(res)
+            }
+            Err(DbErr::Query(err)) if err.to_string().contains("Duplicate entry") => {
+                Err(S3Error::new(S3ErrorCode::BucketAlreadyExists))
+            }
+            Err(_) => Err(S3Error::new(S3ErrorCode::BucketAlreadyExists)),
+        }
+    }
+
+    async fn list_buckets(
+        &self,
+        _req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let buckets = entity::bucket::Entity::find()
+            .all(&self.inner)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let buckets: Vec<Bucket> = buckets
+            .into_iter()
+            .map(|model| {
+                let creation_date = {
+                    let creation_date: SystemTime = model.created_at.into();
+                    let creation_date = Timestamp::from(creation_date);
+
+                    Some(creation_date)
+                };
+
+                Bucket {
+                    name: Some(model.id),
+                    creation_date,
+                    bucket_region: model.region,
+                }
+            })
+            .collect();
+
+        let res = S3Response::new(ListBucketsOutput {
+            buckets: Some(buckets),
+            ..Default::default()
+        });
+
+        Ok(res)
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let bucket_name = req.input.bucket;
+
+        let bucket_exists = entity::bucket::Entity::find_by_id(bucket_name.clone())
+            .one(&self.inner)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .is_some();
+
+        if !bucket_exists {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
+        }
+
+        let object_count = entity::object::Entity::find()
+            .filter(entity::object::Column::BucketId.eq(bucket_name.clone()))
+            .count(&self.inner)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        if object_count > 0 {
+            return Err(S3Error::new(S3ErrorCode::BucketNotEmpty));
+        }
+
+        entity::bucket::Entity::delete_by_id(bucket_name)
+            .exec(&self.inner)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let res = S3Response::new(DeleteBucketOutput::default());
+        Ok(res)
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,

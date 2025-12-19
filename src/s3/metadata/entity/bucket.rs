@@ -6,8 +6,10 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: String,
+    pub region: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
     #[sea_orm(has_many)]
-    pub metadata: HasMany<super::object::Entity>,
+    pub object: HasMany<super::object::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
