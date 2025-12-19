@@ -187,15 +187,13 @@ impl S3 for MetadataStorage {
         let content: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| S3Error::new(S3ErrorCode::InvalidRequest))?;
 
-        let etag = format!("\"{:x}\"", md5::compute(&body));
-
         let active_model = entity::object::ActiveModel {
             bucket_id: Set(req.input.bucket),
             id: Set(req.input.key),
             size: Set(body.len() as u32),
             last_modified: Set(chrono::Local::now().to_utc()),
             content_type: Set(req.input.content_type.map(|v| v.to_string())),
-            etag: Set(Some(etag.clone())),
+            etag: Set(None),
             content: Set(content),
         };
 
@@ -216,7 +214,6 @@ impl S3 for MetadataStorage {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let res = S3Response::new(PutObjectOutput {
-            e_tag: Some(etag),
             ..Default::default()
         });
 
