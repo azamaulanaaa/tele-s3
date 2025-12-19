@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use futures::io::{AsyncRead, AsyncWrite};
+use futures::io::AsyncRead;
 use std::pin::Pin;
 
-pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Sync + Unpin>>;
+pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
