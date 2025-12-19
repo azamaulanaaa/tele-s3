@@ -16,6 +16,7 @@ use s3s::{
     },
 };
 use sea_orm::DatabaseConnection;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     grammers::{Grammers, MessageId},
@@ -120,7 +121,11 @@ impl S3 for TeleS3 {
             .upload_document(&mut stream, size, req.input.key.clone(), peer)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
-        let message_ids = serde_json::to_value(vec![message_id])
+        let inner_item = MetadataInnerItem {
+            message_id,
+            size: size as i64,
+        };
+        let inner_json = serde_json::to_value(vec![inner_item])
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let metadata = Metadata {
@@ -130,7 +135,7 @@ impl S3 for TeleS3 {
             last_modified: chrono::Utc::now(),
             content_type: req.input.content_type.map(|v| v.to_string()),
             etag: None,
-            inner: message_ids,
+            inner: inner_json,
         };
 
         self.metadata_storage
@@ -200,11 +205,14 @@ impl S3 for TeleS3 {
             .upload_document(&mut stream, size, name, peer)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+        let inner_item = MetadataInnerItem {
+            message_id,
+            size: size as i64,
+        };
+        let inner_json = serde_json::to_value(vec![inner_item])
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let part_key = format!("{}_part_{}_{}", req.input.key, upload_id, part_number);
-
-        let inner_json = serde_json::to_value(message_id)
-            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let metadata = Metadata {
             key: part_key,
@@ -244,7 +252,7 @@ impl S3 for TeleS3 {
 
         parts.sort_by_key(|p| p.part_number);
 
-        let mut final_message_ids = Vec::new();
+        let mut final_inner = Vec::new();
         let mut total_size: u64 = 0;
 
         for part in parts {
@@ -260,10 +268,10 @@ impl S3 for TeleS3 {
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
                 .ok_or(S3Error::new(S3ErrorCode::InvalidPart))?;
 
-            let msg_id: MessageId = serde_json::from_value(metadata.inner)
+            let inner: Vec<MetadataInnerItem> = serde_json::from_value(metadata.inner)
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
-            final_message_ids.push(msg_id);
+            final_inner.push(inner);
             total_size += metadata.size;
 
             self.metadata_storage
@@ -271,8 +279,9 @@ impl S3 for TeleS3 {
                 .await
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
         }
+        let final_inners = final_inner.concat();
 
-        let inner = serde_json::to_value(final_message_ids)
+        let inner_json = serde_json::to_value(final_inners)
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let final_metadata = Metadata {
@@ -282,7 +291,7 @@ impl S3 for TeleS3 {
             last_modified: chrono::Utc::now(),
             content_type: None,
             etag: Some(format!("\"{}-{}\"", upload_id, total_size)),
-            inner,
+            inner: inner_json,
         };
 
         self.metadata_storage
@@ -335,7 +344,7 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
             .ok_or(S3Error::new(S3ErrorCode::NoSuchKey))?;
 
-        let message_ids: Vec<MessageId> = serde_json::from_value(metadata.inner)
+        let inner: Vec<MetadataInnerItem> = serde_json::from_value(metadata.inner)
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let peer = self
@@ -345,9 +354,9 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
             .ok_or(S3Error::new(S3ErrorCode::NoSuchBucket))?;
 
-        let download_futures = message_ids.into_iter().map(|msg_id| {
+        let download_futures = inner.into_iter().map(|item| {
             self.grammers
-                .download_document(peer.clone(), msg_id, MAX_CHUNK_SIZE)
+                .download_document(peer.clone(), item.message_id, MAX_CHUNK_SIZE)
         });
 
         let streams: Vec<_> = futures::future::try_join_all(download_futures)
@@ -560,4 +569,10 @@ impl S3 for TeleS3 {
 
         Ok(S3Response::new(output))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetadataInnerItem {
+    message_id: MessageId,
+    size: i64,
 }
