@@ -24,10 +24,10 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn read(
         &self,
-        key: &str,
+        key: String,
         offset: u64,
         limit: Option<u64>,
     ) -> Result<Option<BoxedAsyncReader>, BackendError>;
 
-    async fn delete(&self, key: &str) -> Result<(), BackendError>;
+    async fn delete(&self, key: String) -> Result<(), BackendError>;
 }
