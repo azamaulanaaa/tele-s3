@@ -117,7 +117,7 @@ impl Backend for Grammers {
 
     async fn read(
         &self,
-        key: &str,
+        key: String,
         offset: u64,
         limit: Option<u64>,
     ) -> Result<Option<BoxedAsyncReader>, BackendError> {
@@ -211,7 +211,7 @@ impl Backend for Grammers {
         Ok(Some(reader))
     }
 
-    async fn delete(&self, key: &str) -> Result<(), BackendError> {
+    async fn delete(&self, key: String) -> Result<(), BackendError> {
         let message_id = {
             let numb_key = key.parse::<i32>();
             let numb_key = match numb_key {
