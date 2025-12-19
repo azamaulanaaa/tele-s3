@@ -74,9 +74,9 @@ impl S3 for MetadataStorage {
 
         let etag = format!("\"{:x}\"", md5::compute(&body));
 
-        let active_model = entity::metadata::ActiveModel {
-            bucket: Set(req.input.bucket),
-            key: Set(req.input.key),
+        let active_model = entity::object::ActiveModel {
+            bucket_id: Set(req.input.bucket),
+            id: Set(req.input.key),
             size: Set(body.len() as u32),
             last_modified: Set(chrono::Local::now().to_utc()),
             content_type: Set(req.input.content_type.map(|v| v.to_string())),
@@ -84,20 +84,17 @@ impl S3 for MetadataStorage {
             content: Set(content),
         };
 
-        entity::metadata::Entity::insert(active_model)
+        entity::object::Entity::insert(active_model)
             .on_conflict(
-                OnConflict::columns([
-                    entity::metadata::Column::Bucket,
-                    entity::metadata::Column::Key,
-                ])
-                .update_columns([
-                    entity::metadata::Column::Size,
-                    entity::metadata::Column::LastModified,
-                    entity::metadata::Column::ContentType,
-                    entity::metadata::Column::Etag,
-                    entity::metadata::Column::Content,
-                ])
-                .to_owned(),
+                OnConflict::columns([entity::object::Column::BucketId, entity::object::Column::Id])
+                    .update_columns([
+                        entity::object::Column::Size,
+                        entity::object::Column::LastModified,
+                        entity::object::Column::ContentType,
+                        entity::object::Column::Etag,
+                        entity::object::Column::Content,
+                    ])
+                    .to_owned(),
             )
             .exec(&self.inner)
             .await
@@ -115,7 +112,7 @@ impl S3 for MetadataStorage {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let model = entity::metadata::Entity::find_by_id((req.input.bucket, req.input.key))
+        let model = entity::object::Entity::find_by_id((req.input.bucket, req.input.key))
             .one(&self.inner)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
@@ -146,13 +143,13 @@ impl S3 for MetadataStorage {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let model = entity::metadata::Entity::find_by_id((req.input.bucket, req.input.key))
+        let model = entity::object::Entity::find_by_id((req.input.bucket, req.input.key))
             .select_only()
             .columns([
-                entity::metadata::Column::Size,
-                entity::metadata::Column::ContentType,
-                entity::metadata::Column::Etag,
-                entity::metadata::Column::LastModified,
+                entity::object::Column::Size,
+                entity::object::Column::ContentType,
+                entity::object::Column::Etag,
+                entity::object::Column::LastModified,
             ])
             .one(&self.inner)
             .await
@@ -180,7 +177,7 @@ impl S3 for MetadataStorage {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        entity::metadata::Entity::delete_by_id((req.input.bucket, req.input.key))
+        entity::object::Entity::delete_by_id((req.input.bucket, req.input.key))
             .exec(&self.inner)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
@@ -202,9 +199,9 @@ impl S3 for MetadataStorage {
             .map(|obj| obj.key.clone())
             .collect();
 
-        entity::metadata::Entity::delete_many()
-            .filter(entity::metadata::Column::Bucket.eq(req.input.bucket.clone()))
-            .filter(entity::metadata::Column::Key.is_in(keys.clone()))
+        entity::object::Entity::delete_many()
+            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
+            .filter(entity::object::Column::Id.is_in(keys.clone()))
             .exec(&self.inner)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
@@ -237,16 +234,16 @@ impl S3 for MetadataStorage {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        let mut query = entity::metadata::Entity::find()
-            .filter(entity::metadata::Column::Bucket.eq(req.input.bucket.clone()))
-            .order_by_asc(entity::metadata::Column::Key);
+        let mut query = entity::object::Entity::find()
+            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
+            .order_by_asc(entity::object::Column::Id);
 
         if let Some(prefix) = &req.input.prefix {
-            query = query.filter(entity::metadata::Column::Key.starts_with(prefix.clone()));
+            query = query.filter(entity::object::Column::Id.starts_with(prefix.clone()));
         }
 
         if let Some(marker) = &req.input.marker {
-            query = query.filter(entity::metadata::Column::Key.gt(marker.clone()));
+            query = query.filter(entity::object::Column::Id.gt(marker.clone()));
         }
 
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
@@ -255,10 +252,10 @@ impl S3 for MetadataStorage {
             .limit(Some(limit))
             .select_only()
             .columns([
-                entity::metadata::Column::Key,
-                entity::metadata::Column::Size,
-                entity::metadata::Column::LastModified,
-                entity::metadata::Column::Etag,
+                entity::object::Column::Id,
+                entity::object::Column::Size,
+                entity::object::Column::LastModified,
+                entity::object::Column::Etag,
             ])
             .all(&self.inner)
             .await
@@ -273,7 +270,7 @@ impl S3 for MetadataStorage {
                 };
 
                 Object {
-                    key: Some(model.key.clone()),
+                    key: Some(model.id.clone()),
                     size: Some(model.size.into()),
                     last_modified,
                     e_tag: model.etag.clone(),
@@ -310,16 +307,16 @@ impl S3 for MetadataStorage {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let mut query = entity::metadata::Entity::find()
-            .filter(entity::metadata::Column::Bucket.eq(req.input.bucket.clone()))
-            .order_by_asc(entity::metadata::Column::Key);
+        let mut query = entity::object::Entity::find()
+            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
+            .order_by_asc(entity::object::Column::Id);
 
-        if let Some(prefix) = req.input.prefix {
-            query = query.filter(entity::metadata::Column::Key.starts_with(prefix.clone()));
+        if let Some(prefix) = req.input.prefix.clone() {
+            query = query.filter(entity::object::Column::Id.starts_with(prefix));
         }
 
         if let Some(token) = req.input.continuation_token {
-            query = query.filter(entity::metadata::Column::Key.gt(token));
+            query = query.filter(entity::object::Column::Id.gt(token));
         }
 
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
@@ -328,10 +325,10 @@ impl S3 for MetadataStorage {
             .limit(Some(limit))
             .select_only()
             .columns([
-                entity::metadata::Column::Key,
-                entity::metadata::Column::Size,
-                entity::metadata::Column::LastModified,
-                entity::metadata::Column::Etag,
+                entity::object::Column::Id,
+                entity::object::Column::Size,
+                entity::object::Column::LastModified,
+                entity::object::Column::Etag,
             ])
             .all(&self.inner)
             .await
@@ -348,7 +345,7 @@ impl S3 for MetadataStorage {
                 };
 
                 Object {
-                    key: Some(model.key.clone()),
+                    key: Some(model.id.clone()),
                     size: Some(model.size.into()),
                     last_modified: last_modified,
                     e_tag: model.etag.clone(),
