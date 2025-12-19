@@ -1,10 +1,10 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
+use async_stream::try_stream;
 use futures::{Stream, io::AsyncRead};
-use grammers_client::{Client, InputMessage, client::updates::UpdateStream, types::User};
-pub use grammers_client::{
-    client::files::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE},
-    types::Peer,
+pub use grammers_client::types::Peer;
+use grammers_client::{
+    Client, InputMessage, client::files::MAX_CHUNK_SIZE, client::updates::UpdateStream, types::User,
 };
 use grammers_mtsender::{SenderPool, SenderPoolHandle};
 use sea_orm::DatabaseConnection;
@@ -148,22 +148,12 @@ impl Grammers {
         &self,
         peer: Peer,
         message_id: MessageId,
-        chunk_size: i32,
-        skip_chunk: i32,
+        offset: i32,
+        limit: Option<i32>,
     ) -> Result<
         impl Stream<Item = Result<Vec<u8>, GrammersError>> + Send + Sync + 'static,
         GrammersError,
     > {
-        if !(chunk_size >= MIN_CHUNK_SIZE
-            && chunk_size <= MAX_CHUNK_SIZE
-            && chunk_size % MIN_CHUNK_SIZE == 0)
-        {
-            return Err(GrammersError {
-                kind: GrammersErrorKind::InvalidConfig("Invalid download chunk size"),
-                source: None,
-            });
-        }
-
         let message = self
             .client
             .get_messages_by_id(peer, &[message_id.id])
@@ -186,25 +176,52 @@ impl Grammers {
         })?;
 
         let client = self.client.clone();
+
+        let skip_chunks = (offset / MAX_CHUNK_SIZE) as i32;
         let download_iter = client
             .iter_download(&document)
-            .chunk_size(chunk_size)
-            .skip_chunks(skip_chunk);
+            .chunk_size(MAX_CHUNK_SIZE)
+            .skip_chunks(skip_chunks);
 
-        let media_download = futures::stream::unfold(download_iter, |mut this| async move {
-            let result = this
-                .next()
-                .await
-                .map_err(|e| GrammersError {
-                    kind: GrammersErrorKind::Download("Something wrong"),
+        let mut prefix_trim = (offset % MAX_CHUNK_SIZE) as usize;
+        let mut bytes_remaining = limit;
+
+        let stream = try_stream! {
+            let mut iter = download_iter;
+
+            while let Some(mut chunk) = iter.next().await.map_err(|e| GrammersError {
+                    kind: GrammersErrorKind::Download("Download failed"),
                     source: Some(Box::new(e)),
-                })
-                .transpose();
+                })? {
 
-            result.map(|v| (v, this))
-        });
+            if prefix_trim > 0 {
+                if chunk.len() <= prefix_trim {
+                    prefix_trim -= chunk.len();
+                    continue;
+                }
+                chunk.drain(0..prefix_trim);
+                prefix_trim = 0;
+            }
 
-        Ok(media_download)
+            if let Some(rem) = bytes_remaining {
+                if rem == 0 {
+                    break;
+                }
+
+                let current_len = chunk.len() as i32;
+                if current_len > rem {
+                    chunk.truncate(rem as usize);
+                    bytes_remaining = Some(0);
+                } else {
+                    bytes_remaining = Some(rem - current_len);
+                }
+            }
+
+            yield chunk;
+            }
+        };
+
+        Ok(stream)
     }
 
     pub async fn upload_document<S: AsyncRead + Unpin>(
