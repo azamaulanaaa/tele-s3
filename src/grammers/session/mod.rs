@@ -16,6 +16,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait,
     QueryFilter, Set, TransactionTrait,
 };
+use tracing::{debug, error, info, instrument, warn};
 
 mod entity;
 
@@ -32,13 +33,19 @@ pub struct SessionStorage {
 }
 
 impl SessionStorage {
+    #[instrument(skip(connection), err)]
     pub async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
+        info!("Initializing SessionStorage");
+
         Self::sync_table(&connection).await?;
 
         Ok(Self { inner: connection })
     }
 
+    #[instrument(skip(connection), err)]
     async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
+        debug!("Syncing database schema");
+
         connection
             .get_schema_registry(concat!(module_path!(), "::entity"))
             .sync(connection)
@@ -134,20 +141,32 @@ const KNOWN_DC_OPTIONS: [DcOption; 5] = [
 ];
 
 impl Session for SessionStorage {
+    #[instrument(skip(self), level = "debug", ret)]
     fn home_dc_id(&self) -> i32 {
-        self.run_blocking(async {
+        let result = self.run_blocking(async {
             entity::dc_home::Entity::find()
                 .one(&self.inner)
                 .await
                 .map(|v| v.map(|v| v.dc_id))
-        })
-        .ok()
-        .flatten()
-        .unwrap_or(DEFAULT_DC)
+        });
+
+        match result {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                warn!("No Home DC found, using default");
+                DEFAULT_DC
+            }
+            Err(e) => {
+                error!(error = ?e, "Failed to query Home DC");
+
+                DEFAULT_DC
+            }
+        }
     }
 
+    #[instrument(skip(self), level = "debug")]
     fn set_home_dc_id(&self, dc_id: i32) {
-        let _: Result<(), DbErr> = self.run_blocking(async {
+        let result: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             let _ = entity::dc_home::Entity::delete_many().exec(&txn).await?;
@@ -159,31 +178,87 @@ impl Session for SessionStorage {
 
             Ok(())
         });
+
+        if let Err(e) = result {
+            error!(
+                error = ?e,
+                dc_id = dc_id,
+                "Failed to set Home DC"
+            );
+        }
     }
 
+    #[instrument(skip(self), level = "debug", ret)]
     fn dc_option(&self, dc_id: i32) -> Option<grammers_client::session::types::DcOption> {
         let result: Result<Option<_>, DbErr> = self.run_blocking(async {
             let dc_option = entity::dc_option::Entity::find()
                 .filter(entity::dc_option::Column::DcId.eq(dc_id))
                 .one(&self.inner)
                 .await?;
-            let dc_option = dc_option.map(|v| DcOption {
-                id: v.dc_id,
-                ipv4: v.ipv4.parse().unwrap(),
-                ipv6: v.ipv6.parse().unwrap(),
-                auth_key: v.auth_key.map(|v| v.try_into().unwrap()),
-            });
 
             Ok(dc_option)
         });
-        result.ok().flatten().or(KNOWN_DC_OPTIONS
-            .iter()
-            .find(|dc_option| dc_option.id == dc_id)
-            .cloned())
+
+        let dc_option = match result {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                warn!("DC Option not found, find from default list.");
+
+                None
+            }
+            Err(e) => {
+                error!(
+                    error = ?e,
+                    dc_id = dc_id,
+                    "Failed to query DC Option. find from default list."
+                );
+
+                None
+            }
+        };
+
+        let dc_option = dc_option
+            .map(|v| {
+                let ipv4 = v.ipv4.parse();
+                let ipv6 = v.ipv6.parse();
+
+                let (ipv4, ipv6) = match (ipv4, ipv6) {
+                    (Ok(v4), Ok(v6)) => (v4, v6),
+                    _ => {
+                        error!(dc_id, "Corrupted IP address in database. Ignoring row.");
+
+                        return None;
+                    }
+                };
+
+                Some(DcOption {
+                    id: v.dc_id,
+                    ipv4,
+                    ipv6,
+                    auth_key: v.auth_key.map(|v| v.try_into().unwrap()),
+                })
+            })
+            .flatten();
+
+        if dc_option.is_none() {
+            let fallback = KNOWN_DC_OPTIONS
+                .iter()
+                .find(|dc_option| dc_option.id == dc_id)
+                .cloned();
+
+            if fallback.is_none() {
+                warn!(dc_id, "DC Option found nowhere (neither DB nor Defaults).");
+            }
+
+            return fallback;
+        }
+
+        dc_option
     }
 
+    #[instrument(skip(self), level = "debug")]
     fn set_dc_option(&self, dc_option: &DcOption) {
-        let _: Result<(), DbErr> = self.run_blocking(async {
+        let result: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             entity::dc_option::Entity::delete_many()
@@ -203,8 +278,16 @@ impl Session for SessionStorage {
 
             Ok(())
         });
+
+        if let Err(e) = result {
+            error!(
+                error = ?e,
+                "Failed to set DC Option"
+            );
+        }
     }
 
+    #[instrument(skip(self), level = "debug", ret)]
     fn peer(&self, peer: PeerId) -> Option<PeerInfo> {
         let peer_info: Result<Option<_>, DbErr> = self.run_blocking(async {
             let peer_info = match peer.kind() {
@@ -225,37 +308,60 @@ impl Session for SessionStorage {
                         .await?
                 }
             };
-            let peer_info = peer_info.map(|v| match peer.kind() {
-                PeerKind::User | PeerKind::UserSelf => PeerInfo::User {
-                    id: PeerId::user(v.peer_id.into()).bare_id(),
-                    auth: v.hash.map(|v| PeerAuth::from_hash(v.into())),
-                    bot: v.subtype.map(|v| v & PeerSubtype::UserBot as u8 != 0),
-                    is_self: v.subtype.map(|v| v & PeerSubtype::UserSelf as u8 != 0),
-                },
-                PeerKind::Chat => PeerInfo::Chat { id: peer.bare_id() },
-                PeerKind::Channel => PeerInfo::Channel {
-                    id: peer.bare_id(),
-                    auth: v.hash.map(|v| PeerAuth::from_hash(v.into())),
-                    kind: v.subtype.and_then(|s| {
-                        if (s & PeerSubtype::Gigagroup as u8) == PeerSubtype::Gigagroup as u8 {
-                            Some(ChannelKind::Gigagroup)
-                        } else if s & PeerSubtype::Broadcast as u8 != 0 {
-                            Some(ChannelKind::Broadcast)
-                        } else if s & PeerSubtype::Megagroup as u8 != 0 {
-                            Some(ChannelKind::Megagroup)
-                        } else {
-                            None
-                        }
-                    }),
-                },
-            });
 
             Ok(peer_info)
         });
 
-        peer_info.ok().flatten()
+        let peer_info = match peer_info {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                warn!("Peer not found");
+
+                return None;
+            }
+            Err(e) => {
+                error!(
+                    error = ?e,
+                    "Failed to query Peer Info"
+                );
+
+                return None;
+            }
+        };
+
+        let peer_info = match peer.kind() {
+            PeerKind::User | PeerKind::UserSelf => PeerInfo::User {
+                id: PeerId::user(peer_info.peer_id.into()).bare_id(),
+                auth: peer_info.hash.map(|v| PeerAuth::from_hash(v.into())),
+                bot: peer_info
+                    .subtype
+                    .map(|v| v & PeerSubtype::UserBot as u8 != 0),
+                is_self: peer_info
+                    .subtype
+                    .map(|v| v & PeerSubtype::UserSelf as u8 != 0),
+            },
+            PeerKind::Chat => PeerInfo::Chat { id: peer.bare_id() },
+            PeerKind::Channel => PeerInfo::Channel {
+                id: peer.bare_id(),
+                auth: peer_info.hash.map(|v| PeerAuth::from_hash(v.into())),
+                kind: peer_info.subtype.and_then(|s| {
+                    if (s & PeerSubtype::Gigagroup as u8) == PeerSubtype::Gigagroup as u8 {
+                        Some(ChannelKind::Gigagroup)
+                    } else if s & PeerSubtype::Broadcast as u8 != 0 {
+                        Some(ChannelKind::Broadcast)
+                    } else if s & PeerSubtype::Megagroup as u8 != 0 {
+                        Some(ChannelKind::Megagroup)
+                    } else {
+                        None
+                    }
+                }),
+            },
+        };
+
+        Some(peer_info)
     }
 
+    #[instrument(skip(self), level = "debug")]
     fn cache_peer(&self, peer: &PeerInfo) {
         let subtype = match peer {
             PeerInfo::User { bot, is_self, .. } => {
@@ -284,7 +390,7 @@ impl Session for SessionStorage {
             hash
         };
 
-        let _: Result<(), DbErr> = self.run_blocking(async {
+        let result: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             entity::peer_info::Entity::delete_many()
@@ -303,8 +409,16 @@ impl Session for SessionStorage {
 
             Ok(())
         });
+
+        if let Err(e) = result {
+            error!(
+                error = ?e,
+                "Failed to set Cache Peer"
+            );
+        }
     }
 
+    #[instrument(skip(self), level = "debug", ret)]
     fn updates_state(&self) -> UpdatesState {
         let result: Result<_, DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
@@ -314,33 +428,47 @@ impl Session for SessionStorage {
 
             txn.commit().await?;
 
-            let mut update_state = update_state
-                .map(|v| UpdatesState {
-                    pts: v.pts,
-                    qts: v.qts,
-                    date: v.date,
-                    seq: v.seq,
-                    channels: Vec::new(),
-                })
-                .unwrap_or_default();
-            update_state.channels = channels
-                .into_iter()
-                .map(|v| ChannelState {
-                    id: v.peer_id,
-                    pts: v.pts,
-                })
-                .collect();
-
-            Ok(update_state)
+            Ok((update_state, channels))
         });
-        result.ok().unwrap_or_default()
+
+        let (update_state, channels) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                error!(
+                    error = ?e,
+                    "Failed to query Update State"
+                );
+
+                return Default::default();
+            }
+        };
+
+        let mut update_state = update_state
+            .map(|v| UpdatesState {
+                pts: v.pts,
+                qts: v.qts,
+                date: v.date,
+                seq: v.seq,
+                channels: Vec::new(),
+            })
+            .unwrap_or_default();
+        update_state.channels = channels
+            .into_iter()
+            .map(|v| ChannelState {
+                id: v.peer_id,
+                pts: v.pts,
+            })
+            .collect();
+
+        update_state
     }
 
-    fn set_update_state(&self, update: UpdateState) {
-        let _: Result<(), DbErr> = self.run_blocking(async {
+    #[instrument(skip(self, update_state), level = "debug")]
+    fn set_update_state(&self, update_state: UpdateState) {
+        let result: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
-            match update {
+            match update_state {
                 UpdateState::All(updates_state) => {
                     entity::update_state::Entity::delete_many()
                         .exec(&txn)
@@ -438,5 +566,12 @@ impl Session for SessionStorage {
 
             Ok(())
         });
+
+        if let Err(e) = result {
+            error!(
+                error = ?e,
+                "Failed to set Update State"
+            );
+        }
     }
 }
