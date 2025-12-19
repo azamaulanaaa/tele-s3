@@ -12,7 +12,6 @@ use crate::{grammers::Grammers, s3::TeleS3};
 
 mod backend;
 mod config;
-mod grammers;
 mod s3;
 
 #[derive(Debug, Clone, Parser)]

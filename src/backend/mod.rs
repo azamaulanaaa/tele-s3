@@ -2,6 +2,10 @@ use async_trait::async_trait;
 use futures::io::AsyncRead;
 use std::pin::Pin;
 
+pub use grammers::{Grammers, GrammersConfig};
+
+mod grammers;
+
 pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
 #[derive(Debug, thiserror::Error)]
