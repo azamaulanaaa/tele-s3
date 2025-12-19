@@ -8,10 +8,10 @@ use s3s::{
     dto::{
         Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
         DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
-        DeletedObject, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-        ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
-        Timestamp,
+        DeletedObject, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+        HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsInput,
+        ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput,
+        PutObjectOutput, Timestamp,
     },
 };
 use sea_orm::{
@@ -144,6 +144,24 @@ impl S3 for MetadataStorage {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         let res = S3Response::new(DeleteBucketOutput::default());
+        Ok(res)
+    }
+
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        let exists = entity::bucket::Entity::find_by_id(req.input.bucket)
+            .one(&self.inner)
+            .await
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .is_some();
+
+        if !exists {
+            return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
+        }
+
+        let res = S3Response::new(HeadBucketOutput::default());
         Ok(res)
     }
 
