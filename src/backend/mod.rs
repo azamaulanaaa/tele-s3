@@ -15,7 +15,7 @@ pub enum BackendError {
     #[error("Size {actual} exceed limit {max}")]
     ExceedLimitSize { max: u64, actual: u64 },
     #[error("Unrecognize error")]
-    Other(#[source] Box<dyn std::error::Error>),
+    Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 #[async_trait]
