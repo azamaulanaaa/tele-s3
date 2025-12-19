@@ -356,7 +356,7 @@ impl S3 for TeleS3 {
 
         let download_futures = inner.into_iter().map(|item| {
             self.grammers
-                .download_document(peer.clone(), item.message_id, MAX_CHUNK_SIZE, 0)
+                .download_document(peer.clone(), item.message_id, 0, None)
         });
 
         let streams: Vec<_> = futures::future::try_join_all(download_futures)
