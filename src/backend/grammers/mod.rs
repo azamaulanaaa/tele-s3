@@ -225,7 +225,7 @@ impl Backend for Grammers {
         };
 
         self.client
-            .delete_messages(self.peer, &[message_id])
+            .delete_messages(self.peer.clone(), &[message_id])
             .await
             .map_err(|e| BackendError::Other(Box::new(e)))?;
 
