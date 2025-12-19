@@ -4,8 +4,15 @@ use std::pin::Pin;
 
 pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Sync + Unpin>>;
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum BackendError {}
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    #[error("Out of range")]
+    OutOfRange,
+    #[error("Size {actual} exceed limit {max}")]
+    ExceedLimitSize { max: u64, actual: u64 },
+    #[error("Unrecognize error")]
+    Other(#[source] Box<dyn std::error::Error>),
+}
 
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
