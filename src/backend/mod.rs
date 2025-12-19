@@ -18,7 +18,12 @@ pub enum BackendError {
 pub trait Backend: Send + Sync + 'static {
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError>;
 
-    async fn read(&self, key: &str) -> Result<Option<BoxedAsyncReader>, BackendError>;
+    async fn read(
+        &self,
+        key: &str,
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Result<Option<BoxedAsyncReader>, BackendError>;
 
     async fn delete(&self, key: &str) -> Result<(), BackendError>;
 }
