@@ -324,6 +324,10 @@ impl S3 for TeleS3 {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        if req.input.range.is_some() {
+            return Err(S3Error::new(S3ErrorCode::NotImplemented));
+        }
+
         let metadata = self
             .metadata_storage
             .get(&req.input.bucket, &req.input.key)
@@ -405,6 +409,7 @@ impl S3 for TeleS3 {
         };
 
         let output = HeadObjectOutput {
+            accept_ranges: Some("none".to_string()),
             content_length: Some(metadata.size as i64),
             content_type,
             last_modified,
