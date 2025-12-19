@@ -333,10 +333,6 @@ impl S3 for TeleS3 {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        if req.input.range.is_some() {
-            return Err(S3Error::new(S3ErrorCode::NotImplemented));
-        }
-
         let metadata = self
             .metadata_storage
             .get(&req.input.bucket, &req.input.key)
@@ -354,9 +350,40 @@ impl S3 for TeleS3 {
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
             .ok_or(S3Error::new(S3ErrorCode::NoSuchBucket))?;
 
-        let download_futures = inner.into_iter().map(|item| {
-            self.grammers
-                .download_document(peer.clone(), item.message_id, 0, None)
+        let (mut offset, mut remain_length) = if let Some(range) = req.input.range {
+            let r = range.check(metadata.size)?;
+            (r.start, r.end - r.start)
+        } else {
+            (0, metadata.size as u64)
+        };
+
+        let content_length = remain_length;
+
+        let download_futures = inner.into_iter().filter_map(|item| {
+            if remain_length == 0 {
+                return None;
+            }
+
+            let item_size = item.size as u64;
+
+            if offset >= item_size {
+                offset -= item_size;
+                return None;
+            }
+
+            let local_offset = offset;
+            let bytes_available = item_size - local_offset;
+            let take_amount = std::cmp::min(bytes_available, remain_length);
+
+            offset = 0;
+            remain_length -= take_amount;
+
+            Some(self.grammers.download_document(
+                peer.clone(),
+                item.message_id,
+                local_offset as i32,
+                Some(take_amount as i32),
+            ))
         });
 
         let streams: Vec<_> = futures::future::try_join_all(download_futures)
@@ -384,7 +411,7 @@ impl S3 for TeleS3 {
 
         let output = GetObjectOutput {
             body: Some(body),
-            content_length: Some(metadata.size as i64),
+            content_length: Some(content_length as i64),
             content_type,
             last_modified,
             e_tag: metadata.etag,
@@ -418,7 +445,7 @@ impl S3 for TeleS3 {
         };
 
         let output = HeadObjectOutput {
-            accept_ranges: Some("none".to_string()),
+            accept_ranges: Some("bytes".to_string()),
             content_length: Some(metadata.size as i64),
             content_type,
             last_modified,
