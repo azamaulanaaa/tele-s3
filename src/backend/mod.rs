@@ -10,7 +10,7 @@ pub enum BackendError {}
 
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
-    async fn get_writer(&self, key: &str) -> Result<BoxedAsyncWriter, BackendError>;
+    async fn get_writer(&self, key: &str, size: u64) -> Result<BoxedAsyncWriter, BackendError>;
 
     async fn get_reader(&self, key: &str) -> Result<Option<BoxedAsyncReader>, BackendError>;
 
