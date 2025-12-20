@@ -171,6 +171,25 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
 
+        let is_exists = self
+            .repo
+            .object_exists(&req.input.bucket, &req.input.key)
+            .await?;
+        let delete_futures = if is_exists {
+            let model = self
+                .repo
+                .get_object(&req.input.bucket, &req.input.key)
+                .await?;
+
+            let metadata: Metadata =
+                serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
+            let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
+
+            Some(delete_futures)
+        } else {
+            None
+        };
+
         self.repo
             .upsert_object(
                 req.input.bucket,
@@ -181,6 +200,10 @@ impl<B: Backend> S3 for TeleS3<B> {
                 metadata_json,
             )
             .await?;
+
+        if let Some(delete_futures) = delete_futures {
+            let _ = futures::future::join_all(delete_futures).await;
+        }
 
         let res = S3Response::new(PutObjectOutput {
             ..Default::default()
@@ -334,6 +357,25 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
 
+        let is_exists = self
+            .repo
+            .object_exists(&req.input.bucket, &req.input.key)
+            .await?;
+        let delete_futures = if is_exists {
+            let model = self
+                .repo
+                .get_object(&req.input.bucket, &req.input.key)
+                .await?;
+
+            let metadata: Metadata =
+                serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
+            let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
+
+            Some(delete_futures)
+        } else {
+            None
+        };
+
         self.repo
             .upsert_object(
                 req.input.bucket,
@@ -344,6 +386,10 @@ impl<B: Backend> S3 for TeleS3<B> {
                 metadata_json,
             )
             .await?;
+
+        if let Some(delete_futures) = delete_futures {
+            let _ = futures::future::join_all(delete_futures).await;
+        }
 
         let res = S3Response::new(CompleteMultipartUploadOutput {
             ..Default::default()
