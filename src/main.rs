@@ -8,7 +8,10 @@ use tokio::net::TcpListener;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 
-use crate::{grammers::Grammers, s3::TeleS3};
+use crate::{
+    backend::{Grammers, GrammersConfig},
+    s3::TeleS3,
+};
 
 mod backend;
 mod config;
@@ -35,14 +38,15 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(config.database_uri).await?;
 
     let grammers = {
-        let mut grammers = Grammers::init(config.api_id, db.clone()).await?;
-        if !grammers.is_authorized() {
-            grammers
-                .authenticate(&config.bot_token, &config.api_hash)
-                .await?;
-        }
+        let config = GrammersConfig {
+            app_id: config.api_id,
+            app_hash: config.api_hash,
+            bot_token: config.bot_token,
+            db: db.clone(),
+            username: config.username,
+        };
 
-        grammers
+        Grammers::init(config).await?
     };
 
     let s3_service = {
