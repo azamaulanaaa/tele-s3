@@ -10,6 +10,8 @@ pub struct Model {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[sea_orm(has_many)]
     pub object: HasMany<super::object::Entity>,
+    #[sea_orm(has_many)]
+    pub multipart_upload_state: HasMany<super::multipart_upload_state::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
