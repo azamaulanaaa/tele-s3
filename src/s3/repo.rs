@@ -87,6 +87,7 @@ impl Repository {
         key: String,
         size: u64,
         content_type: Option<String>,
+        etag: Option<String>,
         metadata: serde_json::Value,
     ) -> S3Result<()> {
         let active_model = entity::object::ActiveModel {
@@ -95,7 +96,7 @@ impl Repository {
             size: Set(size as u32),
             last_modified: Set(chrono::Local::now().to_utc()),
             content_type: Set(content_type),
-            etag: Set(None),
+            etag: Set(etag),
             content: Set(metadata),
         };
 
