@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::backend::{Backend, BackendExt, BoxedAsyncReader};
-use repo::{Repository, entity};
+use repo::Repository;
 
 mod repo;
 
@@ -42,10 +42,12 @@ pub struct TeleS3<B: Backend> {
 impl<B: Backend> TeleS3<B> {
     #[instrument(skip(backend, db), err)]
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
+        let repo = Repository::init(db).await?;
+
         Ok(Self {
             backend,
             pending_uploads: Default::default(),
-            repo: Repository::new(db),
+            repo,
         })
     }
 }
