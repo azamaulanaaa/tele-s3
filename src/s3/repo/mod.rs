@@ -5,7 +5,7 @@ use sea_orm::{
 };
 use tracing::instrument;
 
-use super::entity;
+pub mod entity;
 
 pub struct Repository {
     pub db: DatabaseConnection,
