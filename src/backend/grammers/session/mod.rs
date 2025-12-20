@@ -16,7 +16,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait,
     QueryFilter, Set, TransactionTrait,
 };
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, instrument, warn};
 
 mod entity;
 
@@ -35,8 +35,6 @@ pub struct SessionStorage {
 impl SessionStorage {
     #[instrument(skip(connection), err)]
     pub async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
-        info!("Initializing SessionStorage");
-
         Self::sync_table(&connection).await?;
 
         Ok(Self { inner: connection })
@@ -44,8 +42,6 @@ impl SessionStorage {
 
     #[instrument(skip(connection), err)]
     async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
-        debug!("Syncing database schema");
-
         connection
             .get_schema_registry(concat!(module_path!(), "::entity"))
             .sync(connection)
