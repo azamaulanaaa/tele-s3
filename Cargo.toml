@@ -2,6 +2,7 @@
 name = "tele-s3"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/azamaulanaaa/tele-s3"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
@@ -32,3 +33,8 @@ md5 = "0.8.0"
 grammers-client = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-client" }
 grammers-mtsender = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-mtsender" }
 grammers-session = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-session" }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
