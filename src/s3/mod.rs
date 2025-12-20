@@ -146,7 +146,11 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let id = self
             .backend
-            .write(size as u64, body_stream.into_boxed_reader())
+            .write(
+                req.input.key.clone(),
+                size as u64,
+                body_stream.into_boxed_reader(),
+            )
             .await
             .map_err(|e| S3Error::internal_error(e))?;
 
@@ -238,9 +242,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             .take()
             .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
 
+        let name = format!("{}.{:03}", &req.input.key, req.input.part_number);
         let id = self
             .backend
-            .write(size, body_stream.into_boxed_reader())
+            .write(name, size, body_stream.into_boxed_reader())
             .await
             .map_err(|e| S3Error::internal_error(e))?;
 
