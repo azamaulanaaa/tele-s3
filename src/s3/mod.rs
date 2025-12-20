@@ -376,13 +376,15 @@ impl<B: Backend> S3 for TeleS3<B> {
             None
         };
 
+        let content_type = state.content_type.clone().map(|v| v.to_string());
+
         self.repo
             .upsert_object(
                 req.input.bucket,
                 req.input.key,
                 state.size(),
-                state.content_type.map(|v| v.to_string()),
-                None,
+                content_type,
+                Some(state.etag()),
                 metadata_json,
             )
             .await?;
