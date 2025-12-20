@@ -26,7 +26,10 @@ pub struct Config {
     pub api_id: i32,
     pub api_hash: String,
     pub bot_token: String,
+    pub username: String,
+
     pub database_uri: String,
+
     pub listen_port: u16,
     pub auth_access_key: String,
     pub auth_secret_key: String,
