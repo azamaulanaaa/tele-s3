@@ -28,7 +28,7 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::backend::{Backend, BoxedAsyncReader};
+use crate::backend::{Backend, BackendExt, BoxedAsyncReader};
 use repo::Repository;
 
 mod entity;
@@ -144,15 +144,24 @@ impl<B: Backend> S3 for TeleS3<B> {
             .take()
             .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
 
-        let id = self
+        let (id, hash) = self
             .backend
-            .write(
+            .write_with_hasher(
                 req.input.key.clone(),
                 size as u64,
                 body_stream.into_boxed_reader(),
+                md5::Context::new(),
             )
             .await
             .map_err(|e| S3Error::internal_error(e))?;
+
+        if let Some(expected_hash) = req.input.content_md5 {
+            if expected_hash != hash {
+                let _ = self.backend.delete(id).await;
+
+                return Err(S3Error::new(S3ErrorCode::BadDigest));
+            }
+        }
 
         let metadata = Metadata {
             item: vec![MetadataItem { id, size }],
@@ -243,11 +252,24 @@ impl<B: Backend> S3 for TeleS3<B> {
             .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
 
         let name = format!("{}.{:03}", &req.input.key, req.input.part_number);
-        let id = self
+        let (id, hash) = self
             .backend
-            .write(name, size, body_stream.into_boxed_reader())
+            .write_with_hasher(
+                name,
+                size,
+                body_stream.into_boxed_reader(),
+                md5::Context::new(),
+            )
             .await
             .map_err(|e| S3Error::internal_error(e))?;
+
+        if let Some(expected_hash) = req.input.content_md5 {
+            if expected_hash != hash {
+                let _ = self.backend.delete(id).await;
+
+                return Err(S3Error::new(S3ErrorCode::BadDigest));
+            }
+        }
 
         {
             let mut uploads = self.pending_uploads.lock().await;
