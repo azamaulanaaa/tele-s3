@@ -24,21 +24,20 @@ use s3s::{
         UploadPartInput, UploadPartOutput,
     },
 };
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, SqlErr, sea_query::OnConflict,
-};
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::backend::{Backend, BoxedAsyncReader};
+use repo::Repository;
 
 mod entity;
+mod repo;
 
 pub struct TeleS3<B: Backend> {
     backend: B,
     pending_uploads: Arc<tokio::sync::Mutex<HashMap<MultipartUploadKey, MultipartUploadState>>>,
-    db: DatabaseConnection,
+    repo: Repository,
 }
 
 impl<B: Backend> TeleS3<B> {
@@ -47,7 +46,7 @@ impl<B: Backend> TeleS3<B> {
         Ok(Self {
             backend,
             pending_uploads: Default::default(),
-            db,
+            repo: Repository::new(db),
         })
     }
 }
@@ -59,33 +58,13 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        let active_model = entity::bucket::ActiveModel {
-            id: Set(req.input.bucket.clone()),
-            region: Set(req.region),
-            created_at: Set(chrono::Local::now().to_utc()),
-        };
+        self.repo
+            .create_bucket(req.input.bucket, req.region)
+            .await?;
 
-        match entity::bucket::Entity::insert(active_model)
-            .exec(&self.db)
-            .await
-        {
-            Ok(_) => {
-                let res = S3Response::new(CreateBucketOutput::default());
-                Ok(res)
-            }
-            Err(DbErr::Exec(e)) => {
-                let err = DbErr::Exec(e);
+        let res = S3Response::new(CreateBucketOutput::default());
 
-                match err.sql_err() {
-                    Some(SqlErr::UniqueConstraintViolation(_)) => {
-                        Err(S3Error::new(S3ErrorCode::BucketAlreadyExists))
-                    }
-                    _ => Err(S3Error::internal_error(err)),
-                }
-            }
-
-            Err(e) => Err(S3Error::internal_error(e)),
-        }
+        Ok(res)
     }
 
     #[instrument(skip(self), err)]
@@ -93,10 +72,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         _req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let buckets = entity::bucket::Entity::find()
-            .all(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+        let buckets = self.repo.list_buckets().await?;
 
         let buckets: Vec<Bucket> = buckets
             .into_iter()
@@ -120,30 +96,17 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let bucket_exists = entity::bucket::Entity::find_by_id(req.input.bucket.clone())
-            .one(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?
-            .is_some();
-
-        if !bucket_exists {
+        let is_exists = self.repo.bucket_exists(&req.input.bucket).await?;
+        if !is_exists {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
         }
 
-        let object_count = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
-            .count(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
-
+        let object_count = self.repo.get_bucket_object_count(&req.input.bucket).await?;
         if object_count > 0 {
             return Err(S3Error::new(S3ErrorCode::BucketNotEmpty));
         }
 
-        entity::bucket::Entity::delete_by_id(req.input.bucket)
-            .exec(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+        self.repo.delete_bucket(&req.input.bucket).await?;
 
         let res = S3Response::new(DeleteBucketOutput::default());
 
@@ -155,13 +118,9 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        let exists = entity::bucket::Entity::find_by_id(req.input.bucket)
-            .one(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?
-            .is_some();
+        let is_exists = self.repo.bucket_exists(&req.input.bucket).await?;
 
-        if !exists {
+        if !is_exists {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
         }
 
@@ -198,31 +157,15 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
 
-        let active_model = entity::object::ActiveModel {
-            bucket_id: Set(req.input.bucket),
-            id: Set(req.input.key),
-            size: Set(size as u32),
-            last_modified: Set(chrono::Local::now().to_utc()),
-            content_type: Set(req.input.content_type.map(|v| v.to_string())),
-            etag: Set(None),
-            content: Set(metadata_json),
-        };
-
-        entity::object::Entity::insert(active_model)
-            .on_conflict(
-                OnConflict::columns([entity::object::Column::BucketId, entity::object::Column::Id])
-                    .update_columns([
-                        entity::object::Column::Size,
-                        entity::object::Column::LastModified,
-                        entity::object::Column::ContentType,
-                        entity::object::Column::Etag,
-                        entity::object::Column::Content,
-                    ])
-                    .to_owned(),
+        self.repo
+            .upsert_object(
+                req.input.bucket,
+                req.input.key,
+                size,
+                req.input.content_type.map(|v| v.to_string()),
+                metadata_json,
             )
-            .exec(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .await?;
 
         let res = S3Response::new(PutObjectOutput {
             ..Default::default()
@@ -362,7 +305,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             metadata_items.push(metadata_item.clone());
         }
 
-        let size = metadata_items.iter().map(|v| v.size).sum::<u64>() as u32;
+        let size = metadata_items.iter().map(|v| v.size).sum::<u64>();
 
         let metadata = Metadata {
             item: metadata_items,
@@ -370,31 +313,15 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
 
-        let active_model = entity::object::ActiveModel {
-            bucket_id: Set(req.input.bucket),
-            id: Set(req.input.key),
-            size: Set(size),
-            last_modified: Set(chrono::Local::now().to_utc()),
-            content_type: Set(state.content_type.map(|v| v.to_string())),
-            etag: Set(None),
-            content: Set(metadata_json),
-        };
-
-        entity::object::Entity::insert(active_model)
-            .on_conflict(
-                OnConflict::columns([entity::object::Column::BucketId, entity::object::Column::Id])
-                    .update_columns([
-                        entity::object::Column::Size,
-                        entity::object::Column::LastModified,
-                        entity::object::Column::ContentType,
-                        entity::object::Column::Etag,
-                        entity::object::Column::Content,
-                    ])
-                    .to_owned(),
+        self.repo
+            .upsert_object(
+                req.input.bucket,
+                req.input.key,
+                size,
+                state.content_type.map(|v| v.to_string()),
+                metadata_json,
             )
-            .exec(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .await?;
 
         let res = S3Response::new(CompleteMultipartUploadOutput {
             ..Default::default()
@@ -437,11 +364,10 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let model = entity::object::Entity::find_by_id((req.input.bucket, req.input.key))
-            .one(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+        let model = self
+            .repo
+            .get_object(&req.input.bucket, &req.input.key)
+            .await?;
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
@@ -507,11 +433,10 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let model = entity::object::Entity::find_by_id((req.input.bucket, req.input.key))
-            .one(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+        let model = self
+            .repo
+            .get_object(&req.input.bucket, &req.input.key)
+            .await?;
 
         let res = S3Response::new(HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
@@ -533,20 +458,14 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let model =
-            entity::object::Entity::find_by_id((req.input.bucket.clone(), req.input.key.clone()))
-                .one(&self.db)
-                .await
-                .map_err(|e| S3Error::internal_error(e))?
-                .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+        let model = self
+            .repo
+            .delete_object(&req.input.bucket, &req.input.key)
+            .await?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
-
-        entity::object::Entity::delete_by_id((req.input.bucket, req.input.key))
-            .exec(&self.db)
-            .await
-            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
 
         futures::future::try_join_all(
             metadata
@@ -574,12 +493,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             .map(|obj| obj.key.clone())
             .collect();
 
-        let models = entity::object::Entity::delete_many()
-            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
-            .filter(entity::object::Column::Id.is_in(keys.clone()))
-            .exec_with_returning(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+        let models = self.repo.delete_objects(&req.input.bucket, keys).await?;
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
 
@@ -610,27 +524,19 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        let mut query = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
-            .order_by_asc(entity::object::Column::Id);
-
-        if let Some(prefix) = &req.input.prefix {
-            query = query.filter(entity::object::Column::Id.starts_with(prefix.clone()));
-        }
-
-        if let Some(marker) = &req.input.marker {
-            query = query.filter(entity::object::Column::Id.gt(marker.clone()));
-        }
-
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
 
-        let items = query
-            .limit(Some(limit))
-            .all(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+        let models = self
+            .repo
+            .list_objects(
+                &req.input.bucket,
+                req.input.prefix.clone(),
+                req.input.marker.clone(),
+                limit,
+            )
+            .await?;
 
-        let contents: Vec<Object> = items
+        let contents: Vec<Object> = models
             .iter()
             .map(|model| Object {
                 key: Some(model.id.clone()),
@@ -669,25 +575,17 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let mut query = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(req.input.bucket.clone()))
-            .order_by_asc(entity::object::Column::Id);
-
-        if let Some(prefix) = req.input.prefix.clone() {
-            query = query.filter(entity::object::Column::Id.starts_with(prefix));
-        }
-
-        if let Some(token) = req.input.continuation_token {
-            query = query.filter(entity::object::Column::Id.gt(token));
-        }
-
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
 
-        let items = query
-            .limit(Some(limit))
-            .all(&self.db)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+        let items = self
+            .repo
+            .list_objects(
+                &req.input.bucket,
+                req.input.prefix.clone(),
+                req.input.continuation_token,
+                limit,
+            )
+            .await?;
 
         let contents: Vec<Object> = items
             .iter()
