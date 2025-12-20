@@ -3,6 +3,7 @@ use sea_orm::{
     ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Set, SqlErr, sea_query::OnConflict,
 };
+use tracing::instrument;
 
 use super::entity;
 
@@ -11,10 +12,12 @@ pub struct Repository {
 }
 
 impl Repository {
+    #[instrument(skip(db))]
     pub fn new(db: DatabaseConnection) -> Self {
         Self { db }
     }
 
+    #[instrument(skip(self), err)]
     pub async fn create_bucket(&self, name: String, region: Option<String>) -> S3Result<()> {
         let active_model = entity::bucket::ActiveModel {
             id: Set(name),
@@ -43,6 +46,7 @@ impl Repository {
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     pub async fn list_buckets(&self) -> S3Result<Vec<entity::bucket::Model>> {
         let buckets = entity::bucket::Entity::find()
             .all(&self.db)
@@ -52,6 +56,7 @@ impl Repository {
         Ok(buckets)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn delete_bucket(&self, name: &str) -> S3Result<()> {
         entity::bucket::Entity::delete_by_id(name)
             .exec(&self.db)
@@ -61,6 +66,7 @@ impl Repository {
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     pub async fn get_bucket_object_count(&self, name: &str) -> S3Result<u64> {
         let object_count = entity::object::Entity::find()
             .filter(entity::object::Column::BucketId.eq(name))
@@ -71,6 +77,7 @@ impl Repository {
         Ok(object_count)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn bucket_exists(&self, name: &str) -> S3Result<bool> {
         let bucket_exists = entity::bucket::Entity::find_by_id(name)
             .one(&self.db)
@@ -81,6 +88,7 @@ impl Repository {
         Ok(bucket_exists)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn upsert_object(
         &self,
         bucket: String,
@@ -119,6 +127,7 @@ impl Repository {
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     pub async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
         let exists = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
@@ -129,6 +138,7 @@ impl Repository {
         Ok(exists)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
         let model = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
@@ -139,6 +149,7 @@ impl Repository {
         Ok(model)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn delete_object(
         &self,
         bucket: &str,
@@ -152,6 +163,7 @@ impl Repository {
         Ok(model)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn delete_objects(
         &self,
         bucket: &str,
@@ -167,6 +179,7 @@ impl Repository {
         Ok(models)
     }
 
+    #[instrument(skip(self), err)]
     pub async fn list_objects(
         &self,
         bucket: &str,
