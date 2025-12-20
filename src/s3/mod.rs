@@ -563,6 +563,24 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let models = self.repo.delete_objects(&req.input.bucket, keys).await?;
 
+        let metadatas: Vec<Metadata> = models
+            .iter()
+            .map(|model| {
+                serde_json::from_value::<Metadata>(model.content.clone())
+                    .map_err(|e| S3Error::internal_error(e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        futures::future::try_join_all(
+            metadatas
+                .iter()
+                .map(|metadata| metadata.item.clone())
+                .flatten()
+                .map(|item| self.backend.delete(item.id.clone())),
+        )
+        .await
+        .map_err(|e| S3Error::internal_error(e))?;
+
         let quiet = req.input.delete.quiet.unwrap_or(false);
 
         let deleted = if quiet {
