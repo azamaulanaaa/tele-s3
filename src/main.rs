@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     backend::{Grammers, GrammersConfig},
@@ -26,6 +27,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tele_s3=info"));
+
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
     let args = Args::parse();
 
     let config = {
