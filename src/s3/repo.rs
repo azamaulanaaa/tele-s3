@@ -119,6 +119,16 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
+        let exists = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
+            .one(&self.db)
+            .await
+            .map_err(|e| S3Error::internal_error(e))?
+            .is_some();
+
+        Ok(exists)
+    }
+
     pub async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
         let model = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
