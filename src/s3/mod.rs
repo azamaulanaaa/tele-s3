@@ -163,10 +163,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         }
 
+        let etag = Some(format!("\"{}\"", hash));
+
         let metadata = Metadata {
             item: vec![MetadataItem { id, size }],
         };
-
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
 
@@ -176,6 +177,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.key,
                 size,
                 req.input.content_type.map(|v| v.to_string()),
+                etag,
                 metadata_json,
             )
             .await?;
@@ -275,9 +277,13 @@ impl<B: Backend> S3 for TeleS3<B> {
             let mut uploads = self.pending_uploads.lock().await;
 
             if let Some(state) = uploads.get_mut(&key) {
-                state
-                    .parts
-                    .insert(req.input.part_number, MetadataItem { id, size });
+                state.parts.insert(
+                    req.input.part_number,
+                    MultipartUploadPart {
+                        hash,
+                        metadata_item: MetadataItem { id, size },
+                    },
+                );
             } else {
                 let _ = self.backend.delete(id).await;
                 return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
@@ -307,6 +313,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             .multipart_upload
             .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?
             .parts
+            .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?
+            .into_iter()
+            .map(|v| v.part_number)
+            .collect::<Option<Vec<_>>>()
             .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
 
         let state = {
@@ -316,26 +326,10 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .remove(&key)
                 .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?
         };
-
-        let mut metadata_items = Vec::new();
-
-        for req_part in requested_parts {
-            let part_num = req_part
-                .part_number
-                .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidRequest))?;
-
-            let metadata_item = state
-                .parts
-                .get(&part_num)
-                .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
-
-            metadata_items.push(metadata_item.clone());
-        }
-
-        let size = metadata_items.iter().map(|v| v.size).sum::<u64>();
+        let state = state.filter_parts(requested_parts)?;
 
         let metadata = Metadata {
-            item: metadata_items,
+            item: state.metadata_item().collect(),
         };
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
@@ -344,8 +338,9 @@ impl<B: Backend> S3 for TeleS3<B> {
             .upsert_object(
                 req.input.bucket,
                 req.input.key,
-                size,
+                state.size(),
                 state.content_type.map(|v| v.to_string()),
+                None,
                 metadata_json,
             )
             .await?;
@@ -379,7 +374,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         let delete_futures = state
             .parts
             .values()
-            .map(|part| self.backend.delete(part.id.clone()));
+            .map(|part| self.backend.delete(part.metadata_item.id.clone()));
 
         let _ = futures::future::join_all(delete_futures).await;
 
@@ -670,7 +665,62 @@ struct MultipartUploadKey {
 #[derive(Debug, Clone)]
 struct MultipartUploadState {
     content_type: Option<Mime>,
-    parts: BTreeMap<i32, MetadataItem>,
+    parts: BTreeMap<i32, MultipartUploadPart>,
+}
+
+#[derive(Debug, Clone)]
+struct MultipartUploadPart {
+    hash: String,
+    metadata_item: MetadataItem,
+}
+
+impl MultipartUploadState {
+    pub fn size(&self) -> u64 {
+        self.parts.iter().map(|v| v.1.metadata_item.size).sum()
+    }
+
+    pub fn etag(&self) -> String {
+        let part_count = self.parts.len();
+
+        let hashes_byte = self
+            .parts
+            .iter()
+            .map(|v| self.hex_to_bytes(&v.1.hash))
+            .flatten()
+            .collect::<Vec<_>>();
+
+        let hash = md5::compute(&hashes_byte);
+
+        format!("\"{:x}-{}\"", hash, part_count)
+    }
+
+    pub fn metadata_item(&self) -> impl Iterator<Item = MetadataItem> {
+        self.parts.iter().map(|v| v.1.metadata_item.clone())
+    }
+
+    pub fn filter_parts(&self, part_numbers: impl IntoIterator<Item = i32>) -> S3Result<Self> {
+        let mut new_parts = BTreeMap::new();
+
+        for part_number in part_numbers {
+            let part = self
+                .parts
+                .get(&part_number)
+                .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
+            new_parts.insert(part_number, part.clone());
+        }
+
+        Ok(Self {
+            content_type: self.content_type.clone(),
+            parts: new_parts,
+        })
+    }
+
+    fn hex_to_bytes(&self, s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("Invalid hex character"))
+            .collect()
+    }
 }
 
 pub struct ChainReaders {
