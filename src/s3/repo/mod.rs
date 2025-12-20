@@ -1,7 +1,7 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, SqlErr, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, sea_query::OnConflict,
 };
 use tracing::instrument;
 
@@ -217,5 +217,114 @@ impl Repository {
             .map_err(|e| S3Error::internal_error(e))?;
 
         Ok(models)
+    }
+
+    #[instrument(skip(self), err)]
+    pub async fn upsert_multipart_upload_state(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+        content_type: Option<String>,
+        content: serde_json::Value,
+    ) -> S3Result<()> {
+        let active_model = entity::multipart_upload_state::ActiveModel {
+            bucket_id: Set(bucket),
+            object_id: Set(key),
+            upload_id: Set(upload_id),
+            content_type: Set(content_type),
+            content: Set(content),
+        };
+
+        entity::multipart_upload_state::Entity::insert(active_model)
+            .on_conflict(
+                OnConflict::columns([
+                    entity::multipart_upload_state::Column::BucketId,
+                    entity::multipart_upload_state::Column::ObjectId,
+                    entity::multipart_upload_state::Column::UploadId,
+                ])
+                .update_columns([
+                    entity::multipart_upload_state::Column::ContentType,
+                    entity::multipart_upload_state::Column::Content,
+                ])
+                .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(|e| S3Error::internal_error(e))?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self), err)]
+    pub async fn get_multipart_upload_state(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> S3Result<entity::multipart_upload_state::Model> {
+        let model = entity::multipart_upload_state::Entity::find_by_id((
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.to_string(),
+        ))
+        .one(&self.db)
+        .await
+        .map_err(|e| S3Error::internal_error(e))?
+        .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+
+        Ok(model)
+    }
+
+    #[instrument(skip(self), err)]
+    pub async fn delete_multipart_upload_state(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> S3Result<Option<entity::multipart_upload_state::Model>> {
+        let model = entity::multipart_upload_state::Entity::delete_by_id((
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.to_string(),
+        ))
+        .exec_with_returning(&self.db)
+        .await
+        .map_err(|e| S3Error::internal_error(e))?;
+
+        Ok(model)
+    }
+
+    #[instrument(skip(self, action), err)]
+    pub async fn update_multipart_upload_state<F>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        action: F,
+    ) -> S3Result<()>
+    where
+        F: Fn(
+            entity::multipart_upload_state::Model,
+        ) -> S3Result<entity::multipart_upload_state::ActiveModel>,
+    {
+        let model = entity::multipart_upload_state::Entity::find_by_id((
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.to_string(),
+        ))
+        .one(&self.db)
+        .await
+        .map_err(|e| S3Error::internal_error(e))?
+        .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+
+        let model = action(model.into())?;
+
+        model
+            .update(&self.db)
+            .await
+            .map_err(|e| S3Error::internal_error(e))?;
+
+        Ok(())
     }
 }
