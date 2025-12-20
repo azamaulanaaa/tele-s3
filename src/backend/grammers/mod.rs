@@ -11,6 +11,7 @@ use tokio_util::{
     compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt},
     io::StreamReader,
 };
+use tracing::instrument;
 
 use super::{Backend, BackendError, BoxedAsyncReader};
 
@@ -36,6 +37,7 @@ pub struct Grammers {
 }
 
 impl Grammers {
+    #[instrument(skip(config), err)]
     pub async fn init(config: GrammersConfig) -> anyhow::Result<Self> {
         let session = {
             let session = session::SessionStorage::init(config.db).await?;
@@ -79,6 +81,7 @@ impl Grammers {
         })
     }
 
+    #[instrument(skip(self))]
     pub fn close(self) {
         self.sender_pool_handle.quit();
     }
@@ -86,6 +89,7 @@ impl Grammers {
 
 #[async_trait]
 impl Backend for Grammers {
+    #[instrument(skip(self, reader), ret, err)]
     async fn write(
         &self,
         name: String,
@@ -119,6 +123,7 @@ impl Backend for Grammers {
         Ok(message.id().to_string())
     }
 
+    #[instrument(skip(self), err)]
     async fn read(
         &self,
         key: String,
@@ -215,6 +220,7 @@ impl Backend for Grammers {
         Ok(Some(reader))
     }
 
+    #[instrument(skip(self), err)]
     async fn delete(&self, key: String) -> Result<(), BackendError> {
         let message_id = {
             let numb_key = key.parse::<i32>();
