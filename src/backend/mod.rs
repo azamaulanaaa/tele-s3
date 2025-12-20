@@ -20,7 +20,12 @@ pub enum BackendError {
 
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
-    async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError>;
+    async fn write(
+        &self,
+        name: String,
+        size: u64,
+        reader: BoxedAsyncReader,
+    ) -> Result<String, BackendError>;
 
     async fn read(
         &self,
