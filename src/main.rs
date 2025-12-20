@@ -3,7 +3,7 @@ use std::path::Path;
 use clap::Parser;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use sea_orm::Database;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, signal};
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let s3_service = {
-        let teles3 = TeleS3::init(grammers, db).await?;
+        let teles3 = TeleS3::init(grammers.clone(), db.clone()).await?;
         let mut builder = S3ServiceBuilder::new(teles3);
 
         let auth = SimpleAuth::from_single(&config.auth_access_key, config.auth_secret_key);
@@ -71,15 +71,37 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on port {}", config.listen_port);
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let svc = s3_service.clone();
+        tokio::select! {
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((stream, _)) => {
+                        let io = TokioIo::new(stream);
+                        let svc = s3_service.clone();
 
-        tokio::spawn(async move {
-            let builder = Builder::new(TokioExecutor::new());
-            if let Err(err) = builder.serve_connection(io, svc).await {
-                eprintln!("Error serving connection: {:?}", err);
+                        tokio::spawn(async move {
+                            let builder = Builder::new(TokioExecutor::new());
+                            if let Err(err) = builder.serve_connection(io, svc).await {
+                                tracing::error!("Error serving connection: {:?}", err);
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        tracing::error!("Accept error: {:?}", err);
+                    }
+                }
             }
-        });
+            _ = signal::ctrl_c() => {
+                tracing::info!("Shutdown signal received, starting graceful exit...");
+                break;
+            }
+        }
     }
+    tracing::info!("Shutting down services...");
+
+    db.close().await?;
+    grammers.close();
+
+    tracing::info!("Exited gracefully.");
+
+    Ok(())
 }
