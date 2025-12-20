@@ -52,7 +52,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           echo "Attempting to download artifact for $TARGET (tag: $TAG)..."
-          if gh release download "$TAG" --pattern "*$TARGET.tar.gz" --dir download; then
+          if gh release download "$TAG" --pattern "*$TARGET.tar.xz" --dir download; then
             echo "Download successful!"
             break
           fi
