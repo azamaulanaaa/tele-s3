@@ -13,8 +13,19 @@ pub struct Repository {
 
 impl Repository {
     #[instrument(skip(db))]
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
+        Self::sync_table(&db).await?;
+
+        Ok(Self { db })
+    }
+
+    #[instrument(skip(db), err)]
+    async fn sync_table(db: &DatabaseConnection) -> Result<(), DbErr> {
+        db.get_schema_registry(concat!(module_path!(), "::entity"))
+            .sync(db)
+            .await?;
+
+        Ok(())
     }
 
     #[instrument(skip(self), err)]
