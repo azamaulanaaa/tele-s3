@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::Mutex,
     task::{Context, Poll},
     time::SystemTime,
 };
@@ -28,14 +28,16 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::backend::{Backend, BackendExt, BoxedAsyncReader};
+use crate::{
+    backend::{Backend, BackendExt, BoxedAsyncReader},
+    s3::repo::entity,
+};
 use repo::Repository;
 
 mod repo;
 
 pub struct TeleS3<B: Backend> {
     backend: B,
-    pending_uploads: Arc<tokio::sync::Mutex<HashMap<MultipartUploadKey, MultipartUploadState>>>,
     repo: Repository,
 }
 
@@ -44,11 +46,7 @@ impl<B: Backend> TeleS3<B> {
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
         let repo = Repository::init(db).await?;
 
-        Ok(Self {
-            backend,
-            pending_uploads: Default::default(),
-            repo,
-        })
+        Ok(Self { backend, repo })
     }
 }
 
@@ -220,22 +218,19 @@ impl<B: Backend> S3 for TeleS3<B> {
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let upload_id = uuid::Uuid::new_v4().to_string();
 
-        let key = MultipartUploadKey {
-            bucket: req.input.bucket.clone(),
-            key: req.input.key.clone(),
-            upload_id: upload_id.clone(),
-        };
+        let content = BTreeMap::<i32, MultipartUploadPart>::new();
+        let content_json =
+            serde_json::to_value(&content).map_err(|e| S3Error::internal_error(e))?;
 
-        let state = MultipartUploadState {
-            content_type: req.input.content_type,
-            parts: BTreeMap::new(),
-        };
-
-        {
-            let mut uploads = self.pending_uploads.lock().await;
-
-            uploads.insert(key, state);
-        }
+        self.repo
+            .upsert_multipart_upload_state(
+                req.input.bucket.clone(),
+                req.input.key.clone(),
+                upload_id.clone(),
+                req.input.content_type.clone().map(|v| v.to_string()),
+                content_json,
+            )
+            .await?;
 
         let res = S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(req.input.bucket),
@@ -252,19 +247,10 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        let key = MultipartUploadKey {
-            bucket: req.input.bucket.clone(),
-            key: req.input.key.clone(),
-            upload_id: req.input.upload_id,
-        };
-
-        {
-            let uploads = self.pending_uploads.lock().await;
-
-            if !uploads.contains_key(&key) {
-                return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-            }
-        }
+        let _model = self
+            .repo
+            .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await?;
 
         let size =
             req.input
@@ -297,22 +283,34 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         }
 
-        {
-            let mut uploads = self.pending_uploads.lock().await;
+        let multipart_upload_part = MultipartUploadPart {
+            hash,
+            metadata_item: MetadataItem { id, size },
+        };
 
-            if let Some(state) = uploads.get_mut(&key) {
-                state.parts.insert(
-                    req.input.part_number,
-                    MultipartUploadPart {
-                        hash,
-                        metadata_item: MetadataItem { id, size },
-                    },
-                );
-            } else {
-                let _ = self.backend.delete(id).await;
-                return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-            }
-        }
+        self.repo
+            .update_multipart_upload_state(
+                &req.input.bucket,
+                &req.input.key,
+                &req.input.upload_id,
+                |model| {
+                    let mut content: BTreeMap<i32, MultipartUploadPart> =
+                        serde_json::from_value(model.content.clone())
+                            .map_err(|e| S3Error::internal_error(e))?;
+
+                    content.insert(req.input.part_number, multipart_upload_part.clone());
+
+                    let content_json =
+                        serde_json::to_value(&content).map_err(|e| S3Error::internal_error(e))?;
+
+                    let mut active_model: entity::multipart_upload_state::ActiveModel =
+                        model.into();
+                    active_model.content = sea_orm::Set(content_json);
+
+                    Ok(active_model)
+                },
+            )
+            .await?;
 
         let output = UploadPartOutput {
             ..Default::default()
@@ -326,12 +324,6 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let key = MultipartUploadKey {
-            bucket: req.input.bucket.clone(),
-            key: req.input.key.clone(),
-            upload_id: req.input.upload_id,
-        };
-
         let requested_parts = req
             .input
             .multipart_upload
@@ -343,56 +335,86 @@ impl<B: Backend> S3 for TeleS3<B> {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
 
-        let state = {
-            let mut uploads = self.pending_uploads.lock().await;
-
-            uploads
-                .remove(&key)
-                .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?
-        };
-        let state = state.filter_parts(requested_parts)?;
-
-        let metadata = Metadata {
-            item: state.metadata_item().collect(),
-        };
-        let metadata_json =
-            serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
-
-        let is_exists = self
+        let model = self
             .repo
-            .object_exists(&req.input.bucket, &req.input.key)
-            .await?;
-        let delete_futures = if is_exists {
+            .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+
+        let mut content =
+            serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
+                .map_err(|e| S3Error::internal_error(e))?;
+
+        let filtered_content = requested_parts
+            .iter()
+            .map(|index| content.remove(index))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
+
+        let metadata_json = {
+            let metadata_items = filtered_content
+                .iter()
+                .map(|v| v.metadata_item.clone())
+                .collect::<Vec<_>>();
+            let metadata = Metadata {
+                item: metadata_items,
+            };
+            let metadata_json =
+                serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
+
+            metadata_json
+        };
+
+        let size = filtered_content.iter().map(|v| v.metadata_item.size).sum();
+        let etag = {
+            let part_count = filtered_content.len();
+
+            let hashes_byte = filtered_content
+                .iter()
+                .map(|v| hex_to_bytes(&v.hash))
+                .flatten()
+                .collect::<Vec<_>>();
+
+            let hash = md5::compute(&hashes_byte);
+
+            format!("\"{:x}-{}\"", hash, part_count)
+        };
+
+        let delete_old_object_futures = {
             let model = self
                 .repo
                 .get_object(&req.input.bucket, &req.input.key)
-                .await?;
+                .await;
+            if let Ok(model) = model {
+                let metadata: Metadata = serde_json::from_value(model.content)
+                    .map_err(|e| S3Error::internal_error(e))?;
+                let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
 
-            let metadata: Metadata =
-                serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
-            let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
-
-            Some(delete_futures)
-        } else {
-            None
+                Some(delete_futures)
+            } else {
+                None
+            }
         };
-
-        let content_type = state.content_type.clone().map(|v| v.to_string());
 
         self.repo
             .upsert_object(
-                req.input.bucket,
-                req.input.key,
-                state.size(),
-                content_type,
-                Some(state.etag()),
+                req.input.bucket.clone(),
+                req.input.key.clone(),
+                size,
+                model.content_type,
+                Some(etag),
                 metadata_json,
             )
             .await?;
 
-        if let Some(delete_futures) = delete_futures {
+        if let Some(delete_futures) = delete_old_object_futures {
             let _ = futures::future::join_all(delete_futures).await;
         }
+
+        let delete_dangling_futures = content.into_iter().map(|(_index, multipart_upload_part)| {
+            self.backend.delete(multipart_upload_part.metadata_item.id)
+        });
+        let _ = futures::future::join_all(delete_dangling_futures).await;
 
         let res = S3Response::new(CompleteMultipartUploadOutput {
             ..Default::default()
@@ -406,25 +428,18 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let key = MultipartUploadKey {
-            bucket: req.input.bucket.clone(),
-            key: req.input.key.clone(),
-            upload_id: req.input.upload_id,
-        };
+        let model = self
+            .repo
+            .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
 
-        let state = {
-            let mut uploads = self.pending_uploads.lock().await;
+        let content = serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
+            .map_err(|e| S3Error::internal_error(e))?;
 
-            uploads
-                .remove(&key)
-                .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?
-        };
-
-        let delete_futures = state
-            .parts
-            .values()
-            .map(|part| self.backend.delete(part.metadata_item.id.clone()));
-
+        let delete_futures = content.into_iter().map(|(_index, multipart_upload_part)| {
+            self.backend.delete(multipart_upload_part.metadata_item.id)
+        });
         let _ = futures::future::join_all(delete_futures).await;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
@@ -722,72 +737,10 @@ struct MetadataItem {
     size: u64,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct MultipartUploadKey {
-    bucket: String,
-    key: String,
-    upload_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct MultipartUploadState {
-    content_type: Option<Mime>,
-    parts: BTreeMap<i32, MultipartUploadPart>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultipartUploadPart {
     hash: String,
     metadata_item: MetadataItem,
-}
-
-impl MultipartUploadState {
-    pub fn size(&self) -> u64 {
-        self.parts.iter().map(|v| v.1.metadata_item.size).sum()
-    }
-
-    pub fn etag(&self) -> String {
-        let part_count = self.parts.len();
-
-        let hashes_byte = self
-            .parts
-            .iter()
-            .map(|v| self.hex_to_bytes(&v.1.hash))
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let hash = md5::compute(&hashes_byte);
-
-        format!("\"{:x}-{}\"", hash, part_count)
-    }
-
-    pub fn metadata_item(&self) -> impl Iterator<Item = MetadataItem> {
-        self.parts.iter().map(|v| v.1.metadata_item.clone())
-    }
-
-    pub fn filter_parts(&self, part_numbers: impl IntoIterator<Item = i32>) -> S3Result<Self> {
-        let mut new_parts = BTreeMap::new();
-
-        for part_number in part_numbers {
-            let part = self
-                .parts
-                .get(&part_number)
-                .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
-            new_parts.insert(part_number, part.clone());
-        }
-
-        Ok(Self {
-            content_type: self.content_type.clone(),
-            parts: new_parts,
-        })
-    }
-
-    fn hex_to_bytes(&self, s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("Invalid hex character"))
-            .collect()
-    }
 }
 
 pub struct ChainReaders {
@@ -851,6 +804,13 @@ fn chrono_to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> Timestamp {
     let datetime = Timestamp::from(datetime);
 
     datetime
+}
+
+fn hex_to_bytes(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("Invalid hex character"))
+        .collect()
 }
 
 trait StreamingBlobExt {
