@@ -29,9 +29,8 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::backend::{Backend, BackendExt, BoxedAsyncReader};
-use repo::Repository;
+use repo::{Repository, entity};
 
-mod entity;
 mod repo;
 
 pub struct TeleS3<B: Backend> {
