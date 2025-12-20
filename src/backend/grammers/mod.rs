@@ -30,6 +30,7 @@ pub struct GrammersConfig {
     pub username: String,
 }
 
+#[derive(Clone)]
 pub struct Grammers {
     client: Client,
     sender_pool_handle: SenderPoolHandle,
