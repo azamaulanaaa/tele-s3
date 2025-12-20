@@ -4,7 +4,7 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "s3_bucket")]
 pub struct Model {
-    #[sea_orm(primary_key)]
+    #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub region: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
