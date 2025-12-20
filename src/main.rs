@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let listener = TcpListener::bind(("0.0.0.0", config.listen_port)).await?;
+    tracing::info!("Listening on port {}", config.listen_port);
 
     loop {
         let (stream, _) = listener.accept().await?;
