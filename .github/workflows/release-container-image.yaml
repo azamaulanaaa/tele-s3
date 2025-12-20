@@ -1,16 +1,22 @@
 name: Release Container Image
 
+# Run when the "Release" workflow finishes
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   BINARY_NAME: tele-s3
+  TAG: ${{ github.event.release && github.event.release.tag_name || github.event.workflow_run && github.event.workflow_run.head_branch || '' }}
 
 jobs:
   build-arch-images:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,10 +48,10 @@ jobs:
       - name: Download Release Asset (with Retry)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.TAG }}
           TARGET: ${{ matrix.target }}
         run: |
-          echo "Attempting to download artifact for $TARGET..."
+          echo "Attempting to download artifact for $TARGET (tag: $TAG)..."
           if gh release download "$TAG" --pattern "*$TARGET.tar.gz" --dir download; then
             echo "Download successful!"
             break
@@ -64,8 +70,6 @@ jobs:
           tar -xvf *${{ matrix.target }}.tar.gz
           
           # Locate the binary inside the extracted folder and move to root
-          # cargo-dist usually extracts to: $BINARY_NAME-$VERSION-$TARGET/$BINARY_NAME
-          # We use find to locate the binary regardless of folder structure
           FOUND_BIN=$(find . -name "${{ env.BINARY_NAME }}" -type f | head -n 1)
           
           if [ -z "$FOUND_BIN" ]; then
@@ -85,7 +89,7 @@ jobs:
           file: .github/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-${{ matrix.arch }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}-${{ matrix.arch }}
           build-args: |
             BINARY_NAME=${{ env.BINARY_NAME }}
 
@@ -105,7 +109,7 @@ jobs:
       - name: Create and Push Manifest
         run: |
           BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ env.TAG }}"
           
           # 1. Create the specific version tag (e.g. v1.0.0)
           # combining amd64 and arm64
