@@ -175,10 +175,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         let etag = Some(format!("\"{}\"", hash_md5));
 
         let metadata = Metadata {
-            item: vec![MetadataItem {
-                id: id.clone(),
-                size,
-            }],
+            item: vec![MetadataItem { id, size }],
         };
         let metadata_json =
             serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
@@ -202,25 +199,16 @@ impl<B: Backend> S3 for TeleS3<B> {
             None
         };
 
-        {
-            let result = self
-                .repo
-                .upsert_object(
-                    req.input.bucket,
-                    req.input.key,
-                    size,
-                    req.input.content_type,
-                    etag.clone(),
-                    metadata_json,
-                )
-                .await;
-
-            if let Err(err) = result {
-                let _ = self.backend.delete(id).await;
-
-                return Err(err);
-            }
-        }
+        self.repo
+            .upsert_object(
+                req.input.bucket,
+                req.input.key,
+                size,
+                req.input.content_type,
+                etag.clone(),
+                metadata_json,
+            )
+            .await?;
 
         if let Some(delete_futures) = delete_futures {
             let _ = futures::future::join_all(delete_futures).await;
