@@ -159,10 +159,8 @@ impl<B: Backend> S3 for TeleS3<B> {
             let hash_md5 = hasher_md5
                 .lock()
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
-                .finalize_reset()
-                .into_iter()
-                .map(|v| format!("{:02x}", v))
-                .collect::<String>();
+                .finalize_reset();
+            let hash_md5 = hex::encode(&hash_md5);
 
             (id, hash_md5)
         };
@@ -312,10 +310,8 @@ impl<B: Backend> S3 for TeleS3<B> {
             let hash_md5 = hasher_md5
                 .lock()
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
-                .finalize_reset()
-                .into_iter()
-                .map(|v| format!("{:02x}", v))
-                .collect::<String>();
+                .finalize_reset();
+            let hash_md5 = hex::encode(&hash_md5);
 
             (id, hash_md5)
         };
@@ -414,17 +410,17 @@ impl<B: Backend> S3 for TeleS3<B> {
 
             let hashes_byte = filtered_content
                 .iter()
-                .map(|v| hex_to_bytes(&v.hash))
+                .map(|v| hex::decode(&v.hash))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| S3Error::internal_error(e))?
+                .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
 
-            let hash = md5::Md5::digest(&hashes_byte)
-                .as_slice()
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>();
+            let hash_md5 = md5::Md5::digest(&hashes_byte);
+            let hash_md5 = hex::encode(hash_md5);
 
-            format!("\"{}-{}\"", hash, part_count)
+            format!("\"{}-{}\"", hash_md5, part_count)
         };
 
         let delete_old_object_futures = {
