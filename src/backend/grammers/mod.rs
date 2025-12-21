@@ -100,7 +100,9 @@ impl Backend for Grammers {
         }
 
         let mut compat_reader = reader.compat();
-        let size = size as usize;
+        let size: usize = size
+            .try_into()
+            .map_err(|e| BackendError::Other(Box::new(e)))?;
         let name = uuid::Uuid::new_v4().to_string();
 
         let uploaded = self
@@ -108,7 +110,6 @@ impl Backend for Grammers {
             .upload_stream(&mut compat_reader, size, name)
             .await
             .map_err(|e| BackendError::Other(Box::new(e)))?;
-
         let draft_message = InputMessage::new().file(uploaded).silent(true);
 
         let message = self
@@ -116,8 +117,9 @@ impl Backend for Grammers {
             .send_message(self.peer.clone(), draft_message)
             .await
             .map_err(|e| BackendError::Other(Box::new(e)))?;
+        let message_id = message.id().to_string();
 
-        Ok(message.id().to_string())
+        Ok(message_id)
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -138,81 +140,88 @@ impl Backend for Grammers {
 
             numb_key
         };
-
         let offset: i32 = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
         let limit: Option<i32> = limit
             .map(|v| v.try_into())
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
 
-        let message = {
-            let messages = self
+        let media = {
+            let mut messages = self
                 .client
                 .get_messages_by_id(self.peer.clone(), &[message_id])
                 .await
                 .map_err(|e| BackendError::Other(Box::new(e)))?;
 
-            let message = match messages.get(0).cloned().flatten() {
+            let message = match messages.pop().flatten() {
                 Some(v) => v,
                 None => return Ok(None),
             };
 
-            message
+            let media = match message.media() {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            media
         };
 
-        let media = match message.media() {
-            Some(v) => v,
-            None => return Ok(None),
+        let download_iter = {
+            let client = self.client.clone();
+
+            let skip_chunks = (offset / MAX_CHUNK_SIZE) as i32;
+
+            client
+                .iter_download(&media)
+                .chunk_size(MAX_CHUNK_SIZE)
+                .skip_chunks(skip_chunks)
         };
 
-        let client = self.client.clone();
+        let stream = {
+            let mut prefix_trim = (offset % MAX_CHUNK_SIZE) as usize;
+            let mut bytes_remaining = limit;
 
-        let skip_chunks = (offset / MAX_CHUNK_SIZE) as i32;
-        let download_iter = client
-            .iter_download(&media)
-            .chunk_size(MAX_CHUNK_SIZE)
-            .skip_chunks(skip_chunks);
+            try_stream! {
+                let mut iter = download_iter;
 
-        let mut prefix_trim = (offset % MAX_CHUNK_SIZE) as usize;
-        let mut bytes_remaining = limit;
+                while let Some(mut chunk) = iter.next().await.map_err(|e| std::io::Error::other(
+                        format!("Download failed: {}", e)
+                    ))? {
 
-        let stream = try_stream! {
-            let mut iter = download_iter;
+                    if prefix_trim > 0 {
+                        if chunk.len() <= prefix_trim {
+                            prefix_trim -= chunk.len();
+                            continue;
+                        }
+                        chunk.drain(0..prefix_trim);
+                        prefix_trim = 0;
+                    }
 
-            while let Some(mut chunk) = iter.next().await.map_err(|e| std::io::Error::other(
-                    format!("Download failed: {}", e)
-                ))? {
+                    if let Some(rem) = bytes_remaining {
+                        if rem == 0 {
+                            break;
+                        }
 
-            if prefix_trim > 0 {
-                if chunk.len() <= prefix_trim {
-                    prefix_trim -= chunk.len();
-                    continue;
+                        let current_len = chunk.len() as i32;
+                        if current_len > rem {
+                            chunk.truncate(rem as usize);
+                            bytes_remaining = Some(0);
+                        } else {
+                            bytes_remaining = Some(rem - current_len);
+                        }
+                    }
+
+                yield bytes::Bytes::from(chunk);
                 }
-                chunk.drain(0..prefix_trim);
-                prefix_trim = 0;
-            }
-
-            if let Some(rem) = bytes_remaining {
-                if rem == 0 {
-                    break;
-                }
-
-                let current_len = chunk.len() as i32;
-                if current_len > rem {
-                    chunk.truncate(rem as usize);
-                    bytes_remaining = Some(0);
-                } else {
-                    bytes_remaining = Some(rem - current_len);
-                }
-            }
-
-            yield bytes::Bytes::from(chunk);
             }
         };
 
-        let pinned_stream: BoxedStream = Box::pin(stream);
-        let reader_compat = StreamReader::new(pinned_stream).compat();
-        let reader = Box::pin(reader_compat);
+        let reader = {
+            let pinned_stream: BoxedStream = Box::pin(stream);
+            let reader_compat = StreamReader::new(pinned_stream).compat();
+
+            Box::pin(reader_compat)
+        };
 
         Ok(Some(reader))
     }
