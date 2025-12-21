@@ -1,10 +1,12 @@
-use async_trait::async_trait;
-use futures::io::AsyncRead;
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
+
+use async_trait::async_trait;
+use digest::DynDigest;
+use futures::io::AsyncRead;
 
 pub use grammers::{Grammers, GrammersConfig};
 
@@ -38,18 +40,21 @@ pub trait Backend: Send + Sync + 'static {
 
 #[async_trait]
 pub trait BackendExt: Backend {
-    async fn write_with_hasher<H: Hasher + 'static>(
+    async fn write_with_hasher<H>(
         &self,
         size: u64,
         reader: BoxedAsyncReader,
         hasher: H,
-    ) -> Result<(String, String), BackendError> {
+    ) -> Result<(String, String), BackendError>
+    where
+        H: DynDigest + Send + 'static,
+    {
         let hasher = Arc::new(Mutex::new(hasher));
 
         let id = {
-            let hashing_reader = ReaderWithHasher::new(reader, hasher.clone());
+            let reader_with_hash = ReaderWithHasher::new(reader, hasher.clone());
 
-            let id = self.write(size, Box::pin(hashing_reader)).await?;
+            let id = self.write(size, Box::pin(reader_with_hash)).await?;
 
             id
         };
@@ -58,38 +63,42 @@ pub trait BackendExt: Backend {
             .lock()
             .map_err(|_| BackendError::Other("Hasher poisoned".into()))?;
 
-        Ok((id, hasher.finalize()))
+        let hash = hasher
+            .finalize_reset()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        Ok((id, hash))
     }
 }
 
 impl<T: Backend> BackendExt for T {}
 
-pub trait Hasher: Send + Sync {
-    fn update(&mut self, data: &[u8]);
-    fn finalize(&mut self) -> String;
-}
-
-impl Hasher for md5::Context {
-    fn update(&mut self, data: &[u8]) {
-        self.consume(data);
-    }
-    fn finalize(&mut self) -> String {
-        format!("{:x}", self.clone().finalize())
-    }
-}
-
-struct ReaderWithHasher<R: AsyncRead + Unpin, H: Hasher> {
+struct ReaderWithHasher<R, H>
+where
+    R: AsyncRead + Unpin,
+    H: DynDigest,
+{
     inner: R,
     hasher: Arc<Mutex<H>>,
 }
 
-impl<R: AsyncRead + Unpin, H: Hasher> ReaderWithHasher<R, H> {
+impl<R, H> ReaderWithHasher<R, H>
+where
+    R: AsyncRead + Unpin,
+    H: DynDigest,
+{
     pub fn new(inner: R, hasher: Arc<Mutex<H>>) -> Self {
         Self { inner, hasher }
     }
 }
 
-impl<R: AsyncRead + Unpin, H: Hasher> AsyncRead for ReaderWithHasher<R, H> {
+impl<R, H> AsyncRead for ReaderWithHasher<R, H>
+where
+    R: AsyncRead + Unpin,
+    H: DynDigest,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
