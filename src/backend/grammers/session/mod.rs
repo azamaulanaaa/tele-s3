@@ -16,7 +16,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait,
     QueryFilter, Set, TransactionTrait,
 };
-use tracing::{error, instrument, warn};
+use tracing::{error, instrument};
 
 mod entity;
 
@@ -148,10 +148,7 @@ impl Session for SessionStorage {
 
         match result {
             Ok(Some(v)) => v,
-            Ok(None) => {
-                warn!("No Home DC found, using default");
-                DEFAULT_DC
-            }
+            Ok(None) => DEFAULT_DC,
             Err(e) => {
                 error!(error = ?e, "Failed to query Home DC");
 
@@ -197,11 +194,7 @@ impl Session for SessionStorage {
 
         let dc_option = match result {
             Ok(Some(v)) => Some(v),
-            Ok(None) => {
-                warn!("DC Option not found, find from default list.");
-
-                None
-            }
+            Ok(None) => None,
             Err(e) => {
                 error!(
                     error = ?e,
@@ -242,9 +235,7 @@ impl Session for SessionStorage {
                 .find(|dc_option| dc_option.id == dc_id)
                 .cloned();
 
-            if fallback.is_none() {
-                warn!(dc_id, "DC Option found nowhere (neither DB nor Defaults).");
-            }
+            if fallback.is_none() {}
 
             return fallback;
         }
@@ -311,8 +302,6 @@ impl Session for SessionStorage {
         let peer_info = match peer_info {
             Ok(Some(v)) => v,
             Ok(None) => {
-                warn!("Peer not found");
-
                 return None;
             }
             Err(e) => {
