@@ -54,13 +54,6 @@ jobs:
           echo "Attempting to download artifact for $TARGET (tag: $TAG)..."
           if gh release download "$TAG" --pattern "*$TARGET.tar.xz" --dir download; then
             echo "Download successful!"
-            break
-          fi
-          
-          # Fail if directory is empty (download failed)
-          if [ ! -d "download" ]; then
-            echo "Failed to download artifact"
-            exit 1
           fi
 
       - name: Extract Binary
