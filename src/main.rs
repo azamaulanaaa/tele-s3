@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
         let service = builder.build();
 
-        service.into_shared()
+        service
     };
 
     let listener = TcpListener::bind(("0.0.0.0", config.listen_port)).await?;
