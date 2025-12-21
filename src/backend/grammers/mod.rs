@@ -91,12 +91,7 @@ impl Grammers {
 #[async_trait]
 impl Backend for Grammers {
     #[instrument(skip(self, reader), ret, err)]
-    async fn write(
-        &self,
-        name: String,
-        size: u64,
-        reader: BoxedAsyncReader,
-    ) -> Result<String, BackendError> {
+    async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
         if size > MAX_CONTENT_SIZE {
             return Err(BackendError::ExceedLimitSize {
                 max: MAX_CONTENT_SIZE,
@@ -106,6 +101,7 @@ impl Backend for Grammers {
 
         let mut compat_reader = reader.compat();
         let size = size as usize;
+        let name = uuid::Uuid::new_v4().to_string();
 
         let uploaded = self
             .client
