@@ -12,14 +12,14 @@ pub struct Repository {
 }
 
 impl Repository {
-    #[instrument(skip(db))]
+    #[instrument(skip(db), level = "debug")]
     pub async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
         Self::sync_table(&db).await?;
 
         Ok(Self { db })
     }
 
-    #[instrument(skip(db), err)]
+    #[instrument(skip(db), level = "debug", err)]
     async fn sync_table(db: &DatabaseConnection) -> Result<(), DbErr> {
         db.get_schema_registry(concat!(module_path!(), "::entity"))
             .sync(db)
@@ -28,7 +28,7 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn create_bucket(&self, name: String, region: Option<String>) -> S3Result<()> {
         let active_model = entity::bucket::ActiveModel {
             id: Set(name),
@@ -57,7 +57,7 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn list_buckets(&self) -> S3Result<Vec<entity::bucket::Model>> {
         let buckets = entity::bucket::Entity::find()
             .all(&self.db)
@@ -67,7 +67,7 @@ impl Repository {
         Ok(buckets)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_bucket(&self, name: &str) -> S3Result<()> {
         entity::bucket::Entity::delete_by_id(name)
             .exec(&self.db)
@@ -77,7 +77,7 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn get_bucket_object_count(&self, name: &str) -> S3Result<u64> {
         let object_count = entity::object::Entity::find()
             .filter(entity::object::Column::BucketId.eq(name))
@@ -88,7 +88,7 @@ impl Repository {
         Ok(object_count)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn bucket_exists(&self, name: &str) -> S3Result<bool> {
         let bucket_exists = entity::bucket::Entity::find_by_id(name)
             .one(&self.db)
@@ -99,7 +99,7 @@ impl Repository {
         Ok(bucket_exists)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn upsert_object(
         &self,
         bucket: String,
@@ -138,7 +138,7 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
         let exists = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
@@ -149,7 +149,7 @@ impl Repository {
         Ok(exists)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
         let model = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
@@ -160,7 +160,7 @@ impl Repository {
         Ok(model)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_object(
         &self,
         bucket: &str,
@@ -174,7 +174,7 @@ impl Repository {
         Ok(model)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_objects(
         &self,
         bucket: &str,
@@ -190,7 +190,7 @@ impl Repository {
         Ok(models)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -219,7 +219,7 @@ impl Repository {
         Ok(models)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn upsert_multipart_upload_state(
         &self,
         bucket: String,
@@ -256,7 +256,7 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn get_multipart_upload_state(
         &self,
         bucket: &str,
@@ -276,7 +276,7 @@ impl Repository {
         Ok(model)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_multipart_upload_state(
         &self,
         bucket: &str,
@@ -295,7 +295,7 @@ impl Repository {
         Ok(model)
     }
 
-    #[instrument(skip(self, action), err)]
+    #[instrument(skip(self, action), level = "debug", err)]
     pub async fn update_multipart_upload_state<F>(
         &self,
         bucket: &str,
