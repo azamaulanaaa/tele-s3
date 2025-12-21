@@ -205,7 +205,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.key,
                 size,
                 req.input.content_type,
-                etag,
+                etag.clone(),
                 metadata_json,
             )
             .await?;
@@ -215,6 +215,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         }
 
         let res = S3Response::new(PutObjectOutput {
+            e_tag: etag.map(|v| ETag::Strong(v)),
             ..Default::default()
         });
 
