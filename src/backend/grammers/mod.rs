@@ -38,7 +38,7 @@ pub struct Grammers {
 }
 
 impl Grammers {
-    #[instrument(skip(config), err)]
+    #[instrument(skip(config), level = "debug", err)]
     pub async fn init(config: GrammersConfig) -> anyhow::Result<Self> {
         let session = {
             let session = session::SessionStorage::init(config.db).await?;
@@ -82,7 +82,7 @@ impl Grammers {
         })
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub fn close(self) {
         self.sender_pool_handle.quit();
     }
@@ -90,7 +90,7 @@ impl Grammers {
 
 #[async_trait]
 impl Backend for Grammers {
-    #[instrument(skip(self, reader), ret, err)]
+    #[instrument(skip(self, reader), level = "debug", ret, err)]
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
         if size > MAX_CONTENT_SIZE {
             return Err(BackendError::ExceedLimitSize {
@@ -120,7 +120,7 @@ impl Backend for Grammers {
         Ok(message.id().to_string())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     async fn read(
         &self,
         key: String,
@@ -217,7 +217,7 @@ impl Backend for Grammers {
         Ok(Some(reader))
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     async fn delete(&self, key: String) -> Result<(), BackendError> {
         let message_id = {
             let numb_key = key.parse::<i32>();
