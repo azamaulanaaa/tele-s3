@@ -33,14 +33,14 @@ pub struct SessionStorage {
 }
 
 impl SessionStorage {
-    #[instrument(skip(connection), err)]
+    #[instrument(skip(connection), level = "debug", err)]
     pub async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
         Self::sync_table(&connection).await?;
 
         Ok(Self { inner: connection })
     }
 
-    #[instrument(skip(connection), err)]
+    #[instrument(skip(connection), level = "debug", err)]
     async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
         connection
             .get_schema_registry(concat!(module_path!(), "::entity"))
