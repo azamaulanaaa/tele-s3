@@ -60,7 +60,7 @@ jobs:
         run: |
           cd download
           # Extract the tarball
-          tar -xvf *${{ matrix.target }}.tar.gz
+          tar -xvf *${{ matrix.target }}.tar.xz
           
           # Locate the binary inside the extracted folder and move to root
           FOUND_BIN=$(find . -name "${{ env.BINARY_NAME }}" -type f | head -n 1)
