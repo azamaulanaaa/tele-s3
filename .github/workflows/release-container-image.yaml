@@ -7,6 +7,7 @@ on:
       - Release
     types:
       - completed
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -15,7 +16,7 @@ env:
 
 jobs:
   build-arch-images:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
