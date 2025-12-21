@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use digest::Digest;
 use futures::{Stream, TryStreamExt, io::AsyncRead};
 use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
@@ -146,7 +147,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             .write_with_hasher(
                 size as u64,
                 body_stream.into_boxed_reader(),
-                md5::Context::new(),
+                md5::Md5::new(),
             )
             .await
             .map_err(|e| S3Error::internal_error(e))?;
@@ -262,7 +263,7 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let (id, hash) = self
             .backend
-            .write_with_hasher(size, body_stream.into_boxed_reader(), md5::Context::new())
+            .write_with_hasher(size, body_stream.into_boxed_reader(), md5::Md5::new())
             .await
             .map_err(|e| S3Error::internal_error(e))?;
 
@@ -366,9 +367,13 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .flatten()
                 .collect::<Vec<_>>();
 
-            let hash = md5::compute(&hashes_byte);
+            let hash = md5::Md5::digest(&hashes_byte)
+                .as_slice()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
 
-            format!("\"{:x}-{}\"", hash, part_count)
+            format!("\"{}-{}\"", hash, part_count)
         };
 
         let delete_old_object_futures = {
