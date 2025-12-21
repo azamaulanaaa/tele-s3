@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     pin::Pin,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::SystemTime,
 };
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    backend::{Backend, BackendExt, BoxedAsyncReader},
+    backend::{Backend, BoxedAsyncReader, ReaderWithHasher},
     s3::repo::entity,
 };
 use repo::Repository;
@@ -136,31 +136,43 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .content_length
                 .ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))? as u64;
 
-        let body_stream = req
-            .input
-            .body
-            .take()
-            .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
+        let reader = {
+            let body_stream = req
+                .input
+                .body
+                .take()
+                .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
 
-        let (id, hash) = self
+            body_stream.into_boxed_reader()
+        };
+
+        let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+
+        let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
+
+        let id = self
             .backend
-            .write_with_hasher(
-                size as u64,
-                body_stream.into_boxed_reader(),
-                md5::Md5::new(),
-            )
+            .write(size as u64, reader_with_hasher)
             .await
             .map_err(|e| S3Error::internal_error(e))?;
 
-        if let Some(expected_hash) = req.input.content_md5 {
-            if expected_hash != hash {
+        let hash_md5 = hasher_md5
+            .lock()
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .finalize_reset()
+            .into_iter()
+            .map(|v| format!("{:02x}", v))
+            .collect::<String>();
+
+        if let Some(expected_hash_md5) = req.input.content_md5 {
+            if expected_hash_md5 != hash_md5 {
                 let _ = self.backend.delete(id).await;
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
             }
         }
 
-        let etag = Some(format!("\"{}\"", hash));
+        let etag = Some(format!("\"{}\"", hash_md5));
 
         let metadata = Metadata {
             item: vec![MetadataItem { id, size }],
@@ -255,20 +267,36 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .content_length
                 .ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))? as u64;
 
-        let body_stream = req
-            .input
-            .body
-            .take()
-            .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
+        let reader = {
+            let body_stream = req
+                .input
+                .body
+                .take()
+                .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
 
-        let (id, hash) = self
+            body_stream.into_boxed_reader()
+        };
+
+        let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+
+        let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
+
+        let id = self
             .backend
-            .write_with_hasher(size, body_stream.into_boxed_reader(), md5::Md5::new())
+            .write(size as u64, reader_with_hasher)
             .await
             .map_err(|e| S3Error::internal_error(e))?;
 
+        let hash_md5 = hasher_md5
+            .lock()
+            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .finalize_reset()
+            .into_iter()
+            .map(|v| format!("{:02x}", v))
+            .collect::<String>();
+
         if let Some(expected_hash) = req.input.content_md5 {
-            if expected_hash != hash {
+            if expected_hash != hash_md5 {
                 let _ = self.backend.delete(id).await;
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
@@ -276,7 +304,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         }
 
         let multipart_upload_part = MultipartUploadPart {
-            hash,
+            hash: hash_md5,
             metadata_item: MetadataItem { id, size },
         };
 

@@ -38,44 +38,7 @@ pub trait Backend: Send + Sync + 'static {
     async fn delete(&self, key: String) -> Result<(), BackendError>;
 }
 
-#[async_trait]
-pub trait BackendExt: Backend {
-    async fn write_with_hasher<H>(
-        &self,
-        size: u64,
-        reader: BoxedAsyncReader,
-        hasher: H,
-    ) -> Result<(String, String), BackendError>
-    where
-        H: DynDigest + Send + 'static,
-    {
-        let hasher = Arc::new(Mutex::new(hasher));
-
-        let id = {
-            let reader_with_hash = ReaderWithHasher::new(reader, hasher.clone());
-
-            let id = self.write(size, Box::pin(reader_with_hash)).await?;
-
-            id
-        };
-
-        let mut hasher = hasher
-            .lock()
-            .map_err(|_| BackendError::Other("Hasher poisoned".into()))?;
-
-        let hash = hasher
-            .finalize_reset()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-
-        Ok((id, hash))
-    }
-}
-
-impl<T: Backend> BackendExt for T {}
-
-struct ReaderWithHasher<R, H>
+pub struct ReaderWithHasher<R, H>
 where
     R: AsyncRead + Unpin,
     H: DynDigest,
