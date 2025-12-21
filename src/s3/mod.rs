@@ -41,7 +41,7 @@ pub struct TeleS3<B: Backend> {
 }
 
 impl<B: Backend> TeleS3<B> {
-    #[instrument(skip(backend, db), err)]
+    #[instrument(skip(backend, db), level = "debug", err)]
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
         let repo = Repository::init(db).await?;
 
@@ -117,7 +117,6 @@ impl<B: Backend> S3 for TeleS3<B> {
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         let is_exists = self.repo.bucket_exists(&req.input.bucket).await?;
-
         if !is_exists {
             return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
         }
@@ -146,60 +145,69 @@ impl<B: Backend> S3 for TeleS3<B> {
             body_stream.into_boxed_reader()
         };
 
-        let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+        let (id, hash_md5) = {
+            let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
 
-        let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
+            let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
 
-        let id = self
-            .backend
-            .write(size as u64, reader_with_hasher)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            let id = self
+                .backend
+                .write(size as u64, reader_with_hasher)
+                .await
+                .map_err(|e| S3Error::internal_error(e))?;
 
-        let hash_md5 = hasher_md5
-            .lock()
-            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
-            .finalize_reset()
-            .into_iter()
-            .map(|v| format!("{:02x}", v))
-            .collect::<String>();
+            let hash_md5 = hasher_md5
+                .lock()
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+                .finalize_reset()
+                .into_iter()
+                .map(|v| format!("{:02x}", v))
+                .collect::<String>();
 
-        if let Some(expected_hash_md5) = req.input.content_md5 {
-            if expected_hash_md5 != hash_md5 {
-                let _ = self.backend.delete(id).await;
+            (id, hash_md5)
+        };
 
-                return Err(S3Error::new(S3ErrorCode::BadDigest));
-            }
+        if req.input.content_md5 != Some(hash_md5.clone()) {
+            let _ = self.backend.delete(id).await;
+
+            return Err(S3Error::new(S3ErrorCode::BadDigest));
         }
 
         let etag = Some(format!("\"{}\"", hash_md5));
 
-        let metadata = Metadata {
-            item: vec![MetadataItem {
-                id: id.clone(),
-                size,
-            }],
-        };
-        let metadata_json =
-            serde_json::to_value(&metadata).map_err(|e| S3Error::internal_error(e))?;
+        let content_json = {
+            let content = Metadata {
+                item: vec![MetadataItem {
+                    id: id.clone(),
+                    size,
+                }],
+            };
+            let content_json =
+                serde_json::to_value(&content).map_err(|e| S3Error::internal_error(e))?;
 
-        let is_exists = self
-            .repo
-            .object_exists(&req.input.bucket, &req.input.key)
-            .await?;
-        let delete_futures = if is_exists {
-            let model = self
+            content_json
+        };
+
+        let delete_old_future = {
+            let is_exists = self
                 .repo
-                .get_object(&req.input.bucket, &req.input.key)
+                .object_exists(&req.input.bucket, &req.input.key)
                 .await?;
 
-            let metadata: Metadata =
-                serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
-            let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
+            if is_exists {
+                let model = self
+                    .repo
+                    .get_object(&req.input.bucket, &req.input.key)
+                    .await?;
 
-            Some(delete_futures)
-        } else {
-            None
+                let metadata: Metadata = serde_json::from_value(model.content)
+                    .map_err(|e| S3Error::internal_error(e))?;
+                let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
+
+                Some(delete_futures)
+            } else {
+                None
+            }
         };
 
         {
@@ -211,7 +219,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                     size,
                     req.input.content_type,
                     etag.clone(),
-                    metadata_json,
+                    content_json,
                 )
                 .await;
 
@@ -222,8 +230,8 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         }
 
-        if let Some(delete_futures) = delete_futures {
-            let _ = futures::future::join_all(delete_futures).await;
+        if let Some(delete_future) = delete_old_future {
+            let _ = futures::future::join_all(delete_future).await;
         }
 
         let res = S3Response::new(PutObjectOutput {
@@ -290,30 +298,32 @@ impl<B: Backend> S3 for TeleS3<B> {
             body_stream.into_boxed_reader()
         };
 
-        let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+        let (id, hash_md5) = {
+            let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
 
-        let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
+            let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
 
-        let id = self
-            .backend
-            .write(size as u64, reader_with_hasher)
-            .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            let id = self
+                .backend
+                .write(size as u64, reader_with_hasher)
+                .await
+                .map_err(|e| S3Error::internal_error(e))?;
 
-        let hash_md5 = hasher_md5
-            .lock()
-            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
-            .finalize_reset()
-            .into_iter()
-            .map(|v| format!("{:02x}", v))
-            .collect::<String>();
+            let hash_md5 = hasher_md5
+                .lock()
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+                .finalize_reset()
+                .into_iter()
+                .map(|v| format!("{:02x}", v))
+                .collect::<String>();
 
-        if let Some(expected_hash) = req.input.content_md5 {
-            if expected_hash != hash_md5 {
-                let _ = self.backend.delete(id).await;
+            (id, hash_md5)
+        };
 
-                return Err(S3Error::new(S3ErrorCode::BadDigest));
-            }
+        if req.input.content_md5 != Some(hash_md5.clone()) {
+            let _ = self.backend.delete(id).await;
+
+            return Err(S3Error::new(S3ErrorCode::BadDigest));
         }
 
         let multipart_upload_part = MultipartUploadPart {
@@ -345,11 +355,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             )
             .await?;
 
-        let output = UploadPartOutput {
+        let res = S3Response::new(UploadPartOutput {
             ..Default::default()
-        };
+        });
 
-        Ok(S3Response::new(output))
+        Ok(res)
     }
 
     #[instrument(skip(self), err)]
@@ -527,7 +537,6 @@ impl<B: Backend> S3 for TeleS3<B> {
 
             Some(reader)
         });
-
         let readers = futures::future::try_join_all(reader_futures)
             .await
             .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
@@ -587,14 +596,11 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(|e| S3Error::internal_error(e))?;
 
-        futures::future::try_join_all(
-            metadata
-                .item
-                .iter()
-                .map(|item| self.backend.delete(item.id.clone())),
-        )
-        .await
-        .map_err(|e| S3Error::internal_error(e))?;
+        let delete_futures = metadata
+            .item
+            .iter()
+            .map(|item| self.backend.delete(item.id.clone()));
+        let _ = futures::future::join_all(delete_futures).await;
 
         let res = S3Response::new(DeleteObjectOutput::default());
 
@@ -623,15 +629,12 @@ impl<B: Backend> S3 for TeleS3<B> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        futures::future::try_join_all(
-            metadatas
-                .iter()
-                .map(|metadata| metadata.item.clone())
-                .flatten()
-                .map(|item| self.backend.delete(item.id.clone())),
-        )
-        .await
-        .map_err(|e| S3Error::internal_error(e))?;
+        let delete_futures = metadatas
+            .iter()
+            .map(|metadata| metadata.item.clone())
+            .flatten()
+            .map(|item| self.backend.delete(item.id.clone()));
+        let _ = futures::future::join_all(delete_futures).await;
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
 
@@ -800,12 +803,9 @@ impl Stream for ChainReaders {
         let buffer = &mut this.buffer;
         let readers_mutex = &mut this.readers;
 
-        let mut readers = match readers_mutex.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return Poll::Pending;
-            }
-        };
+        let mut readers = readers_mutex
+            .lock()
+            .map_err(|_| std::io::Error::other("reader poisoned"))?;
 
         loop {
             let reader = match readers.front_mut() {
