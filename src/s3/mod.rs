@@ -144,7 +144,6 @@ impl<B: Backend> S3 for TeleS3<B> {
         let (id, hash) = self
             .backend
             .write_with_hasher(
-                req.input.key.clone(),
                 size as u64,
                 body_stream.into_boxed_reader(),
                 md5::Context::new(),
@@ -261,15 +260,9 @@ impl<B: Backend> S3 for TeleS3<B> {
             .take()
             .ok_or_else(|| S3Error::new(S3ErrorCode::IncompleteBody))?;
 
-        let name = format!("{}.{:03}", &req.input.key, req.input.part_number);
         let (id, hash) = self
             .backend
-            .write_with_hasher(
-                name,
-                size,
-                body_stream.into_boxed_reader(),
-                md5::Context::new(),
-            )
+            .write_with_hasher(size, body_stream.into_boxed_reader(), md5::Context::new())
             .await
             .map_err(|e| S3Error::internal_error(e))?;
 

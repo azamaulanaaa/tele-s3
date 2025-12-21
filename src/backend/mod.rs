@@ -24,12 +24,7 @@ pub enum BackendError {
 
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
-    async fn write(
-        &self,
-        name: String,
-        size: u64,
-        reader: BoxedAsyncReader,
-    ) -> Result<String, BackendError>;
+    async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError>;
 
     async fn read(
         &self,
@@ -45,7 +40,6 @@ pub trait Backend: Send + Sync + 'static {
 pub trait BackendExt: Backend {
     async fn write_with_hasher<H: Hasher + 'static>(
         &self,
-        name: String,
         size: u64,
         reader: BoxedAsyncReader,
         hasher: H,
@@ -55,7 +49,7 @@ pub trait BackendExt: Backend {
         let id = {
             let hashing_reader = ReaderWithHasher::new(reader, hasher.clone());
 
-            let id = self.write(name, size, Box::pin(hashing_reader)).await?;
+            let id = self.write(size, Box::pin(hashing_reader)).await?;
 
             id
         };
