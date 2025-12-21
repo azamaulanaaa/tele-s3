@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     pin::Pin,
-    str::FromStr,
     sync::Mutex,
     task::{Context, Poll},
     time::SystemTime,
@@ -9,7 +8,6 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt, io::AsyncRead};
-use mime::Mime;
 use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
@@ -17,11 +15,11 @@ use s3s::{
         CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
         CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
         DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, GetObjectInput, GetObjectOutput,
-        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-        ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
-        UploadPartInput, UploadPartOutput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetObjectInput,
+        GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+        ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
+        StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -194,7 +192,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.bucket,
                 req.input.key,
                 size,
-                req.input.content_type.map(|v| v.to_string()),
+                req.input.content_type,
                 etag,
                 metadata_json,
             )
@@ -227,7 +225,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.bucket.clone(),
                 req.input.key.clone(),
                 upload_id.clone(),
-                req.input.content_type.clone().map(|v| v.to_string()),
+                req.input.content_type,
                 content_json,
             )
             .await?;
@@ -503,10 +501,10 @@ impl<B: Backend> S3 for TeleS3<B> {
         let body = StreamingBlob::wrap(chain_readers);
 
         let res = S3Response::new(GetObjectOutput {
-            content_type: model.content_type.map(|v| v.parse().ok()).flatten(),
+            content_type: model.content_type,
             content_length: Some(content_length as i64),
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
-            e_tag: model.etag,
+            e_tag: model.etag.map(|v| ETag::Strong(v)),
             body: Some(body),
             ..Default::default()
         });
@@ -527,12 +525,9 @@ impl<B: Backend> S3 for TeleS3<B> {
         let res = S3Response::new(HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             content_length: Some(model.size as i64),
-            content_type: model
-                .content_type
-                .map(|v| Mime::from_str(&v).ok())
-                .flatten(),
+            content_type: model.content_type,
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
-            e_tag: model.etag,
+            e_tag: model.etag.map(|v| ETag::Strong(v)),
             ..Default::default()
         });
 
@@ -697,7 +692,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 key: Some(model.id.clone()),
                 size: Some(model.size.into()),
                 last_modified: Some(chrono_to_timestamp(model.last_modified)),
-                e_tag: model.etag.clone(),
+                e_tag: model.etag.clone().map(|v| ETag::Strong(v)),
                 ..Default::default()
             })
             .collect();
