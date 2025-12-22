@@ -6,6 +6,7 @@ use std::{
     time::SystemTime,
 };
 
+use base64::Engine;
 use bytes::Bytes;
 use digest::Digest;
 use futures::{Stream, TryStreamExt, io::AsyncRead};
@@ -166,13 +167,14 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .lock()
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
                 .finalize_reset();
-            let hash_md5 = hex::encode(hash_md5);
 
             (id, hash_md5)
         };
 
         if let Some(expected_hash) = req.input.content_md5 {
-            if expected_hash != hash_md5.clone() {
+            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(&hash_md5);
+
+            if expected_hash != hash_md5 {
                 if let Some(id) = id {
                     let _ = self.backend.delete(id).await;
                 }
@@ -181,7 +183,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         }
 
-        let etag = Some(hash_md5);
+        let etag = Some(hex::encode(hash_md5));
 
         let content_json = {
             let mut content = Metadata { item: vec![] };
@@ -323,13 +325,14 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .lock()
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
                 .finalize_reset();
-            let hash_md5 = hex::encode(hash_md5);
 
             (id, hash_md5)
         };
 
         if let Some(expected_hash) = req.input.content_md5 {
-            if expected_hash != hash_md5.clone() {
+            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(&hash_md5);
+
+            if expected_hash != hash_md5 {
                 let _ = self.backend.delete(id).await;
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
@@ -337,7 +340,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         }
 
         let multipart_upload_part = MultipartUploadPart {
-            hash: hash_md5.clone(),
+            hash: hex::encode(hash_md5),
             metadata_item: MetadataItem { id, size },
         };
 
@@ -366,7 +369,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             .await?;
 
         let res = S3Response::new(UploadPartOutput {
-            e_tag: Some(ETag::Strong(hash_md5)),
+            e_tag: Some(ETag::Strong(multipart_upload_part.hash)),
             ..Default::default()
         });
 
