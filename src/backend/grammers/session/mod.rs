@@ -206,36 +206,32 @@ impl Session for SessionStorage {
             }
         };
 
-        let dc_option = dc_option
-            .map(|v| {
-                let ipv4 = v.ipv4.parse();
-                let ipv6 = v.ipv6.parse();
+        let dc_option = dc_option.and_then(|v| {
+            let ipv4 = v.ipv4.parse();
+            let ipv6 = v.ipv6.parse();
 
-                let (ipv4, ipv6) = match (ipv4, ipv6) {
-                    (Ok(v4), Ok(v6)) => (v4, v6),
-                    _ => {
-                        error!(dc_id, "Corrupted IP address in database. Ignoring row.");
+            let (ipv4, ipv6) = match (ipv4, ipv6) {
+                (Ok(v4), Ok(v6)) => (v4, v6),
+                _ => {
+                    error!(dc_id, "Corrupted IP address in database. Ignoring row.");
 
-                        return None;
-                    }
-                };
+                    return None;
+                }
+            };
 
-                Some(DcOption {
-                    id: v.dc_id,
-                    ipv4,
-                    ipv6,
-                    auth_key: v.auth_key.map(|v| v.try_into().unwrap()),
-                })
+            Some(DcOption {
+                id: v.dc_id,
+                ipv4,
+                ipv6,
+                auth_key: v.auth_key.map(|v| v.try_into().unwrap()),
             })
-            .flatten();
+        });
 
         if dc_option.is_none() {
             let fallback = KNOWN_DC_OPTIONS
                 .iter()
                 .find(|dc_option| dc_option.id == dc_id)
                 .cloned();
-
-            if fallback.is_none() {}
 
             return fallback;
         }
@@ -316,8 +312,8 @@ impl Session for SessionStorage {
 
         let peer_info = match peer.kind() {
             PeerKind::User | PeerKind::UserSelf => PeerInfo::User {
-                id: PeerId::user(peer_info.peer_id.into()).bare_id(),
-                auth: peer_info.hash.map(|v| PeerAuth::from_hash(v.into())),
+                id: PeerId::user(peer_info.peer_id).bare_id(),
+                auth: peer_info.hash.map(PeerAuth::from_hash),
                 bot: peer_info
                     .subtype
                     .map(|v| v & PeerSubtype::UserBot as u8 != 0),
@@ -328,7 +324,7 @@ impl Session for SessionStorage {
             PeerKind::Chat => PeerInfo::Chat { id: peer.bare_id() },
             PeerKind::Channel => PeerInfo::Channel {
                 id: peer.bare_id(),
-                auth: peer_info.hash.map(|v| PeerAuth::from_hash(v.into())),
+                auth: peer_info.hash.map(PeerAuth::from_hash),
                 kind: peer_info.subtype.and_then(|s| {
                     if (s & PeerSubtype::Gigagroup as u8) == PeerSubtype::Gigagroup as u8 {
                         Some(ChannelKind::Gigagroup)

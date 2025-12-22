@@ -36,9 +36,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = {
         let config_path = Path::new(&args.config);
-        let config = config::Config::try_from(config_path)?;
+        
 
-        config
+        config::Config::try_from(config_path)?
     };
 
     let db = Database::connect(config.database_uri).await?;
@@ -62,9 +62,9 @@ async fn main() -> anyhow::Result<()> {
         let auth = SimpleAuth::from_single(&config.auth_access_key, config.auth_secret_key);
         builder.set_auth(auth);
 
-        let service = builder.build();
+        
 
-        service
+        builder.build()
     };
 
     let listener = TcpListener::bind(("0.0.0.0", config.listen_port)).await?;

@@ -131,14 +131,13 @@ impl Backend for Grammers {
     ) -> Result<Option<BoxedAsyncReader>, BackendError> {
         let message_id = {
             let numb_key = key.parse::<i32>();
-            let numb_key = match numb_key {
+
+            match numb_key {
                 Ok(v) => v,
                 Err(_e) => {
                     return Ok(None);
                 }
-            };
-
-            numb_key
+            }
         };
         let offset: i32 = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
         let limit: Option<i32> = limit
@@ -158,18 +157,16 @@ impl Backend for Grammers {
                 None => return Ok(None),
             };
 
-            let media = match message.media() {
+            match message.media() {
                 Some(v) => v,
                 None => return Ok(None),
-            };
-
-            media
+            }
         };
 
         let download_iter = {
             let client = self.client.clone();
 
-            let skip_chunks = (offset / MAX_CHUNK_SIZE) as i32;
+            let skip_chunks = offset / MAX_CHUNK_SIZE;
 
             client
                 .iter_download(&media)
@@ -230,14 +227,13 @@ impl Backend for Grammers {
     async fn delete(&self, key: String) -> Result<(), BackendError> {
         let message_id = {
             let numb_key = key.parse::<i32>();
-            let numb_key = match numb_key {
+
+            match numb_key {
                 Ok(v) => v,
                 Err(_e) => {
                     return Ok(());
                 }
-            };
-
-            numb_key
+            }
         };
 
         self.client
