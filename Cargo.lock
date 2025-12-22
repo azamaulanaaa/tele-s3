@@ -3091,6 +3091,7 @@ dependencies = [
  "futures",
  "grammers-client",
  "grammers-mtsender",
+ "hex",
  "hyper-util",
  "md-5 0.10.6",
  "s3s",

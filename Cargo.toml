@@ -29,6 +29,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 md-5 = "0.10.6"
 digest = "0.10.7"
+hex = "0.4.3"
 
 [patch.crates-io]
 grammers-client = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-client" }

@@ -12,14 +12,14 @@ pub struct Repository {
 }
 
 impl Repository {
-    #[instrument(skip(db))]
+    #[instrument(skip(db), level = "debug")]
     pub async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
         Self::sync_table(&db).await?;
 
         Ok(Self { db })
     }
 
-    #[instrument(skip(db), err)]
+    #[instrument(skip(db), level = "debug", err)]
     async fn sync_table(db: &DatabaseConnection) -> Result<(), DbErr> {
         db.get_schema_registry(concat!(module_path!(), "::entity"))
             .sync(db)
@@ -28,7 +28,7 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn create_bucket(&self, name: String, region: Option<String>) -> S3Result<()> {
         let active_model = entity::bucket::ActiveModel {
             id: Set(name),
@@ -57,49 +57,49 @@ impl Repository {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn list_buckets(&self) -> S3Result<Vec<entity::bucket::Model>> {
         let buckets = entity::bucket::Entity::find()
             .all(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(buckets)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_bucket(&self, name: &str) -> S3Result<()> {
         entity::bucket::Entity::delete_by_id(name)
             .exec(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn get_bucket_object_count(&self, name: &str) -> S3Result<u64> {
         let object_count = entity::object::Entity::find()
             .filter(entity::object::Column::BucketId.eq(name))
             .count(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(object_count)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn bucket_exists(&self, name: &str) -> S3Result<bool> {
         let bucket_exists = entity::bucket::Entity::find_by_id(name)
             .one(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?
+            .map_err(S3Error::internal_error)?
             .is_some();
 
         Ok(bucket_exists)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn upsert_object(
         &self,
         bucket: String,
@@ -133,34 +133,34 @@ impl Repository {
             )
             .exec(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
         let exists = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?
+            .map_err(S3Error::internal_error)?
             .is_some();
 
         Ok(exists)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
         let model = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?
+            .map_err(S3Error::internal_error)?
             .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
 
         Ok(model)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_object(
         &self,
         bucket: &str,
@@ -169,12 +169,12 @@ impl Repository {
         let model = entity::object::Entity::delete_by_id((bucket.to_string(), key.to_string()))
             .exec_with_returning(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(model)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_objects(
         &self,
         bucket: &str,
@@ -185,12 +185,12 @@ impl Repository {
             .filter(entity::object::Column::Id.is_in(keys.clone()))
             .exec_with_returning(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(models)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -214,12 +214,12 @@ impl Repository {
             .limit(Some(limit))
             .all(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(models)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn upsert_multipart_upload_state(
         &self,
         bucket: String,
@@ -251,12 +251,12 @@ impl Repository {
             )
             .exec(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn get_multipart_upload_state(
         &self,
         bucket: &str,
@@ -270,13 +270,13 @@ impl Repository {
         ))
         .one(&self.db)
         .await
-        .map_err(|e| S3Error::internal_error(e))?
+        .map_err(S3Error::internal_error)?
         .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
 
         Ok(model)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_multipart_upload_state(
         &self,
         bucket: &str,
@@ -290,12 +290,12 @@ impl Repository {
         ))
         .exec_with_returning(&self.db)
         .await
-        .map_err(|e| S3Error::internal_error(e))?;
+        .map_err(S3Error::internal_error)?;
 
         Ok(model)
     }
 
-    #[instrument(skip(self, action), err)]
+    #[instrument(skip(self, action), level = "debug", err)]
     pub async fn update_multipart_upload_state<F>(
         &self,
         bucket: &str,
@@ -315,15 +315,15 @@ impl Repository {
         ))
         .one(&self.db)
         .await
-        .map_err(|e| S3Error::internal_error(e))?
+        .map_err(S3Error::internal_error)?
         .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
 
-        let model = action(model.into())?;
+        let model = action(model)?;
 
         model
             .update(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
