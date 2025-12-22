@@ -100,6 +100,17 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
+    pub async fn get_bucket(&self, name: &str) -> S3Result<entity::bucket::Model> {
+        let bucket = entity::bucket::Entity::find_by_id(name)
+            .one(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?;
+
+        Ok(bucket)
+    }
+
+    #[instrument(skip(self), level = "debug", err)]
     pub async fn upsert_object(
         &self,
         bucket: String,
