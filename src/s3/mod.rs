@@ -836,13 +836,6 @@ fn chrono_to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> Timestamp {
     datetime
 }
 
-fn hex_to_bytes(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("Invalid hex character"))
-        .collect()
-}
-
 trait StreamingBlobExt {
     fn into_boxed_reader(self) -> BoxedAsyncReader;
 }
