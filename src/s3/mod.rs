@@ -148,13 +148,19 @@ impl<B: Backend> S3 for TeleS3<B> {
         let (id, hash_md5) = {
             let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
 
-            let reader_with_hasher = Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
+            let id = if size > 0 {
+                let reader_with_hasher =
+                    Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
 
-            let id = self
-                .backend
-                .write(size, reader_with_hasher)
-                .await
-                .map_err(S3Error::internal_error)?;
+                let id = self
+                    .backend
+                    .write(size, reader_with_hasher)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+                Some(id)
+            } else {
+                None
+            };
 
             let hash_md5 = hasher_md5
                 .lock()
@@ -166,7 +172,9 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         if req.input.content_md5 != Some(hash_md5.clone()) {
-            let _ = self.backend.delete(id).await;
+            if let Some(id) = id {
+                let _ = self.backend.delete(id).await;
+            }
 
             return Err(S3Error::new(S3ErrorCode::BadDigest));
         }
@@ -174,12 +182,11 @@ impl<B: Backend> S3 for TeleS3<B> {
         let etag = Some(format!("\"{}\"", hash_md5));
 
         let content_json = {
-            let content = Metadata {
-                item: vec![MetadataItem {
-                    id: id.clone(),
-                    size,
-                }],
-            };
+            let mut content = Metadata { item: vec![] };
+
+            if let Some(id) = id.clone() {
+                content.item.push(MetadataItem { id, size })
+            }
 
             serde_json::to_value(&content).map_err(S3Error::internal_error)?
         };
@@ -220,7 +227,9 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .await;
 
             if let Err(err) = result {
-                let _ = self.backend.delete(id).await;
+                if let Some(id) = id {
+                    let _ = self.backend.delete(id).await;
+                }
 
                 return Err(err);
             }
@@ -282,6 +291,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             req.input
                 .content_length
                 .ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))? as u64;
+
+        if size == 0 {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+        }
 
         let reader = {
             let body_stream = req
