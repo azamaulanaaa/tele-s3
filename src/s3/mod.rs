@@ -171,12 +171,14 @@ impl<B: Backend> S3 for TeleS3<B> {
             (id, hash_md5)
         };
 
-        if req.input.content_md5 != Some(hash_md5.clone()) {
-            if let Some(id) = id {
-                let _ = self.backend.delete(id).await;
-            }
+        if let Some(expected_hash) = req.input.content_md5 {
+            if expected_hash != hash_md5.clone() {
+                if let Some(id) = id {
+                    let _ = self.backend.delete(id).await;
+                }
 
-            return Err(S3Error::new(S3ErrorCode::BadDigest));
+                return Err(S3Error::new(S3ErrorCode::BadDigest));
+            }
         }
 
         let etag = Some(format!("\"{}\"", hash_md5));
@@ -326,10 +328,12 @@ impl<B: Backend> S3 for TeleS3<B> {
             (id, hash_md5)
         };
 
-        if req.input.content_md5 != Some(hash_md5.clone()) {
-            let _ = self.backend.delete(id).await;
+        if let Some(expected_hash) = req.input.content_md5 {
+            if expected_hash != hash_md5.clone() {
+                let _ = self.backend.delete(id).await;
 
-            return Err(S3Error::new(S3ErrorCode::BadDigest));
+                return Err(S3Error::new(S3ErrorCode::BadDigest));
+            }
         }
 
         let multipart_upload_part = MultipartUploadPart {
