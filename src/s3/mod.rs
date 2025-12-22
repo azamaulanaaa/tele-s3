@@ -416,7 +416,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             let hash_md5 = md5::Md5::digest(&hashes_byte);
             let hash_md5 = hex::encode(hash_md5);
 
-            format!("\"{}-{}\"", hash_md5, part_count)
+            Some(format!("\"{}-{}\"", hash_md5, part_count))
         };
 
         let delete_old_object_futures = {
@@ -441,7 +441,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.key.clone(),
                 size,
                 model.content_type,
-                Some(etag),
+                etag.clone(),
                 metadata_json,
             )
             .await?;
@@ -456,6 +456,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         let _ = futures::future::join_all(delete_dangling_futures).await;
 
         let res = S3Response::new(CompleteMultipartUploadOutput {
+            e_tag: etag.map(ETag::Strong),
             ..Default::default()
         });
 
