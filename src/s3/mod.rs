@@ -181,7 +181,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         }
 
-        let etag = Some(format!("\"{}\"", hash_md5));
+        let etag = Some(hash_md5);
 
         let content_json = {
             let mut content = Metadata { item: vec![] };
@@ -433,7 +433,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             let hash_md5 = md5::Md5::digest(&hashes_byte);
             let hash_md5 = hex::encode(hash_md5);
 
-            Some(format!("\"{}-{}\"", hash_md5, part_count))
+            Some(format!("{}-{}", hash_md5, part_count))
         };
 
         let delete_old_object_futures = {
