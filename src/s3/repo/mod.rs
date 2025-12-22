@@ -62,7 +62,7 @@ impl Repository {
         let buckets = entity::bucket::Entity::find()
             .all(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(buckets)
     }
@@ -72,7 +72,7 @@ impl Repository {
         entity::bucket::Entity::delete_by_id(name)
             .exec(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
@@ -83,7 +83,7 @@ impl Repository {
             .filter(entity::object::Column::BucketId.eq(name))
             .count(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(object_count)
     }
@@ -93,7 +93,7 @@ impl Repository {
         let bucket_exists = entity::bucket::Entity::find_by_id(name)
             .one(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?
+            .map_err(S3Error::internal_error)?
             .is_some();
 
         Ok(bucket_exists)
@@ -133,7 +133,7 @@ impl Repository {
             )
             .exec(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
@@ -143,7 +143,7 @@ impl Repository {
         let exists = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?
+            .map_err(S3Error::internal_error)?
             .is_some();
 
         Ok(exists)
@@ -154,7 +154,7 @@ impl Repository {
         let model = entity::object::Entity::find_by_id((bucket.to_string(), key.to_string()))
             .one(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?
+            .map_err(S3Error::internal_error)?
             .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
 
         Ok(model)
@@ -169,7 +169,7 @@ impl Repository {
         let model = entity::object::Entity::delete_by_id((bucket.to_string(), key.to_string()))
             .exec_with_returning(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(model)
     }
@@ -185,7 +185,7 @@ impl Repository {
             .filter(entity::object::Column::Id.is_in(keys.clone()))
             .exec_with_returning(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(models)
     }
@@ -214,7 +214,7 @@ impl Repository {
             .limit(Some(limit))
             .all(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(models)
     }
@@ -251,7 +251,7 @@ impl Repository {
             )
             .exec(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
@@ -270,7 +270,7 @@ impl Repository {
         ))
         .one(&self.db)
         .await
-        .map_err(|e| S3Error::internal_error(e))?
+        .map_err(S3Error::internal_error)?
         .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
 
         Ok(model)
@@ -290,7 +290,7 @@ impl Repository {
         ))
         .exec_with_returning(&self.db)
         .await
-        .map_err(|e| S3Error::internal_error(e))?;
+        .map_err(S3Error::internal_error)?;
 
         Ok(model)
     }
@@ -315,15 +315,15 @@ impl Repository {
         ))
         .one(&self.db)
         .await
-        .map_err(|e| S3Error::internal_error(e))?
+        .map_err(S3Error::internal_error)?
         .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
 
-        let model = action(model.into())?;
+        let model = action(model)?;
 
         model
             .update(&self.db)
             .await
-            .map_err(|e| S3Error::internal_error(e))?;
+            .map_err(S3Error::internal_error)?;
 
         Ok(())
     }
