@@ -320,7 +320,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         }
 
         let multipart_upload_part = MultipartUploadPart {
-            hash: hash_md5,
+            hash: hash_md5.clone(),
             metadata_item: MetadataItem { id, size },
         };
 
@@ -349,6 +349,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             .await?;
 
         let res = S3Response::new(UploadPartOutput {
+            e_tag: Some(ETag::Strong(hash_md5)),
             ..Default::default()
         });
 
