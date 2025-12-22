@@ -13,15 +13,16 @@ use futures::{Stream, TryStreamExt, io::AsyncRead};
 use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
-        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket,
+        AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
         CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
         CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
         DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetObjectInput,
-        GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-        ListBucketsInput, ListBucketsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput,
-        StreamingBlob, Timestamp, UploadPartInput, UploadPartOutput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetBucketLocationInput,
+        GetBucketLocationOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+        ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
+        PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, UploadPartInput,
+        UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -62,6 +63,20 @@ impl<B: Backend> S3 for TeleS3<B> {
             .await?;
 
         let res = S3Response::new(CreateBucketOutput::default());
+
+        Ok(res)
+    }
+
+    #[instrument(skip(self), err)]
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        let model = self.repo.get_bucket(&req.input.bucket).await?;
+
+        let res = S3Response::new(GetBucketLocationOutput {
+            location_constraint: model.region.map(|v| BucketLocationConstraint::from(v)),
+        });
 
         Ok(res)
     }
