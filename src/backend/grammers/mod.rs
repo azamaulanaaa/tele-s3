@@ -1,4 +1,5 @@
 use std::{
+    ops::RangeInclusive,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -20,6 +21,7 @@ use super::{Backend, BackendError, BoxedAsyncReader};
 mod session;
 
 const MAX_CONTENT_SIZE: usize = 1_000_000_000;
+const EMULATE_FLOOD_RANGE: RangeInclusive<u64> = 0..=(60 * 3 * 1000);
 
 type BoxedStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
@@ -133,6 +135,13 @@ impl Grammers {
 
         None
     }
+
+    async fn emulate_flood(&self) {
+        let duration = Duration::from_millis(ran::ran_u64_range(EMULATE_FLOOD_RANGE));
+
+        let mut guard = self.flood_guard.lock().unwrap();
+        *guard = Some(Instant::now() + duration);
+    }
 }
 
 #[async_trait]
@@ -199,6 +208,8 @@ impl Backend for Grammers {
             }
         };
         let message_id = message.id().to_string();
+
+        self.emulate_flood().await;
 
         Ok(message_id)
     }
@@ -314,6 +325,8 @@ impl Backend for Grammers {
             Box::pin(reader_compat)
         };
 
+        self.emulate_flood().await;
+
         Ok(Some(reader))
     }
 
@@ -338,7 +351,11 @@ impl Backend for Grammers {
                 .delete_messages(self.peer.clone(), &[message_id])
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.emulate_flood().await;
+
+                    return Ok(());
+                }
                 Err(e) => {
                     if self.catch_flood_error(&e).await.is_some() {
                         continue;
