@@ -1,17 +1,19 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::anyhow;
 use async_stream::try_stream;
 use async_trait::async_trait;
-pub use grammers_client::types::Peer;
-use grammers_client::{Client, InputMessage, client::files::MAX_CHUNK_SIZE};
-use grammers_mtsender::{SenderPool, SenderPoolHandle};
+use grammers_client::{Client, InputMessage, client::files::MAX_CHUNK_SIZE, types::Peer};
+use grammers_mtsender::{InvocationError, SenderPool, SenderPoolHandle};
 use sea_orm::DatabaseConnection;
 use tokio_util::{
     compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt},
     io::StreamReader,
 };
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use super::{Backend, BackendError, BoxedAsyncReader};
 
@@ -35,6 +37,7 @@ pub struct Grammers {
     client: Client,
     sender_pool_handle: SenderPoolHandle,
     peer: Peer,
+    flood_guard: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Grammers {
@@ -79,12 +82,56 @@ impl Grammers {
             sender_pool_handle,
             client,
             peer,
+            flood_guard: Default::default(),
         })
     }
 
     #[instrument(skip(self), level = "debug")]
     pub fn close(self) {
         self.sender_pool_handle.quit();
+    }
+
+    async fn check_flood_wait(&self) -> Result<(), BackendError> {
+        let wait_time = {
+            let guard = self
+                .flood_guard
+                .lock()
+                .map_err(|_| BackendError::Other("Flood guard is poisoned".into()))?;
+
+            if let Some(until) = *guard {
+                let now = Instant::now();
+                if until > now { Some(until - now) } else { None }
+            } else {
+                None
+            }
+        };
+
+        if let Some(duration) = wait_time {
+            warn!("Flood guard active. Sleeping for {:.2?}", duration);
+            tokio::time::sleep(duration).await;
+
+            let mut guard = self.flood_guard.lock().unwrap();
+            *guard = None;
+        }
+
+        Ok(())
+    }
+
+    async fn catch_flood_error(&self, err: &InvocationError) -> Option<Duration> {
+        if let InvocationError::Rpc(rpc_err) = err {
+            if rpc_err.name == "FLOOD_WAIT" {
+                let seconds = rpc_err.value.unwrap_or(0) as u64;
+                let duration = Duration::from_secs(seconds + 1);
+
+                let mut guard = self.flood_guard.lock().unwrap();
+                *guard = Some(Instant::now() + duration);
+
+                tracing::warn!("Hit FLOOD_WAIT. Blocking for {}s.", seconds);
+                return Some(duration);
+            }
+        }
+
+        None
     }
 }
 
@@ -105,18 +152,53 @@ impl Backend for Grammers {
             .map_err(|e| BackendError::Other(Box::new(e)))?;
         let name = uuid::Uuid::new_v4().to_string();
 
-        let uploaded = self
+        loop {
+            self.check_flood_wait().await?;
+            break;
+        }
+
+        let uploaded = match self
             .client
             .upload_stream(&mut compat_reader, size, name)
             .await
-            .map_err(|e| BackendError::Other(Box::new(e)))?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::Other {
+                    match e.downcast::<InvocationError>() {
+                        Ok(e) => {
+                            self.catch_flood_error(&e).await;
+                            return Err(BackendError::Other(Box::new(e)));
+                        }
+                        Err(e) => {
+                            return Err(BackendError::Other(Box::new(e)));
+                        }
+                    }
+                }
+
+                return Err(BackendError::Other(Box::new(e)));
+            }
+        };
+
         let draft_message = InputMessage::new().file(uploaded).silent(true);
 
-        let message = self
-            .client
-            .send_message(self.peer.clone(), draft_message)
-            .await
-            .map_err(|e| BackendError::Other(Box::new(e)))?;
+        let message = loop {
+            self.check_flood_wait().await?;
+
+            match self
+                .client
+                .send_message(self.peer.clone(), draft_message.clone())
+                .await
+            {
+                Ok(msg) => break msg,
+                Err(e) => {
+                    if let Some(_wait) = self.catch_flood_error(&e).await {
+                        continue;
+                    }
+                    return Err(BackendError::Other(Box::new(e)));
+                }
+            }
+        };
         let message_id = message.id().to_string();
 
         Ok(message_id)
@@ -145,6 +227,11 @@ impl Backend for Grammers {
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
 
+        loop {
+            self.check_flood_wait().await?;
+            break;
+        }
+
         let media = {
             let mut messages = self
                 .client
@@ -163,53 +250,61 @@ impl Backend for Grammers {
             }
         };
 
-        let download_iter = {
-            let client = self.client.clone();
+        let this = self.clone();
 
-            let skip_chunks = offset / MAX_CHUNK_SIZE;
-
-            client
-                .iter_download(&media)
-                .chunk_size(MAX_CHUNK_SIZE)
-                .skip_chunks(skip_chunks)
-        };
-
-        let stream = {
+        let stream = try_stream! {
             let mut prefix_trim = (offset % MAX_CHUNK_SIZE) as usize;
             let mut bytes_remaining = limit;
 
-            try_stream! {
-                let mut iter = download_iter;
+            let mut download_iter = {
+                let skip_chunks = offset / MAX_CHUNK_SIZE;
 
-                while let Some(mut chunk) = iter.next().await.map_err(|e| std::io::Error::other(
-                        format!("Download failed: {}", e)
-                    ))? {
+                this.client
+                    .iter_download(&media)
+                    .chunk_size(MAX_CHUNK_SIZE)
+                    .skip_chunks(skip_chunks)
+            };
 
-                    if prefix_trim > 0 {
-                        if chunk.len() <= prefix_trim {
-                            prefix_trim -= chunk.len();
+            loop {
+                this.check_flood_wait().await.map_err(|e| std::io::Error::other(e))?;
+
+                let chunk_result = download_iter.next().await;
+
+                let mut chunk = match chunk_result {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) => {
+                        if let Some(_wait) = this.catch_flood_error(&e).await {
                             continue;
                         }
-                        chunk.drain(0..prefix_trim);
-                        prefix_trim = 0;
+                        Err(std::io::Error::other(format!("Download failed: {}", e)))?
+                    }
+                };
+
+                if prefix_trim > 0 {
+                    if chunk.len() <= prefix_trim {
+                        prefix_trim -= chunk.len();
+                        continue;
+                    }
+                    chunk.drain(0..prefix_trim);
+                    prefix_trim = 0;
+                }
+
+                if let Some(rem) = bytes_remaining {
+                    if rem == 0 {
+                        break;
                     }
 
-                    if let Some(rem) = bytes_remaining {
-                        if rem == 0 {
-                            break;
-                        }
-
-                        let current_len = chunk.len() as i32;
-                        if current_len > rem {
-                            chunk.truncate(rem as usize);
-                            bytes_remaining = Some(0);
-                        } else {
-                            bytes_remaining = Some(rem - current_len);
-                        }
+                    let current_len = chunk.len() as i32;
+                    if current_len > rem {
+                        chunk.truncate(rem as usize);
+                        bytes_remaining = Some(0);
+                    } else {
+                        bytes_remaining = Some(rem - current_len);
                     }
+                }
 
                 yield bytes::Bytes::from(chunk);
-                }
             }
         };
 
@@ -236,11 +331,23 @@ impl Backend for Grammers {
             }
         };
 
-        self.client
-            .delete_messages(self.peer.clone(), &[message_id])
-            .await
-            .map_err(|e| BackendError::Other(Box::new(e)))?;
+        loop {
+            self.check_flood_wait().await?;
 
-        Ok(())
+            match self
+                .client
+                .delete_messages(self.peer.clone(), &[message_id])
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if self.catch_flood_error(&e).await.is_some() {
+                        continue;
+                    }
+
+                    return Err(BackendError::Other(Box::new(e)));
+                }
+            }
+        }
     }
 }
