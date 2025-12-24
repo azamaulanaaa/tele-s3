@@ -19,7 +19,7 @@ use super::{Backend, BackendError, BoxedAsyncReader};
 
 mod session;
 
-const MAX_CONTENT_SIZE: u64 = 1_000_000_000;
+const MAX_CONTENT_SIZE: usize = 1_000_000_000;
 
 type BoxedStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
@@ -139,17 +139,16 @@ impl Grammers {
 impl Backend for Grammers {
     #[instrument(skip(self, reader), level = "debug", ret, err)]
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
+        let size: usize = size.try_into().map_err(|_e| BackendError::OutOfRange)?;
+
         if size > MAX_CONTENT_SIZE {
             return Err(BackendError::ExceedLimitSize {
-                max: MAX_CONTENT_SIZE,
-                actual: size,
+                max: MAX_CONTENT_SIZE as u64,
+                actual: size as u64,
             });
         }
 
         let mut compat_reader = reader.compat();
-        let size: usize = size
-            .try_into()
-            .map_err(|e| BackendError::Other(Box::new(e)))?;
         let name = uuid::Uuid::new_v4().to_string();
 
         loop {
@@ -221,8 +220,8 @@ impl Backend for Grammers {
                 }
             }
         };
-        let offset: i32 = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
-        let limit: Option<i32> = limit
+        let offset: usize = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
+        let limit: Option<usize> = limit
             .map(|v| v.try_into())
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
@@ -253,16 +252,16 @@ impl Backend for Grammers {
         let this = self.clone();
 
         let stream = try_stream! {
-            let mut prefix_trim = (offset % MAX_CHUNK_SIZE) as usize;
+            let mut prefix_trim = offset % MAX_CHUNK_SIZE as usize;
             let mut bytes_remaining = limit;
 
             let mut download_iter = {
-                let skip_chunks = offset / MAX_CHUNK_SIZE;
+                let skip_chunks = offset / MAX_CHUNK_SIZE as usize;
 
                 this.client
                     .iter_download(&media)
                     .chunk_size(MAX_CHUNK_SIZE)
-                    .skip_chunks(skip_chunks)
+                    .skip_chunks(skip_chunks as i32)
             };
 
             loop {
@@ -295,9 +294,9 @@ impl Backend for Grammers {
                         break;
                     }
 
-                    let current_len = chunk.len() as i32;
+                    let current_len = chunk.len() ;
                     if current_len > rem {
-                        chunk.truncate(rem as usize);
+                        chunk.truncate(rem);
                         bytes_remaining = Some(0);
                     } else {
                         bytes_remaining = Some(rem - current_len);
