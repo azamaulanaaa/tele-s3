@@ -1,6 +1,6 @@
 [package]
 name = "tele-s3"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 repository = "https://github.com/azamaulanaaa/tele-s3"
 license-file = "LICENSE"
