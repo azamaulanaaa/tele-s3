@@ -325,8 +325,6 @@ impl Backend for Grammers {
             Box::pin(reader_compat)
         };
 
-        self.emulate_flood().await;
-
         Ok(Some(reader))
     }
 
@@ -352,8 +350,6 @@ impl Backend for Grammers {
                 .await
             {
                 Ok(_) => {
-                    self.emulate_flood().await;
-
                     return Ok(());
                 }
                 Err(e) => {
