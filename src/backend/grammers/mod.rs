@@ -20,7 +20,7 @@ use super::{Backend, BackendError, BoxedAsyncReader};
 
 mod session;
 
-const MAX_CONTENT_SIZE: usize = 1_000_000_000;
+const MAX_CONTENT_SIZE: usize = 1_500_000_000;
 const EMULATE_FLOOD_RANGE: RangeInclusive<u64> = 0..=(60 * 3 * 1000);
 
 type BoxedStream =
