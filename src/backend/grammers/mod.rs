@@ -1,5 +1,4 @@
 use std::{
-    ops::RangeInclusive,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -26,7 +25,6 @@ use super::{Backend, BackendError, BoxedAsyncReader};
 
 mod session;
 
-const EMULATE_FLOOD_RANGE: RangeInclusive<u64> = 0..=(60 * 3 * 1000);
 const PART_SIZE: usize = 512 * 1024;
 const MAX_PARTS: i32 = 4000;
 
@@ -142,13 +140,6 @@ impl Grammers {
 
         None
     }
-
-    async fn emulate_flood(&self) {
-        let duration = Duration::from_millis(ran::ran_u64_range(EMULATE_FLOOD_RANGE));
-
-        let mut guard = self.flood_guard.lock().unwrap();
-        *guard = Some(Instant::now() + duration);
-    }
 }
 
 #[async_trait]
@@ -243,8 +234,6 @@ impl Backend for Grammers {
             }
         };
         let message_id = message.id().to_string();
-
-        self.emulate_flood().await;
 
         Ok(message_id)
     }
