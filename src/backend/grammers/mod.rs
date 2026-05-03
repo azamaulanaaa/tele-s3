@@ -7,9 +7,15 @@ use std::{
 use anyhow::anyhow;
 use async_stream::try_stream;
 use async_trait::async_trait;
-use grammers_client::{Client, InputMessage, client::files::MAX_CHUNK_SIZE, types::Peer};
+use grammers_client::{
+    Client, InputMessage,
+    client::files::MAX_CHUNK_SIZE,
+    grammers_tl_types::{functions::upload::SaveBigFilePart, types::InputFileBig},
+    types::{Peer, media::Uploaded},
+};
 use grammers_mtsender::{InvocationError, SenderPool, SenderPoolHandle};
 use sea_orm::DatabaseConnection;
+use tokio::io::AsyncReadExt;
 use tokio_util::{
     compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt},
     io::StreamReader,
@@ -20,8 +26,9 @@ use super::{Backend, BackendError, BoxedAsyncReader};
 
 mod session;
 
-const MAX_CONTENT_SIZE: usize = 1_500_000_000;
 const EMULATE_FLOOD_RANGE: RangeInclusive<u64> = 0..=(60 * 3 * 1000);
+const PART_SIZE: usize = 512 * 1024;
+const MAX_PARTS: i32 = 4000;
 
 type BoxedStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
@@ -148,45 +155,73 @@ impl Grammers {
 impl Backend for Grammers {
     #[instrument(skip(self, reader), level = "debug", ret, err)]
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
-        let size: usize = size.try_into().map_err(|_e| BackendError::OutOfRange)?;
-
-        if size > MAX_CONTENT_SIZE {
+        let max_size = MAX_PARTS as u64 * PART_SIZE as u64;
+        if size > max_size {
             return Err(BackendError::ExceedLimitSize {
-                max: MAX_CONTENT_SIZE as u64,
-                actual: size as u64,
+                max: max_size,
+                actual: size,
             });
         }
 
-        let mut compat_reader = reader.compat();
+        let file_id: i64 = {
+            let now = std::time::SystemTime::now();
+            let duration = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("Time went backwards");
+            duration.as_millis() as i64
+        };
+
         let name = uuid::Uuid::new_v4().to_string();
+        let mut compat_reader = reader.compat();
 
         loop {
             self.check_flood_wait().await?;
             break;
         }
 
-        let uploaded = match self
-            .client
-            .upload_stream(&mut compat_reader, size, name)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::Other {
-                    match e.downcast::<InvocationError>() {
-                        Ok(e) => {
-                            self.catch_flood_error(&e).await;
-                            return Err(BackendError::Other(Box::new(e)));
-                        }
-                        Err(e) => {
-                            return Err(BackendError::Other(Box::new(e)));
-                        }
-                    }
-                }
+        let mut part_index = 0;
+        let total_parts = size.div_ceil(PART_SIZE as u64) as i32;
+        let mut remaining = size as usize;
+        loop {
+            let mut buffer = vec![0u8; PART_SIZE.min(remaining)];
+            let n = compat_reader
+                .read_exact(&mut buffer)
+                .await
+                .map_err(|e| BackendError::Other(e.into()))?;
+            if n == 0 {
+                break;
+            }
+            remaining -= n;
 
+            let result = self
+                .client
+                .invoke(&SaveBigFilePart {
+                    file_id,
+                    file_part: part_index,
+                    file_total_parts: total_parts,
+                    bytes: buffer,
+                })
+                .await;
+            if let Err(e) = result {
+                self.catch_flood_error(&e).await;
                 return Err(BackendError::Other(Box::new(e)));
             }
-        };
+
+            part_index += 1;
+
+            if n < PART_SIZE {
+                break;
+            }
+        }
+
+        let uploaded = Uploaded::from_raw(
+            InputFileBig {
+                id: file_id,
+                parts: part_index,
+                name,
+            }
+            .into(),
+        );
 
         let draft_message = InputMessage::new().file(uploaded).silent(true);
 
