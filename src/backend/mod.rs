@@ -13,7 +13,8 @@ pub use grammers::{Grammers, GrammersConfig};
 
 mod chain_readers;
 mod grammers;
-mod memory;
+#[cfg(test)]
+pub mod memory;
 
 pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
