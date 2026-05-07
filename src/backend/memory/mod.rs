@@ -50,10 +50,43 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         offset: u64,
         limit: Option<u64>,
     ) -> Result<Option<BoxedAsyncReader>, BackendError> {
+        let table = self.table.read().await;
+
+        let key = match key.parse() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+
+        let metadata = match table.get(&key) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
         todo!()
     }
 
     async fn delete(&self, key: String) -> Result<(), BackendError> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use anyhow::anyhow;
+
+    #[tokio::test]
+    async fn test_read_non_existing() -> anyhow::Result<()> {
+        let backend = Memory::<1, 1>::default();
+
+        let key = "key".to_string();
+        let result = backend.read(key, 0, None).await;
+
+        if !result.is_ok_and(|v| v.is_none()) {
+            return Err(anyhow!("should not be able to read non existing object"));
+        }
+
+        Ok(())
     }
 }
