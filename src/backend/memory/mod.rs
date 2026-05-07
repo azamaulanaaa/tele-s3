@@ -311,4 +311,20 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_free_map_on_write() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        let content = [1, 2, 3];
+        let content_reader = Box::pin(Cursor::new(content));
+
+        let _ = backend.write(content.len() as u64, content_reader).await?;
+
+        let free_map = backend.free_map.read().await;
+
+        assert_eq!(free_map[..], [false, false, true]);
+
+        Ok(())
+    }
 }
