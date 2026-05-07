@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use digest::DynDigest;
 use futures::io::AsyncRead;
 
+pub use chain_readers::ChainReaders;
 pub use grammers::{Grammers, GrammersConfig};
 
+mod chain_readers;
 mod grammers;
 mod memory;
 
