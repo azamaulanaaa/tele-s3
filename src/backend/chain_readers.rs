@@ -62,3 +62,34 @@ impl Stream for ChainReaders {
         }
     }
 }
+
+impl AsyncRead for ChainReaders {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+
+        let readers_mutex = &mut this.readers;
+
+        let readers = readers_mutex
+            .get_mut()
+            .map_err(|_| std::io::Error::other("reader poisoned"))?;
+
+        loop {
+            let reader = match readers.front_mut() {
+                Some(r) => r,
+                None => return Poll::Ready(Ok(0)),
+            };
+
+            match Pin::new(reader).poll_read(cx, buf) {
+                Poll::Ready(Ok(0)) => {
+                    readers.pop_front();
+                    continue;
+                }
+                res => return res,
+            }
+        }
+    }
+}
