@@ -11,6 +11,7 @@ use futures::io::AsyncRead;
 pub use grammers::{Grammers, GrammersConfig};
 
 mod grammers;
+mod memory;
 
 pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
