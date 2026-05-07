@@ -223,7 +223,26 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
     }
 
     async fn delete(&self, key: String) -> Result<(), BackendError> {
-        todo!()
+        let key = match key.parse() {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        let metadata = {
+            let mut table = self.table.write().await;
+            let metadata = table.remove(&key);
+            match metadata {
+                Some(v) => v,
+                None => return Ok(()),
+            }
+        };
+
+        let mut free_map = self.free_map.write().await;
+        for chunk_index in metadata.chunks_idx {
+            free_map[chunk_index] = true
+        }
+
+        Ok(())
     }
 }
 
@@ -324,6 +343,42 @@ mod tests {
         let free_map = backend.free_map.read().await;
 
         assert_eq!(free_map[..], [false, false, true]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_free_map_on_delete() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        let content = [1, 2, 3];
+        let content_reader = Box::pin(Cursor::new(content));
+
+        let key = backend.write(content.len() as u64, content_reader).await?;
+        backend.delete(key).await?;
+
+        let free_map = backend.free_map.read().await;
+
+        assert_eq!(free_map[..], [true, true, true]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_after_delete() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        let content = [1, 2, 3];
+        let content_reader = Box::pin(Cursor::new(content));
+
+        let key = backend.write(content.len() as u64, content_reader).await?;
+        backend.delete(key.clone()).await?;
+
+        let result = backend.read(key, 0, None).await;
+
+        if !result.is_ok_and(|v| v.is_none()) {
+            return Err(anyhow!("should not be able to read non existing object"));
+        }
 
         Ok(())
     }
