@@ -15,7 +15,7 @@ impl<const M: usize> Default for Chunk<M> {
     }
 }
 
-struct ObjectMetadata<const N: usize> {
+struct ObjectMetadata {
     chunks: Vec<usize>,
     len: usize,
 }
@@ -23,7 +23,7 @@ struct ObjectMetadata<const N: usize> {
 pub struct Memory<const N: usize, const M: usize> {
     storage: Box<[Arc<RwLock<Chunk<M>>>; N]>,
     free_map: RwLock<[bool; N]>,
-    table: RwLock<BTreeMap<u64, ObjectMetadata<N>>>,
+    table: RwLock<BTreeMap<u64, ObjectMetadata>>,
 }
 
 impl<const N: usize, const M: usize> Default for Memory<N, M> {
@@ -41,6 +41,16 @@ impl<const N: usize, const M: usize> Default for Memory<N, M> {
 #[async_trait::async_trait]
 impl<const N: usize, const M: usize> Backend for Memory<N, M> {
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
+        let free_map = self.free_map.read().await;
+
+        let free_size = (free_map.iter().filter(|&&is_free| is_free).count() * M) as u64;
+        if size > free_size {
+            return Err(BackendError::ExceedLimitSize {
+                max: free_size,
+                actual: size,
+            });
+        }
+
         todo!()
     }
 
@@ -75,6 +85,7 @@ mod tests {
     use super::*;
 
     use anyhow::anyhow;
+    use futures::io::Cursor;
 
     #[tokio::test]
     async fn test_read_non_existing() -> anyhow::Result<()> {
@@ -85,6 +96,26 @@ mod tests {
 
         if !result.is_ok_and(|v| v.is_none()) {
             return Err(anyhow!("should not be able to read non existing object"));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_over_free_capacity() -> anyhow::Result<()> {
+        let backend = Memory::<1, 1>::default();
+
+        let content = "content";
+        let content_reader = Box::pin(Cursor::new(content.as_bytes()));
+        let result = backend.write(content.len() as u64, content_reader).await;
+
+        match result {
+            Err(BackendError::ExceedLimitSize { max: _, actual: _ }) => (),
+            _ => {
+                return Err(anyhow!(
+                    "shoud spit error input size bigger than the free capacity"
+                ));
+            }
         }
 
         Ok(())
