@@ -1,6 +1,7 @@
 use anyhow::Context;
 use aws_sdk_s3::{
     Client,
+    primitives::ByteStream,
     types::{BucketLocationConstraint, CreateBucketConfiguration},
 };
 use config::{REGION, config};
@@ -93,6 +94,70 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
         is_exists
     };
     assert!(!is_exists, "buckets should not exist after delete");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_put_object_and_list_objects() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "put-object-and-list-objects";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test_name";
+    let object_content = "test_content";
+
+    let objects = {
+        let res = client
+            .list_objects()
+            .bucket(bucket_name)
+            .max_keys(10)
+            .send()
+            .await
+            .context("list objects")?;
+        res.contents().to_owned()
+    };
+    assert_eq!(objects.len(), 0);
+
+    {
+        let _ = client
+            .put_object()
+            .bucket(bucket_name)
+            .key(object_name)
+            .body(ByteStream::from_static(object_content.as_bytes()))
+            .send()
+            .await
+            .context("put object");
+    }
+
+    let objects = {
+        let res = client
+            .list_objects()
+            .bucket(bucket_name)
+            .max_keys(10)
+            .send()
+            .await
+            .context("list objects")?;
+        res.contents().to_owned()
+    };
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].key(), Some(object_name));
 
     Ok(())
 }
