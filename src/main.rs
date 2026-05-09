@@ -9,14 +9,12 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use tracing_subscriber::EnvFilter;
 
-use crate::{
+use tele_s3::{
     backend::{Grammers, GrammersConfig},
     s3::TeleS3,
 };
 
-mod backend;
 mod config;
-mod s3;
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about)]
@@ -30,13 +28,18 @@ async fn main() -> anyhow::Result<()> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tele_s3=info"));
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .pretty()
+        // .with_target(true)
+        // .with_file(true)
+        // .with_line_number(true)
+        .with_env_filter(env_filter)
+        .init();
 
     let args = Args::parse();
 
     let config = {
         let config_path = Path::new(&args.config);
-        
 
         config::Config::try_from(config_path)?
     };
@@ -61,8 +64,6 @@ async fn main() -> anyhow::Result<()> {
 
         let auth = SimpleAuth::from_single(&config.auth_access_key, config.auth_secret_key);
         builder.set_auth(auth);
-
-        
 
         builder.build()
     };
