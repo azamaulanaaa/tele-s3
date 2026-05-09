@@ -1,3 +1,4 @@
+use anyhow::Context;
 use aws_sdk_s3::{
     Client,
     types::{BucketLocationConstraint, CreateBucketConfiguration},
@@ -7,14 +8,14 @@ use config::{REGION, config};
 mod config;
 
 #[tokio::test]
-async fn test_create_and_list() -> anyhow::Result<()> {
+async fn test_create_bucket_and_list_bucket() -> anyhow::Result<()> {
     let config = config::<0, 0>().await?;
     let client = Client::new(&config);
 
     let bucket_name = "create-and-list";
 
     let is_exists = {
-        let res = client.list_buckets().send().await?;
+        let res = client.list_buckets().send().await.context("list bucket")?;
         let is_exists = res
             .buckets()
             .iter()
@@ -35,11 +36,12 @@ async fn test_create_and_list() -> anyhow::Result<()> {
             .create_bucket_configuration(cfg)
             .bucket(bucket_name)
             .send()
-            .await?;
+            .await
+            .context("create bucket")?;
     }
 
     let is_exists = {
-        let res = client.list_buckets().send().await?;
+        let res = client.list_buckets().send().await.context("list bucket")?;
         let is_exists = res
             .buckets()
             .iter()
