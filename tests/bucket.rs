@@ -8,8 +8,8 @@ mod config;
 
 #[tokio::test]
 async fn test_create_and_list() -> anyhow::Result<()> {
-    let config = config().await?;
-    let client = Client::new(config);
+    let config = config::<0, 0>().await?;
+    let client = Client::new(&config);
 
     let bucket_name = "create-and-list";
 
