@@ -42,3 +42,9 @@ grammers-session = { git = "https://github.com/azamaulanaaa/grammers", branch = 
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[dev-dependencies]
+aws-config = { version = "1.8.15", default-features = false }
+aws-credential-types = "1.2.14"
+aws-sdk-s3 = { version = "1.129.0", default-features = false, features = ["behavior-version-latest"] }
+s3s-aws = "0.13.0"
