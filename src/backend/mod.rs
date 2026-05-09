@@ -1,20 +1,17 @@
-use std::{
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
-};
+use std::pin::Pin;
 
 use async_trait::async_trait;
-use digest::DynDigest;
 use futures::io::AsyncRead;
 
 pub use chain_readers::ChainReaders;
 pub use grammers::{Grammers, GrammersConfig};
+pub use reader_with_hasher::ReaderWithHasher;
 
 mod chain_readers;
 mod grammers;
 #[cfg(test)]
 pub mod memory;
+mod reader_with_hasher;
 
 pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
@@ -40,49 +37,4 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<Option<BoxedAsyncReader>, BackendError>;
 
     async fn delete(&self, key: String) -> Result<(), BackendError>;
-}
-
-pub struct ReaderWithHasher<R, H>
-where
-    R: AsyncRead + Unpin,
-    H: DynDigest,
-{
-    inner: R,
-    hasher: Arc<Mutex<H>>,
-}
-
-impl<R, H> ReaderWithHasher<R, H>
-where
-    R: AsyncRead + Unpin,
-    H: DynDigest,
-{
-    pub fn new(inner: R, hasher: Arc<Mutex<H>>) -> Self {
-        Self { inner, hasher }
-    }
-}
-
-impl<R, H> AsyncRead for ReaderWithHasher<R, H>
-where
-    R: AsyncRead + Unpin,
-    H: DynDigest,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-
-        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-
-        if let Poll::Ready(Ok(n)) = result {
-            let hasher = &mut this
-                .hasher
-                .lock()
-                .map_err(|_| std::io::Error::other("Hasher poisoned"))?;
-            hasher.update(&buf[..n]);
-        }
-
-        result
-    }
 }
