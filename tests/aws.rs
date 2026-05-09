@@ -12,7 +12,7 @@ async fn test_create_bucket_and_list_bucket() -> anyhow::Result<()> {
     let config = config::<0, 0>().await?;
     let client = Client::new(&config);
 
-    let bucket_name = "create-and-list";
+    let bucket_name = "create-bucket-and-list-bucket";
 
     let is_exists = {
         let res = client.list_buckets().send().await.context("list bucket")?;
@@ -59,7 +59,7 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
     let config = config::<0, 0>().await?;
     let client = Client::new(&config);
 
-    let bucket_name = "create-and-list";
+    let bucket_name = "delete-bucket";
 
     {
         let location = BucketLocationConstraint::from(REGION);
