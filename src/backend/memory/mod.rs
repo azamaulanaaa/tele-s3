@@ -67,7 +67,7 @@ struct ObjectMetadata {
 }
 
 pub struct Memory<const N: usize, const M: usize> {
-    storage: Box<[Arc<RwLock<Chunk<M>>>; N]>,
+    storage: [Arc<RwLock<Chunk<M>>>; N],
     free_map: RwLock<[bool; N]>,
     table: RwLock<BTreeMap<u64, ObjectMetadata>>,
 }
@@ -77,7 +77,7 @@ impl<const N: usize, const M: usize> Default for Memory<N, M> {
         let storage = std::array::from_fn(|_| Arc::new(RwLock::new(Chunk::default())));
 
         Self {
-            storage: Box::new(storage),
+            storage,
             free_map: RwLock::new([true; N]),
             table: Default::default(),
         }
