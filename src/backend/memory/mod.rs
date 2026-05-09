@@ -2,35 +2,28 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use std::{collections::BTreeMap, time::SystemTime};
 
-use futures::io::Cursor;
 use futures::{AsyncRead, AsyncReadExt};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
-use super::{Backend, BackendError, BoxedAsyncReader, ChainReaders};
+use super::{Backend, BackendError, BoxedAsyncReader};
 
-struct Chunk<const M: usize> {
-    data: [u8; M],
-}
-
-struct ChunkReader<const M: usize> {
-    chunk: Arc<RwLock<Chunk<M>>>,
-    start: usize,
-    end: usize,
+struct ObjectReader<const M: usize> {
+    object: Arc<RwLock<Object<M>>>,
+    end: Option<usize>,
     pos: usize,
 }
 
-impl<const M: usize> ChunkReader<M> {
-    fn new(chunk: Arc<RwLock<Chunk<M>>>, start: usize, end: usize) -> Self {
+impl<const M: usize> ObjectReader<M> {
+    fn new(object: Arc<RwLock<Object<M>>>, start: usize, end: Option<usize>) -> Self {
         Self {
-            chunk,
-            start,
+            object,
             end,
-            pos: 0,
+            pos: start,
         }
     }
 }
 
-impl<const M: usize> AsyncRead for ChunkReader<M> {
+impl<const M: usize> AsyncRead for ObjectReader<M> {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -38,7 +31,7 @@ impl<const M: usize> AsyncRead for ChunkReader<M> {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
-        let guard = match this.chunk.try_read() {
+        let object = match this.object.try_read() {
             Ok(g) => g,
             Err(_) => {
                 cx.waker().wake_by_ref();
@@ -46,7 +39,11 @@ impl<const M: usize> AsyncRead for ChunkReader<M> {
             }
         };
 
-        let available = &guard.data[this.start + this.pos..this.end];
+        let idx_chunk = this.pos / M;
+        let chunk_pos = this.pos % M;
+        let chunk_end = ((this.end.unwrap_or(object.len) - this.pos) + chunk_pos).min(M);
+
+        let available = &object.chunks[idx_chunk][chunk_pos..chunk_end];
         let n = std::cmp::min(buf.len(), available.len());
         buf[..n].copy_from_slice(&available[..n]);
 
@@ -55,30 +52,20 @@ impl<const M: usize> AsyncRead for ChunkReader<M> {
     }
 }
 
-impl<const M: usize> Default for Chunk<M> {
-    fn default() -> Self {
-        Self { data: [0; M] }
-    }
-}
-
-struct ObjectMetadata {
-    chunks_idx: Vec<usize>,
+struct Object<const M: usize> {
+    chunks: Vec<[u8; M]>,
     len: usize,
 }
 
 pub struct Memory<const N: usize, const M: usize> {
-    storage: [Arc<RwLock<Chunk<M>>>; N],
-    free_map: RwLock<[bool; N]>,
-    table: RwLock<BTreeMap<u64, ObjectMetadata>>,
+    storage: Mutex<[Option<[u8; M]>; N]>,
+    table: RwLock<BTreeMap<u64, Arc<RwLock<Object<M>>>>>,
 }
 
 impl<const N: usize, const M: usize> Default for Memory<N, M> {
     fn default() -> Self {
-        let storage = std::array::from_fn(|_| Arc::new(RwLock::new(Chunk::default())));
-
         Self {
-            storage,
-            free_map: RwLock::new([true; N]),
+            storage: Mutex::new([Some([0; M]); N]),
             table: Default::default(),
         }
     }
@@ -87,14 +74,14 @@ impl<const N: usize, const M: usize> Default for Memory<N, M> {
 #[async_trait::async_trait]
 impl<const N: usize, const M: usize> Backend for Memory<N, M> {
     async fn write(&self, size: u64, mut reader: BoxedAsyncReader) -> Result<String, BackendError> {
-        let metadata = {
-            let mut free_map = self.free_map.write().await;
+        let mut object = {
+            let mut storage = self.storage.lock().await;
 
             let chunks_needed = size.div_ceil(M as u64) as usize;
-            let chunks_idx: Vec<_> = free_map
+            let chunks_idx: Vec<_> = storage
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, &is_free)| (is_free).then_some(idx))
+                .filter_map(|(idx, &chunk)| chunk.map(|_| idx))
                 .take(chunks_needed)
                 .collect();
 
@@ -107,35 +94,35 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
                 });
             }
 
-            let metadata = ObjectMetadata {
-                chunks_idx,
+            let mut object = Object::<M> {
+                chunks: Vec::new(),
                 len: size as usize,
             };
 
-            for &idx in &metadata.chunks_idx {
-                free_map[idx] = false;
+            for idx in chunks_idx.into_iter() {
+                let chunk = storage[idx]
+                    .take()
+                    .ok_or_else(|| BackendError::Other("unable to take free chunk".into()))?;
+                object.chunks.push(chunk);
             }
 
-            metadata
+            object
         };
 
-        let reminder_len = metadata.len % M;
+        {
+            let reminder_len = object.len % M;
+            let last_idx = object.chunks.len() - 1;
+            for idx in 0..object.chunks.len() {
+                let is_last = idx == last_idx;
 
-        for (idx, &chunk_idx) in metadata.chunks_idx.iter().enumerate() {
-            let chunk = self.storage.get(chunk_idx).ok_or_else(|| {
-                BackendError::Other("chunk index logicly should not ever execeed N".into())
-            })?;
-            let mut chunk = chunk.write().await;
-
-            let is_last = idx == metadata.chunks_idx.len() - 1;
-
-            let _ = if is_last && reminder_len != 0 {
-                reader.read_exact(&mut chunk.data[..reminder_len])
-            } else {
-                reader.read_exact(&mut chunk.data)
+                let _ = if is_last && reminder_len != 0 {
+                    reader.read_exact(&mut object.chunks[idx][..reminder_len])
+                } else {
+                    reader.read_exact(&mut object.chunks[idx])
+                }
+                .await
+                .map_err(|e| BackendError::Other(e.into()))?;
             }
-            .await
-            .map_err(|e| BackendError::Other(e.into()))?;
         }
 
         let key = {
@@ -146,7 +133,8 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
                 .map_err(|e| BackendError::Other(e.into()))?
                 .as_secs();
 
-            let _ = table.insert(key, metadata);
+            let object = Arc::new(RwLock::new(object));
+            let _ = table.insert(key, object);
 
             key.to_string()
         };
@@ -170,56 +158,15 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
             Err(_) => return Ok(None),
         };
 
-        let metadata = match table.get(&key) {
-            Some(v) => v,
+        let object = match table.get(&key) {
+            Some(v) => v.clone(),
             None => return Ok(None),
         };
 
-        if offset >= metadata.len {
-            return Ok(Some(Box::pin(Cursor::new(vec![]))));
-        }
+        let reader = ObjectReader::new(object, offset, limit);
+        let boxpinreader = Box::pin(reader);
 
-        let available_after_offset = metadata.len - offset;
-        let read_len = limit.map_or(available_after_offset, |l| l.min(available_after_offset));
-
-        if read_len == 0 {
-            return Ok(Some(Box::pin(Cursor::new(vec![]))));
-        }
-
-        let n_skip_chunks = offset / M;
-        let start_first_chunk = offset % M;
-        let n_chunks = (read_len + start_first_chunk).div_ceil(M);
-        let end_last_chunk = (read_len + start_first_chunk) % M;
-
-        let mut readers: Vec<BoxedAsyncReader> = Vec::new();
-
-        for (idx, &chunk_idx) in metadata
-            .chunks_idx
-            .iter()
-            .skip(n_skip_chunks)
-            .take(n_chunks)
-            .enumerate()
-        {
-            let mut start = 0;
-            let mut end = M;
-            if idx == 0 {
-                start = start_first_chunk;
-            }
-            if idx == n_chunks - 1 {
-                end = end_last_chunk;
-            }
-
-            let chunk_arc = self
-                .storage
-                .get(chunk_idx)
-                .cloned()
-                .ok_or_else(|| BackendError::Other("Chunk index data out of bound".into()))?;
-            readers.push(Box::pin(ChunkReader::new(chunk_arc, start, end)));
-        }
-
-        let readers = Box::pin(ChainReaders::from_vec(readers));
-
-        Ok(Some(readers))
+        Ok(Some(boxpinreader))
     }
 
     async fn delete(&self, key: String) -> Result<(), BackendError> {
@@ -228,18 +175,26 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
             Err(_) => return Ok(()),
         };
 
-        let metadata = {
+        let object = {
             let mut table = self.table.write().await;
-            let metadata = table.remove(&key);
-            match metadata {
+            let object = table.remove(&key);
+            match object {
                 Some(v) => v,
                 None => return Ok(()),
             }
         };
 
-        let mut free_map = self.free_map.write().await;
-        for chunk_index in metadata.chunks_idx {
-            free_map[chunk_index] = true
+        {
+            let mut object = object.write().await;
+            let mut storage = self.storage.lock().await;
+            for idx in 0..storage.len() {
+                if storage[idx].is_none() {
+                    storage[idx] = object.chunks.pop();
+                    if storage[idx].is_none() {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -332,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_map_on_write() -> anyhow::Result<()> {
+    async fn test_storage_on_write() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
 
         let content = [1, 2, 3];
@@ -340,7 +295,10 @@ mod tests {
 
         let _ = backend.write(content.len() as u64, content_reader).await?;
 
-        let free_map = backend.free_map.read().await;
+        let free_map = {
+            let storage = backend.storage.lock().await;
+            storage.iter().map(|v| v.is_some()).collect::<Vec<_>>()
+        };
 
         assert_eq!(free_map[..], [false, false, true]);
 
@@ -348,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_map_on_delete() -> anyhow::Result<()> {
+    async fn test_storage_on_delete() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
 
         let content = [1, 2, 3];
@@ -357,7 +315,10 @@ mod tests {
         let key = backend.write(content.len() as u64, content_reader).await?;
         backend.delete(key).await?;
 
-        let free_map = backend.free_map.read().await;
+        let free_map = {
+            let storage = backend.storage.lock().await;
+            storage.iter().map(|v| v.is_some()).collect::<Vec<_>>()
+        };
 
         assert_eq!(free_map[..], [true, true, true]);
 
