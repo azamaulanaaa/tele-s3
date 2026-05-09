@@ -5,12 +5,12 @@ use futures::io::AsyncRead;
 
 pub use chain_readers::ChainReaders;
 pub use grammers::{Grammers, GrammersConfig};
+pub use memory::Memory;
 pub use reader_with_hasher::ReaderWithHasher;
 
 mod chain_readers;
 mod grammers;
-#[cfg(test)]
-pub mod memory;
+mod memory;
 mod reader_with_hasher;
 
 pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
