@@ -1,5 +1,9 @@
 [tools]
+cargo-binstall = "latest"
+"cargo:cargo-zigbuild" = "latest"
 rust = { version = "stable", components = "rust-analyzer", targets = "stable-x86_64-pc-windows-gnu" }
+zig = "latest"
 
 [env]
 RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
+CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu"
