@@ -146,16 +146,14 @@ async fn test_put_object_and_list_objects() -> anyhow::Result<()> {
     };
     assert_eq!(objects.len(), 0);
 
-    {
-        let _ = client
-            .put_object()
-            .bucket(bucket_name)
-            .key(object_name)
-            .body(ByteStream::from_static(object_content.as_bytes()))
-            .send()
-            .await
-            .context("put object");
-    }
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_name)
+        .body(ByteStream::from_static(object_content.as_bytes()))
+        .send()
+        .await
+        .context("put object")?;
 
     let objects = {
         let res = client
@@ -212,16 +210,14 @@ async fn test_put_object_and_get_object() -> anyhow::Result<()> {
         Some("NoSuchKey".to_string())
     );
 
-    {
-        let _ = client
-            .put_object()
-            .bucket(bucket_name)
-            .key(object_name)
-            .body(ByteStream::from_static(object_content.as_bytes()))
-            .send()
-            .await
-            .context("put object");
-    }
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_name)
+        .body(ByteStream::from_static(object_content.as_bytes()))
+        .send()
+        .await
+        .context("put object")?;
 
     let output_content = {
         let res = client
