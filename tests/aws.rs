@@ -64,6 +64,15 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
 
     let bucket_name = "delete-bucket";
 
+    let err = {
+        let res = client.delete_bucket().bucket(bucket_name).send().await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("NoSuchBucket".to_string())
+    );
+
     {
         let location = BucketLocationConstraint::from(REGION);
         let cfg = CreateBucketConfiguration::builder()
