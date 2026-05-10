@@ -5,6 +5,7 @@ use aws_sdk_s3::{
     types::{BucketLocationConstraint, CreateBucketConfiguration},
 };
 use config::{REGION, config};
+use tokio::io::AsyncReadExt;
 
 mod config;
 
@@ -158,6 +159,64 @@ async fn test_put_object_and_list_objects() -> anyhow::Result<()> {
     };
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].key(), Some(object_name));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_put_object_and_get_object() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "put-object-and-get-objects";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test_name";
+    let object_content = "test_content";
+
+    {
+        let _ = client
+            .put_object()
+            .bucket(bucket_name)
+            .key(object_name)
+            .body(ByteStream::from_static(object_content.as_bytes()))
+            .send()
+            .await
+            .context("put object");
+    }
+
+    let output_content = {
+        let res = client
+            .get_object()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await
+            .context("get object")?;
+        let mut output_content = String::new();
+        let _ = res
+            .body
+            .into_async_read()
+            .read_to_string(&mut output_content)
+            .await
+            .context("read to string")?;
+        output_content
+    };
+    assert_eq!(output_content, object_content);
 
     Ok(())
 }
