@@ -1,6 +1,7 @@
 use anyhow::Context;
 use aws_sdk_s3::{
     Client,
+    error::ProvideErrorMetadata,
     primitives::ByteStream,
     types::{BucketLocationConstraint, CreateBucketConfiguration},
 };
@@ -187,6 +188,20 @@ async fn test_put_object_and_get_object() -> anyhow::Result<()> {
 
     let object_name = "test_name";
     let object_content = "test_content";
+
+    let err = {
+        let res = client
+            .get_object()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        Some("NoSuchKey".to_string())
+    );
 
     {
         let _ = client
