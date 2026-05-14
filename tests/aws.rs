@@ -529,10 +529,14 @@ async fn test_list_objects_with_prefix_and_delimiter() -> anyhow::Result<()> {
         (res.contents().to_owned(), res.common_prefixes().to_owned())
     };
 
-    assert_eq!(objects_list.len(), 1);
+    assert_eq!(objects_list.len(), 1, "length of object list is not 1");
     assert_eq!(objects_list[0].key(), Some(objects_data[0][0]));
 
-    assert_eq!(common_prefix_list.len(), 1);
+    assert_eq!(
+        common_prefix_list.len(),
+        1,
+        "length of common prefix list is not 1"
+    );
     assert_eq!(common_prefix_list[0].prefix(), Some(common_prefix));
 
     Ok(())
@@ -593,10 +597,14 @@ async fn test_list_objects_v2_with_prefix_and_delimiter() -> anyhow::Result<()> 
         (res.contents().to_owned(), res.common_prefixes().to_owned())
     };
 
-    assert_eq!(objects_list.len(), 1);
+    assert_eq!(objects_list.len(), 1, "length of object list is not 1");
     assert_eq!(objects_list[0].key(), Some(objects_data[0][0]));
 
-    assert_eq!(common_prefix_list.len(), 1);
+    assert_eq!(
+        common_prefix_list.len(),
+        1,
+        "length of common prefix list is not 1"
+    );
     assert_eq!(common_prefix_list[0].prefix(), Some(common_prefix));
 
     Ok(())
