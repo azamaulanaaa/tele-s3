@@ -7,3 +7,8 @@ zig = "latest"
 [env]
 RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
 CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu"
+
+[tasks]
+test = { run = "cargo-zigbuild test" }
+build = { run = "cargo-zigbuild build" }
+run = { run = "cargo-zigbuild run" }
