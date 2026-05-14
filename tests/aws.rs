@@ -497,6 +497,8 @@ async fn test_list_objects_with_prefix_and_delimiter() -> anyhow::Result<()> {
     }
 
     let prefix = "prefix/";
+    let common_prefix = "prefix/sub_item/";
+    let delimiter = "/";
     let objects_data = [
         ["prefix/item", "test_content"],
         ["prefix/sub_item/item", "test_content"],
@@ -514,21 +516,24 @@ async fn test_list_objects_with_prefix_and_delimiter() -> anyhow::Result<()> {
             .context("put object")?;
     }
 
-    let objects_list = {
+    let (objects_list, common_prefix_list) = {
         let res = client
             .list_objects()
             .bucket(bucket_name)
             .prefix(prefix)
-            .delimiter("/")
+            .delimiter(delimiter)
             .max_keys(10)
             .send()
             .await
             .context("list objects")?;
-        res.contents().to_owned()
+        (res.contents().to_owned(), res.common_prefixes().to_owned())
     };
 
     assert_eq!(objects_list.len(), 1);
     assert_eq!(objects_list[0].key(), Some(objects_data[0][0]));
+
+    assert_eq!(common_prefix_list.len(), 1);
+    assert_eq!(common_prefix_list[0].prefix(), Some(common_prefix));
 
     Ok(())
 }
@@ -556,6 +561,8 @@ async fn test_list_objects_v2_with_prefix_and_delimiter() -> anyhow::Result<()> 
     }
 
     let prefix = "prefix/";
+    let common_prefix = "prefix/sub_item/";
+    let delimiter = "/";
     let objects_data = [
         ["prefix/item", "test_content"],
         ["prefix/sub_item/item", "test_content"],
@@ -573,21 +580,24 @@ async fn test_list_objects_v2_with_prefix_and_delimiter() -> anyhow::Result<()> 
             .context("put object")?;
     }
 
-    let objects_list = {
+    let (objects_list, common_prefix_list) = {
         let res = client
             .list_objects_v2()
             .bucket(bucket_name)
             .prefix(prefix)
-            .delimiter("/")
+            .delimiter(delimiter)
             .max_keys(10)
             .send()
             .await
             .context("list objects")?;
-        res.contents().to_owned()
+        (res.contents().to_owned(), res.common_prefixes().to_owned())
     };
 
     assert_eq!(objects_list.len(), 1);
     assert_eq!(objects_list[0].key(), Some(objects_data[0][0]));
+
+    assert_eq!(common_prefix_list.len(), 1);
+    assert_eq!(common_prefix_list[0].prefix(), Some(common_prefix));
 
     Ok(())
 }
