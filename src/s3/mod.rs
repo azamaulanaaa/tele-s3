@@ -11,15 +11,15 @@ use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
-        CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
-        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetBucketLocationInput,
-        GetBucketLocationOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
-        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-        ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
-        PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, UploadPartInput,
-        UploadPartOutput,
+        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+        CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
+        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        GetBucketLocationInput, GetBucketLocationOutput, GetObjectInput, GetObjectOutput,
+        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
+        ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+        ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
+        UploadPartInput, UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -696,33 +696,58 @@ impl<B: Backend> S3 for TeleS3<B> {
             .list_objects(
                 &req.input.bucket,
                 req.input.prefix.clone(),
+                req.input.delimiter.clone(),
                 req.input.marker.clone(),
                 limit,
             )
             .await?;
 
-        let contents: Vec<Object> = models
-            .iter()
-            .map(|model| Object {
-                key: Some(model.id.clone()),
-                size: Some(model.size.into()),
-                last_modified: Some(chrono_to_timestamp(model.last_modified)),
-                ..Default::default()
-            })
-            .collect();
+        let (contents, common_prefix) = models.iter().fold(
+            (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
+            |mut result, model| {
+                let common_prefix = {
+                    let prefix = req.input.prefix.clone().unwrap_or_default();
+                    let id = model.id.clone();
 
-        let key_count = contents.len() as u64;
-        let is_truncated = key_count == limit;
+                    let id_without_prefix = id.strip_prefix(&prefix).unwrap_or(id.as_str());
 
-        let next_marker = if is_truncated {
-            contents.last().and_then(|obj| obj.key.clone())
+                    if let Some(ref delimiter) = req.input.delimiter {
+                        let sub_key = id_without_prefix.split_once(delimiter).map(|v| v.0);
+
+                        sub_key.map(|sub_key| format!("{}{}{}", prefix, sub_key, delimiter,))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(common_prefix) = common_prefix {
+                    result.1.push(CommonPrefix {
+                        prefix: Some(common_prefix),
+                    });
+                } else {
+                    result.0.push(Object {
+                        key: Some(model.id.clone()),
+                        size: Some(model.size.into()),
+                        last_modified: Some(chrono_to_timestamp(model.last_modified)),
+                        ..Default::default()
+                    })
+                }
+
+                result
+            },
+        );
+
+        let next_marker = if models.len() as u64 == limit {
+            models.last().and_then(|model| Some(model.id.clone()))
         } else {
             None
         };
 
+        let is_truncated = next_marker.is_some();
+
         let res = S3Response::new(ListObjectsOutput {
             contents: Some(contents),
-            common_prefixes: None,
+            common_prefixes: Some(common_prefix),
             is_truncated: Some(is_truncated),
             marker: req.input.marker,
             next_marker,
@@ -742,41 +767,66 @@ impl<B: Backend> S3 for TeleS3<B> {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
 
-        let items = self
+        let models = self
             .repo
             .list_objects(
                 &req.input.bucket,
                 req.input.prefix.clone(),
+                req.input.delimiter.clone(),
                 req.input.continuation_token,
                 limit,
             )
             .await?;
 
-        let contents: Vec<Object> = items
-            .iter()
-            .map(|model| Object {
-                key: Some(model.id.clone()),
-                size: Some(model.size.into()),
-                last_modified: Some(chrono_to_timestamp(model.last_modified)),
-                e_tag: model.etag.clone().map(ETag::Strong),
-                ..Default::default()
-            })
-            .collect();
+        let (contents, common_prefix) = models.iter().fold(
+            (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
+            |mut result, model| {
+                let common_prefix = {
+                    let prefix = req.input.prefix.clone().unwrap_or_default();
+                    let id = model.id.clone();
 
-        let next_token = if contents.len() as u64 == limit {
-            contents.last().and_then(|obj| obj.key.clone())
+                    let id_without_prefix = id.strip_prefix(&prefix).unwrap_or(id.as_str());
+
+                    if let Some(ref delimiter) = req.input.delimiter {
+                        let sub_key = id_without_prefix.split_once(delimiter).map(|v| v.0);
+
+                        sub_key.map(|sub_key| format!("{}{}{}", prefix, sub_key, delimiter,))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(common_prefix) = common_prefix {
+                    result.1.push(CommonPrefix {
+                        prefix: Some(common_prefix),
+                    });
+                } else {
+                    result.0.push(Object {
+                        key: Some(model.id.clone()),
+                        size: Some(model.size.into()),
+                        last_modified: Some(chrono_to_timestamp(model.last_modified)),
+                        ..Default::default()
+                    })
+                }
+
+                result
+            },
+        );
+
+        let next_marker = if models.len() as u64 == limit {
+            models.last().and_then(|model| Some(model.id.clone()))
         } else {
             None
         };
 
-        let is_truncated = next_token.is_some();
+        let is_truncated = next_marker.is_some();
 
         let res = S3Response::new(ListObjectsV2Output {
             contents: Some(contents),
-            common_prefixes: None,
+            common_prefixes: Some(common_prefix),
             is_truncated: Some(is_truncated),
-            next_continuation_token: next_token,
-            key_count: Some(items.len() as i32),
+            next_continuation_token: next_marker,
+            key_count: Some(models.len() as i32),
             max_keys: Some(limit as i32),
             name: Some(req.input.bucket),
             prefix: req.input.prefix,

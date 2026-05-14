@@ -1,7 +1,9 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, ExprTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, SqlErr,
+    prelude::Expr,
+    sea_query::{OnConflict, Query},
 };
 use tracing::instrument;
 
@@ -206,19 +208,95 @@ impl Repository {
         &self,
         bucket: &str,
         prefix: Option<String>,
+        delimiter: Option<String>,
         marker: Option<String>,
         limit: u64,
     ) -> S3Result<Vec<entity::object::Model>> {
         let mut query = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
+            .filter(
+                Condition::all()
+                    .add(entity::object::Column::BucketId.eq(bucket))
+                    .add_option(
+                        marker
+                            .clone()
+                            .map(|marker| entity::object::Column::Id.gt(marker)),
+                    )
+                    .add_option(
+                        prefix
+                            .clone()
+                            .map(|prefix| entity::object::Column::Id.starts_with(prefix)),
+                    ),
+            )
             .order_by_asc(entity::object::Column::Id);
 
-        if let Some(prefix) = prefix {
-            query = query.filter(entity::object::Column::Id.starts_with(prefix.clone()));
-        }
+        if let Some(delimiter) = delimiter {
+            let prefix_len = prefix.clone().map(|v| v.len()).unwrap_or_default() as u32;
 
-        if let Some(marker) = marker {
-            query = query.filter(entity::object::Column::Id.gt(marker.clone()));
+            query =
+                query.filter(
+                    Condition::any()
+                        .add(
+                            Expr::cust_with_exprs(
+                                "INSTR(SUBSTR(?, ?), ?)",
+                                [
+                                    entity::object::Column::Id.into_expr(),
+                                    (prefix_len + 1).into(),
+                                    delimiter.clone().into(),
+                                ],
+                            )
+                            .eq(0),
+                        )
+                        .add(
+                            entity::object::Column::Id.in_subquery(
+                                Query::select()
+                                    .expr(entity::object::Column::Id.min())
+                                    // .expr(Expr::cust_with_exprs(
+                                    //     "SUBSTR(MIN(?), 1, ? + INSTR(SUBSTR(MIN(?), ?), ?))",
+                                    //     [
+                                    //         entity::object::Column::Id.into_expr(),
+                                    //         (prefix_len.saturating_sub(1)).into(),
+                                    //         entity::object::Column::Id.into_expr(),
+                                    //         prefix_len.into(),
+                                    //         delimiter.clone().into(),
+                                    //     ],
+                                    // ))
+                                    .from(entity::object::Entity)
+                                    .distinct()
+                                    .cond_where(
+                                        Condition::all()
+                                            .add(entity::object::Column::BucketId.eq(bucket))
+                                            .add_option(marker.map(|marker| {
+                                                entity::object::Column::Id.gt(marker)
+                                            }))
+                                            .add_option(prefix.clone().map(|prefix| {
+                                                entity::object::Column::Id.starts_with(prefix)
+                                            }))
+                                            .add(
+                                                Expr::cust_with_exprs(
+                                                    "INSTR(SUBSTR(?, ?), ?)",
+                                                    [
+                                                        entity::object::Column::Id.into_expr(),
+                                                        (prefix_len + 1).into(),
+                                                        delimiter.clone().into(),
+                                                    ],
+                                                )
+                                                .ne(0),
+                                            ),
+                                    )
+                                    .add_group_by([Expr::cust_with_exprs(
+                                        "SUBSTR(?, 1, ? + INSTR(SUBSTR(?, ?), ?))",
+                                        [
+                                            entity::object::Column::Id.into_expr(),
+                                            prefix_len.into(),
+                                            entity::object::Column::Id.into_expr(),
+                                            (prefix_len + 1).into(),
+                                            delimiter.clone().into(),
+                                        ],
+                                    )])
+                                    .to_owned(),
+                            ),
+                        ),
+                );
         }
 
         let models = query
