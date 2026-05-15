@@ -129,12 +129,12 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        let is_exists = self.repo.bucket_exists(&req.input.bucket).await?;
-        if !is_exists {
-            return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
-        }
+        let model = self.repo.get_bucket(&req.input.bucket).await?;
 
-        let res = S3Response::new(HeadBucketOutput::default());
+        let res = S3Response::new(HeadBucketOutput {
+            bucket_region: model.region,
+            ..Default::default()
+        });
         Ok(res)
     }
 
