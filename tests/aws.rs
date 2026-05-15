@@ -110,6 +110,49 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_head_bucket() -> anyhow::Result<()> {
+    let config = config::<0, 0>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "head-bucket";
+
+    let err = {
+        let res = client.head_bucket().bucket(bucket_name).send().await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("NoSuchBucket".to_string())
+    );
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let res = client
+        .head_bucket()
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("head bucket")?;
+
+    assert_eq!(res.bucket_region(), Some(REGION));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_put_object_and_list_objects() -> anyhow::Result<()> {
     let config = config::<1, 1024>().await?;
     let client = Client::new(&config);
