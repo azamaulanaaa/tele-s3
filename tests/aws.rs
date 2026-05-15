@@ -406,6 +406,88 @@ async fn test_delete_object() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_copy_object() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "copy-object";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test_name";
+    let object_destination_name = "text_name_2";
+    let object_content = "test_content";
+    let copy_source = format!("{}/{}", bucket_name, object_name);
+
+    let err = {
+        let res = client
+            .copy_object()
+            .bucket(bucket_name)
+            .key(object_destination_name)
+            .copy_source(&copy_source)
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        Some("NoSuchKey".to_string())
+    );
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_name)
+        .body(ByteStream::from_static(object_content.as_bytes()))
+        .send()
+        .await
+        .context("put object")?;
+
+    let _ = client
+        .copy_object()
+        .bucket(bucket_name)
+        .key(object_destination_name)
+        .copy_source(&copy_source)
+        .send()
+        .await
+        .context("copy object")?;
+
+    let output_content = {
+        let res = client
+            .get_object()
+            .bucket(bucket_name)
+            .key(object_destination_name)
+            .send()
+            .await
+            .context("get object")?;
+        let mut output_content = String::new();
+        let _ = res
+            .body
+            .into_async_read()
+            .read_to_string(&mut output_content)
+            .await
+            .context("read to string")?;
+        output_content
+    };
+    assert_eq!(output_content, object_content);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_list_objects_with_prefix() -> anyhow::Result<()> {
     let config = config::<2, 1024>().await?;
     let client = Client::new(&config);
