@@ -479,7 +479,7 @@ async fn test_list_objects_with_prefix_and_delimiter() -> anyhow::Result<()> {
     let config = config::<3, 1024>().await?;
     let client = Client::new(&config);
 
-    let bucket_name = "list-objects-v2-with-prefix";
+    let bucket_name = "list-objects-with-prefix-and-delimiter";
 
     {
         let location = BucketLocationConstraint::from(REGION);
@@ -547,7 +547,7 @@ async fn test_list_objects_v2_with_prefix_and_delimiter() -> anyhow::Result<()> 
     let config = config::<3, 1024>().await?;
     let client = Client::new(&config);
 
-    let bucket_name = "list-objects-v2-with-prefix";
+    let bucket_name = "list-objects-v2-with-prefix-and-delimiter";
 
     {
         let location = BucketLocationConstraint::from(REGION);
