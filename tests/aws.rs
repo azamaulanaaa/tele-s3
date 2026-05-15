@@ -609,3 +609,79 @@ async fn test_list_objects_v2_with_prefix_and_delimiter() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_list_objects_with_next_marker() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "list-objects-with-next-marker";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let objects_data = [
+        ["prefix/item", "test_content"],
+        ["prefix/sub_item/item", "test_content"],
+        ["prefix_item", "test_content"],
+    ];
+
+    for &[key, content] in objects_data.iter() {
+        let _ = client
+            .put_object()
+            .bucket(bucket_name)
+            .key(key)
+            .body(ByteStream::from_static(content.as_bytes()))
+            .send()
+            .await
+            .context("put object")?;
+    }
+
+    let (objects_list, next_marker) = {
+        let res = client
+            .list_objects()
+            .bucket(bucket_name)
+            .max_keys(1)
+            .send()
+            .await
+            .context("list objects")?;
+        (
+            res.contents().to_owned(),
+            res.next_marker().map(|v| v.to_owned()),
+        )
+    };
+
+    assert_eq!(objects_list.len(), 1, "length of object list is not 1");
+    assert_eq!(objects_list[0].key(), Some(objects_data[0][0]));
+
+    let next_marker = next_marker.expect("next marker is missing");
+
+    let objects_list = {
+        let res = client
+            .list_objects()
+            .bucket(bucket_name)
+            .max_keys(1)
+            .marker(next_marker)
+            .send()
+            .await
+            .context("list objects with marker")?;
+        res.contents().to_owned()
+    };
+
+    assert_eq!(objects_list.len(), 1, "length of object list is not 1");
+    assert_eq!(objects_list[0].key(), Some(objects_data[1][0]));
+
+    Ok(())
+}
