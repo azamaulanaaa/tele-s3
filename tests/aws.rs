@@ -3,7 +3,10 @@ use aws_sdk_s3::{
     Client,
     error::ProvideErrorMetadata,
     primitives::ByteStream,
-    types::{BucketLocationConstraint, CreateBucketConfiguration},
+    types::{
+        BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
+        CreateBucketConfiguration,
+    },
 };
 use config::{REGION, config};
 use tokio::io::AsyncReadExt;
@@ -883,6 +886,75 @@ async fn test_list_objects_v2_with_continuation_token() -> anyhow::Result<()> {
 
     assert_eq!(objects_list.len(), 1, "length of object list is not 1");
     assert_eq!(objects_list[0].key(), Some(objects_data[1][0]));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_multipart_upload() -> anyhow::Result<()> {
+    let config = config::<2, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "multipart-upload";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test";
+    let objects_content = ["part1", "part2"];
+
+    let upload_id = {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await
+            .context("create multipart upload")?;
+
+        res.upload_id.context("missing upload id")?
+    };
+
+    let mut completed_part = CompletedMultipartUpload::builder();
+    for (idx, content) in objects_content.iter().enumerate() {
+        let part_number = (idx as i32) + 1;
+        let _ = client
+            .upload_part()
+            .bucket(bucket_name)
+            .upload_id(&upload_id)
+            .key(object_name)
+            .part_number(part_number)
+            .body(ByteStream::from_static(content.as_bytes()))
+            .send()
+            .await
+            .context("upload part")?;
+
+        completed_part =
+            completed_part.parts(CompletedPart::builder().part_number(part_number).build())
+    }
+    let completed_part = completed_part.build();
+
+    let _ = client
+        .complete_multipart_upload()
+        .bucket(bucket_name)
+        .upload_id(upload_id)
+        .key(object_name)
+        .multipart_upload(completed_part)
+        .send()
+        .await
+        .context("complete multipart upload")?;
 
     Ok(())
 }
