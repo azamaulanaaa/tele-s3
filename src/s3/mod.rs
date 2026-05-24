@@ -261,6 +261,7 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let res = S3Response::new(PutObjectOutput {
             e_tag: etag.map(ETag::Strong),
+            size: Some(size as i64),
             ..Default::default()
         });
 
