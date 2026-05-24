@@ -56,10 +56,12 @@ impl<B: Backend> S3 for TeleS3<B> {
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         self.repo
-            .create_bucket(req.input.bucket, req.region.map(|v| v.to_string()))
+            .create_bucket(req.input.bucket, req.region.clone().map(|v| v.to_string()))
             .await?;
 
-        let res = S3Response::new(CreateBucketOutput::default());
+        let res = S3Response::new(CreateBucketOutput {
+            location: req.region.map(|v| v.to_string()),
+        });
 
         Ok(res)
     }
