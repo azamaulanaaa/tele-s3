@@ -18,8 +18,8 @@ use s3s::{
         GetBucketLocationInput, GetBucketLocationOutput, GetObjectInput, GetObjectOutput,
         HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
         ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
-        UploadPartInput, UploadPartOutput,
+        ListObjectsV2Output, LocationType, Object, PutObjectInput, PutObjectOutput, StreamingBlob,
+        Timestamp, UploadPartInput, UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -134,6 +134,8 @@ impl<B: Backend> S3 for TeleS3<B> {
         let model = self.repo.get_bucket(&req.input.bucket).await?;
 
         let res = S3Response::new(HeadBucketOutput {
+            bucket_location_name: model.region.clone(),
+            bucket_location_type: Some(LocationType::from_static(LocationType::LOCAL_ZONE)),
             bucket_region: model.region,
             ..Default::default()
         });
