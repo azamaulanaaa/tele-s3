@@ -493,6 +493,8 @@ impl<B: Backend> S3 for TeleS3<B> {
         let _ = futures::future::join_all(delete_dangling_futures).await;
 
         let res = S3Response::new(CompleteMultipartUploadOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
             e_tag: etag.map(ETag::Strong),
             ..Default::default()
         });
