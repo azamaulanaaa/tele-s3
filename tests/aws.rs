@@ -280,6 +280,65 @@ async fn test_put_object_and_list_objects_v2() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_put_object_and_head_object() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "put-object-and-head-objects";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test_name";
+    let object_content = "test_content";
+
+    let err = {
+        let res = client
+            .head_object()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        Some("NoSuchKey".to_string())
+    );
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_name)
+        .body(ByteStream::from_static(object_content.as_bytes()))
+        .send()
+        .await
+        .context("put object")?;
+
+    client
+        .head_object()
+        .bucket(bucket_name)
+        .key(object_name)
+        .send()
+        .await
+        .context("head object")?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_put_object_and_get_object() -> anyhow::Result<()> {
     let config = config::<1, 1024>().await?;
     let client = Client::new(&config);
