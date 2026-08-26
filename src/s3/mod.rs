@@ -16,13 +16,15 @@ use s3s::{
         CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
         DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
         DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition,
-        GetBucketLocationInput,
-        GetBucketLocationOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
-        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput, ListObjectsOutput,
-        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, LocationType,
-        MultipartUpload, Object, Part, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
-        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+        GetBucketAclInput, GetBucketAclOutput, GetBucketLocationInput, GetBucketLocationOutput,
+        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee,
+        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
+        ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput,
+        ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
+        ListPartsOutput, LocationType, MultipartUpload, Object, Owner, Part, PutBucketAclInput,
+        PutBucketAclOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectOutput,
+        StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+        UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -1367,6 +1369,55 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         Ok(res)
     }
+
+    #[instrument(skip(self), err)]
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<GetBucketAclInput>,
+    ) -> S3Result<S3Response<GetBucketAclOutput>> {
+        self.repo.get_bucket(&req.input.bucket).await?;
+
+        Ok(S3Response::new(GetBucketAclOutput {
+            owner: Some(canned_owner()),
+            grants: Some(vec![full_control_grant()]),
+        }))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request<PutBucketAclInput>,
+    ) -> S3Result<S3Response<PutBucketAclOutput>> {
+        // Existence-checked, otherwise accepted and ignored: this backend
+        // has no ACL enforcement, but clients probing ACLs must not error.
+        self.repo.get_bucket(&req.input.bucket).await?;
+
+        Ok(S3Response::new(PutBucketAclOutput::default()))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn get_object_acl(
+        &self,
+        req: S3Request<GetObjectAclInput>,
+    ) -> S3Result<S3Response<GetObjectAclOutput>> {
+        self.repo.get_object(&req.input.bucket, &req.input.key).await?;
+
+        Ok(S3Response::new(GetObjectAclOutput {
+            owner: Some(canned_owner()),
+            grants: Some(vec![full_control_grant()]),
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn put_object_acl(
+        &self,
+        req: S3Request<PutObjectAclInput>,
+    ) -> S3Result<S3Response<PutObjectAclOutput>> {
+        self.repo.get_object(&req.input.bucket, &req.input.key).await?;
+
+        Ok(S3Response::new(PutObjectAclOutput::default()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1397,6 +1448,28 @@ fn chrono_to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> Timestamp {
     let datetime: SystemTime = datetime.into();
 
     Timestamp::from(datetime)
+}
+
+/// The single synthetic owner every resource is reported to belong to.
+fn canned_owner() -> Owner {
+    Owner {
+        display_name: Some("tele-s3".into()),
+        id: Some("tele-s3".into()),
+    }
+}
+
+/// Full control granted to the synthetic owner.
+fn full_control_grant() -> Grant {
+    Grant {
+        grantee: Some(Grantee {
+            display_name: Some("tele-s3".into()),
+            email_address: None,
+            id: Some("tele-s3".into()),
+            type_: s3s::dto::Type::CANONICAL_USER.to_string().into(),
+            uri: None,
+        }),
+        permission: Some(s3s::dto::Permission::FULL_CONTROL.to_string().into()),
+    }
 }
 
 /// Translate If-Match / If-None-Match headers into a write precondition.
