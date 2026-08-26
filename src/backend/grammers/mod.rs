@@ -125,8 +125,8 @@ impl Grammers {
     }
 
     async fn catch_flood_error(&self, err: &InvocationError) -> Option<Duration> {
-        if let InvocationError::Rpc(rpc_err) = err {
-            if rpc_err.name == "FLOOD_WAIT" {
+        if let InvocationError::Rpc(rpc_err) = err
+            && rpc_err.name == "FLOOD_WAIT" {
                 let seconds = rpc_err.value.unwrap_or(0) as u64;
                 let duration = Duration::from_secs(seconds + 1);
 
@@ -136,7 +136,6 @@ impl Grammers {
                 tracing::warn!("Hit FLOOD_WAIT. Blocking for {}s.", seconds);
                 return Some(duration);
             }
-        }
 
         None
     }
@@ -300,7 +299,7 @@ impl Backend for Grammers {
             };
 
             loop {
-                this.check_flood_wait().await.map_err(|e| std::io::Error::other(e))?;
+                this.check_flood_wait().await.map_err(std::io::Error::other)?;
 
                 let chunk_result = download_iter.next().await;
 
