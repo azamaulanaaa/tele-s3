@@ -866,7 +866,9 @@ impl<B: Backend> S3 for TeleS3<B> {
                 &req.input.bucket,
                 req.input.prefix.clone(),
                 req.input.delimiter.clone(),
-                req.input.continuation_token,
+                // start-after only applies to the first page; once a
+                // continuation token is present it takes precedence.
+                req.input.continuation_token.clone().or(req.input.start_after.clone()),
                 limit,
             )
             .await?;
