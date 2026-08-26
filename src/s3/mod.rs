@@ -188,10 +188,16 @@ impl<B: Backend> S3 for TeleS3<B> {
             (id, hash_md5)
         };
 
-        if let Some(expected_hash) = req.input.content_md5 {
-            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(hash_md5);
+        if let Some(expected) = req.input.content_md5 {
+            // Decode instead of comparing strings so padding/whitespace
+            // variations in the client header don't cause false mismatches.
+            let expected_digest =
+                match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
+                    Ok(v) => v,
+                    Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
+                };
 
-            if expected_hash != hash_md5 {
+            if expected_digest[..] != hash_md5[..] {
                 if let Some(id) = id {
                     let _ = self.backend.delete(id).await;
                 }
@@ -427,10 +433,14 @@ impl<B: Backend> S3 for TeleS3<B> {
             (id, hash_md5)
         };
 
-        if let Some(expected_hash) = req.input.content_md5 {
-            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(hash_md5);
+        if let Some(expected) = req.input.content_md5 {
+            let expected_digest =
+                match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
+                    Ok(v) => v,
+                    Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
+                };
 
-            if expected_hash != hash_md5 {
+            if expected_digest[..] != hash_md5[..] {
                 let _ = self.backend.delete(id).await;
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
