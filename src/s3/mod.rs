@@ -6,7 +6,7 @@ use std::{
 
 use base64::Engine;
 use digest::Digest;
-use futures::TryStreamExt;
+use futures::{io::AsyncReadExt, TryStreamExt};
 use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
@@ -1217,10 +1217,53 @@ impl<B: Backend> S3 for TeleS3<B> {
             .collect();
         self.repo.acquire_blob_refs(&acquire_items).await?;
 
-        // Digesting a shared slice would require reading its bytes back;
-        // leave the hash empty and omit the ETag instead.
+        // Compute the slice digest by streaming the shared bytes back once.
+        // This costs a read pass through the backend per copied part but
+        // keeps real ETags on every part and preserves the combined
+        // multipart ETag algorithm. Each slice is already a (blob, offset,
+        // length) triple, so one ranged backend read per slice suffices.
+        let part_hash = {
+            let reader_futures = part_items
+                .iter()
+                .map(|item| self.backend.read(item.id.clone(), item.offset, Some(item.size)));
+
+            let readers = futures::future::try_join_all(reader_futures)
+                .await
+                .map_err(S3Error::from)?
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError))?;
+
+            let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+            {
+                // Hashed in fixed-size scratch buffers so the whole part is
+                // never held in memory at once.
+                let chain_readers = ChainReaders::from_vec(readers);
+                let mut reader_with_hasher =
+                    ReaderWithHasher::new(chain_readers, hasher_md5.clone());
+
+                let mut scratch = vec![0u8; 64 * 1024];
+                loop {
+                    let n = reader_with_hasher
+                        .read(&mut scratch)
+                        .await
+                        .map_err(S3Error::internal_error)?;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+
+            let hash_md5 = hasher_md5
+                .lock()
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+                .finalize_reset();
+
+            hex::encode(hash_md5)
+        };
+
         let multipart_upload_part = MultipartUploadPart {
-            hash: String::new(),
+            hash: part_hash.clone(),
             metadata_items: part_items,
         };
 
@@ -1250,8 +1293,7 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let res = S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
-                // Shared slices carry no digest; omit rather than re-read.
-                e_tag: None,
+                e_tag: Some(ETag::Strong(part_hash)),
                 last_modified: Some(chrono_to_timestamp(chrono::Local::now().to_utc())),
                 ..Default::default()
             }),
