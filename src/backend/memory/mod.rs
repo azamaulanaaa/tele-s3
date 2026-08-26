@@ -1,6 +1,5 @@
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{collections::BTreeMap};
 
 use futures::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
@@ -70,7 +69,7 @@ struct Object<const M: usize> {
 
 pub struct Memory<const N: usize, const M: usize> {
     storage: Mutex<[Option<[u8; M]>; N]>,
-    table: RwLock<BTreeMap<u64, Arc<RwLock<Object<M>>>>>,
+    table: RwLock<BTreeMap<u128, Arc<RwLock<Object<M>>>>>,
 }
 
 impl<const N: usize, const M: usize> Default for Memory<N, M> {
@@ -139,12 +138,8 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         let key = {
             let mut table = self.table.write().await;
 
-            let key = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| BackendError::Other(e.into()))?
-                .as_secs();
-
             let object = Arc::new(RwLock::new(object));
+            let key = uuid::Uuid::new_v4().as_u128();
             let _ = table.insert(key, object);
 
             key.to_string()
@@ -164,7 +159,7 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
         let table = self.table.read().await;
 
-        let key = match key.parse() {
+        let key = match key.parse::<u128>() {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
@@ -181,7 +176,7 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
     }
 
     async fn delete(&self, key: String) -> Result<(), BackendError> {
-        let key = match key.parse() {
+        let key = match key.parse::<u128>() {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
