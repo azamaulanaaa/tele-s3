@@ -19,6 +19,8 @@ pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 pub enum BackendError {
     #[error("Out of range")]
     OutOfRange,
+    #[error("Backend is rate limited")]
+    SlowDown,
     #[error("Size {actual} exceed limit {max}")]
     ExceedLimitSize { max: u64, actual: u64 },
     #[error("Unrecognize error")]

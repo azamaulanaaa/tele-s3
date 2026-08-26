@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    backend::{Backend, BoxedAsyncReader, ChainReaders, ReaderWithHasher},
+    backend::{Backend, BackendError, BoxedAsyncReader, ChainReaders, ReaderWithHasher},
     s3::repo::entity,
 };
 use repo::Repository;
@@ -46,6 +46,18 @@ impl<B: Backend> TeleS3<B> {
         let repo = Repository::init(db).await?;
 
         Ok(Self { backend, repo })
+    }
+}
+
+impl From<BackendError> for S3Error {
+    fn from(err: BackendError) -> Self {
+        match err {
+            // Rate limiting is transient; surfacing SlowDown (503) lets AWS
+            // SDK clients retry automatically instead of treating it as a
+            // hard failure.
+            BackendError::SlowDown => S3Error::new(S3ErrorCode::SlowDown),
+            other => S3Error::internal_error(other),
+        }
     }
 }
 
@@ -174,7 +186,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                     .backend
                     .write(size, reader_with_hasher)
                     .await
-                    .map_err(S3Error::internal_error)?;
+                    .map_err(S3Error::from)?;
                 Some(id)
             } else {
                 None
@@ -423,7 +435,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .backend
                 .write(size, reader_with_hasher)
                 .await
-                .map_err(S3Error::internal_error)?;
+                .map_err(S3Error::from)?;
 
             let hash_md5 = hasher_md5
                 .lock()
@@ -667,7 +679,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         });
         let readers = futures::future::try_join_all(reader_futures)
             .await
-            .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+            .map_err(S3Error::from)?
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError))?;

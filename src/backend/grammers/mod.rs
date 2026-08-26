@@ -117,32 +117,43 @@ impl Grammers {
             warn!("Flood guard active. Sleeping for {:.2?}", duration);
             tokio::time::sleep(duration).await;
 
-            let mut guard = self.flood_guard.lock().unwrap();
+            let mut guard = self
+                .flood_guard
+                .lock()
+                .map_err(|_| BackendError::Other("Flood guard is poisoned".into()))?;
             *guard = None;
         }
 
         Ok(())
     }
 
-    async fn catch_flood_error(&self, err: &InvocationError) -> Option<Duration> {
+    async fn catch_flood_error(
+        &self,
+        err: &InvocationError,
+    ) -> Result<Option<Duration>, BackendError> {
         if let InvocationError::Rpc(rpc_err) = err {
             // Code 420 covers every timed rate-limit variant (FLOOD_WAIT_X,
             // FLOOD_PREMIUM_WAIT_X, ...). X is the required wait in seconds;
             // variants without a duration can't be waited out here.
             if rpc_err.code == 420 {
-                let seconds = rpc_err.value? as u64;
+                let seconds = rpc_err.value.ok_or_else(|| {
+                    BackendError::Other(format!("{} without duration", rpc_err.name).into())
+                })? as u64;
 
                 let duration = Duration::from_secs(seconds + 1);
 
-                let mut guard = self.flood_guard.lock().unwrap();
+                let mut guard = self
+                    .flood_guard
+                    .lock()
+                    .map_err(|_| BackendError::Other("Flood guard is poisoned".into()))?;
                 *guard = Some(Instant::now() + duration);
 
                 tracing::warn!("Hit {} ({}s). Blocking.", rpc_err.name, seconds);
-                return Some(duration);
+                return Ok(Some(duration));
             }
         }
 
-        None
+        Ok(None)
     }
 }
 
@@ -195,7 +206,7 @@ impl Backend for Grammers {
                 })
                 .await;
             if let Err(e) = result {
-                self.catch_flood_error(&e).await;
+                self.catch_flood_error(&e).await?;
                 return Err(BackendError::Other(Box::new(e)));
             }
 
@@ -227,7 +238,7 @@ impl Backend for Grammers {
             {
                 Ok(msg) => break msg,
                 Err(e) => {
-                    if let Some(_wait) = self.catch_flood_error(&e).await {
+                    if self.catch_flood_error(&e).await?.is_some() {
                         continue;
                     }
                     return Err(BackendError::Other(Box::new(e)));
@@ -306,7 +317,12 @@ impl Backend for Grammers {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
                     Err(e) => {
-                        if let Some(_wait) = this.catch_flood_error(&e).await {
+                        if this
+                            .catch_flood_error(&e)
+                            .await
+                            .map_err(std::io::Error::other)?
+                            .is_some()
+                        {
                             continue;
                         }
                         Err(std::io::Error::other(format!("Download failed: {}", e)))?
@@ -375,7 +391,7 @@ impl Backend for Grammers {
                     return Ok(());
                 }
                 Err(e) => {
-                    if self.catch_flood_error(&e).await.is_some() {
+                    if self.catch_flood_error(&e).await?.is_some() {
                         continue;
                     }
 
