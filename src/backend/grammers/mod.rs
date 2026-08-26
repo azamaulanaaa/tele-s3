@@ -273,23 +273,35 @@ impl Backend for Grammers {
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
 
-        self.check_flood_wait().await?;
+        // A long flood wait (> grammers' sleep threshold) surfaces here as
+        // an RPC error; honor it, update the shared guard, and retry so a
+        // read doesn't fail just because another operation tripped the limit.
+        let media = loop {
+            self.check_flood_wait().await?;
 
-        let media = {
-            let mut messages = self
+            match self
                 .client
                 .get_messages_by_id(self.peer.clone(), &[message_id])
                 .await
-                .map_err(|e| BackendError::Other(Box::new(e)))?;
+            {
+                Ok(mut messages) => {
+                    let message = match messages.pop().flatten() {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
 
-            let message = match messages.pop().flatten() {
-                Some(v) => v,
-                None => return Ok(None),
-            };
+                    match message.media() {
+                        Some(v) => break v,
+                        None => return Ok(None),
+                    }
+                }
+                Err(e) => {
+                    if self.catch_flood_error(&e).await?.is_some() {
+                        continue;
+                    }
 
-            match message.media() {
-                Some(v) => v,
-                None => return Ok(None),
+                    return Err(BackendError::Other(Box::new(e)));
+                }
             }
         };
 
