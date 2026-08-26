@@ -5,7 +5,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{
         BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
-        CreateBucketConfiguration,
+        CreateBucketConfiguration, Tag, Tagging,
     },
 };
 use config::{REGION, config};
@@ -2209,6 +2209,106 @@ async fn test_object_metadata() -> anyhow::Result<()> {
         mpu_out.metadata.clone().unwrap_or_default().get("origin").map(String::as_str),
         Some("mpu"),
         "multipart metadata not replayed"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_object_tagging() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "object-tagging";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key("tagged")
+        .body(ByteStream::from_static(b"data".as_slice()))
+        .send()
+        .await
+        .context("put object")?;
+
+    // Put two tags.
+    client
+        .put_object_tagging()
+        .bucket(bucket_name)
+        .key("tagged")
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("env").value("prod").build().unwrap())
+                .tag_set(Tag::builder().key("team").value("infra").build().unwrap())
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .context("put object tagging")?;
+
+    let tags = client
+        .get_object_tagging()
+        .bucket(bucket_name)
+        .key("tagged")
+        .send()
+        .await
+        .context("get object tagging")?
+        .tag_set;
+
+    assert_eq!(tags.len(), 2, "expected two tags");
+    assert_eq!(tags[0].key, "env");
+    assert_eq!(tags[0].value, "prod");
+    assert_eq!(tags[1].key, "team");
+    assert_eq!(tags[1].value, "infra");
+
+    // Delete clears the set.
+    client
+        .delete_object_tagging()
+        .bucket(bucket_name)
+        .key("tagged")
+        .send()
+        .await
+        .context("delete object tagging")?;
+
+    let tags = client
+        .get_object_tagging()
+        .bucket(bucket_name)
+        .key("tagged")
+        .send()
+        .await
+        .context("get object tagging after delete")?
+        .tag_set;
+
+    assert!(tags.is_empty(), "tags should be empty after delete");
+
+    // Missing objects report NoSuchKey.
+    let err = {
+        let res = client
+            .get_object_tagging()
+            .bucket(bucket_name)
+            .key("no-such-object")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("NoSuchKey".to_string())
     );
 
     Ok(())

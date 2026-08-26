@@ -15,14 +15,17 @@ use s3s::{
         CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
         CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
         DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+        DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, ETagCondition,
         GetBucketAclInput, GetBucketAclOutput, GetBucketLocationInput, GetBucketLocationOutput,
-        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput, Grant, Grantee,
+        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput,
+        GetObjectTaggingInput, GetObjectTaggingOutput, Grant, Grantee,
         HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
         ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput,
         ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
         ListPartsOutput, LocationType, MultipartUpload, Object, Owner, Part, PutBucketAclInput,
-        PutBucketAclOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectOutput,
+        PutBucketAclOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectInput,
+        PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
         StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
         UploadPartOutput,
     },
@@ -1430,6 +1433,47 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
+
+    #[instrument(skip(self), err)]
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let model = self.repo.get_object(&req.input.bucket, &req.input.key).await?;
+
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set: json_to_tag_set(&model.tags),
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        self.repo
+            .set_object_tags(
+                &req.input.bucket,
+                &req.input.key,
+                tags_to_json(req.input.tagging),
+            )
+            .await?;
+
+        Ok(S3Response::new(PutObjectTaggingOutput::default()))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        self.repo
+            .set_object_tags(&req.input.bucket, &req.input.key, serde_json::json!([]))
+            .await?;
+
+        Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1502,6 +1546,41 @@ fn json_to_metadata(value: &serde_json::Value) -> Option<s3s::dto::Metadata> {
         Ok(map) if !map.is_empty() => Some(map),
         _ => None,
     }
+}
+
+fn tags_to_json(tagging: s3s::dto::Tagging) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = tagging
+        .tag_set
+        .into_iter()
+        .map(|tag| {
+            serde_json::json!({
+                "key": tag.key.unwrap_or_default(),
+                "value": tag.value.unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    serde_json::Value::Array(list)
+}
+
+fn json_to_tag_set(value: &serde_json::Value) -> Vec<s3s::dto::Tag> {
+    value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let key = entry.get("key")?.as_str()?.to_string();
+                    let tag_value = entry.get("value")?.as_str()?.to_string();
+
+                    Some(s3s::dto::Tag {
+                        key: Some(key),
+                        value: Some(tag_value),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Translate If-Match / If-None-Match headers into a write precondition.

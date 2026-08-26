@@ -12,6 +12,10 @@ pub struct Model {
     pub last_modified: chrono::DateTime<chrono::Utc>,
     pub content_type: Option<String>,
     pub etag: Option<String>,
+    /// x-amz-meta-* headers as a JSON object of string key/value pairs.
+    pub user_metadata: serde_json::Value,
+    /// Object tagging set as a JSON array of {key, value} pairs.
+    pub tags: serde_json::Value,
     pub content: serde_json::Value,
     #[sea_orm(belongs_to, from = "bucket_id", to = "id")]
     pub bucket: HasOne<super::bucket::Entity>,
