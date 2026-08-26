@@ -957,6 +957,22 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
     let bucket_name = "multipart-upload";
 
     {
+        let err = {
+            let res = client
+                .create_multipart_upload()
+                .bucket("no-such-multipart-bucket")
+                .key("test")
+                .send()
+                .await;
+            res.err()
+        };
+        assert_eq!(
+            err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+            Some("NoSuchBucket".to_string())
+        );
+    }
+
+    {
         let location = BucketLocationConstraint::from(REGION);
         let cfg = CreateBucketConfiguration::builder()
             .location_constraint(location)

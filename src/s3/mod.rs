@@ -352,6 +352,8 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        self.repo.get_bucket(&req.input.bucket).await?;
+
         let upload_id = uuid::Uuid::new_v4().to_string();
 
         let content = BTreeMap::<i32, MultipartUploadPart>::new();
