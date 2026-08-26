@@ -11,19 +11,17 @@ use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
-        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-        CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
-        CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
-        CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
-        DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-        GetBucketLocationInput, GetBucketLocationOutput, GetObjectInput, GetObjectOutput,
-        HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-        ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, ListPartsInput, ListPartsOutput, Part, LocationType,
-        Object, PutObjectInput, PutObjectOutput, StreamingBlob,
-        Timestamp, UploadPartInput, UploadPartOutput, ListMultipartUploadsInput,
-        ListMultipartUploadsOutput, MultipartUpload, UploadPartCopyInput, UploadPartCopyOutput,
-        CopyPartResult,
+        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
+        CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
+        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetBucketLocationInput,
+        GetBucketLocationOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
+        HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+        ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput, ListObjectsOutput,
+        ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, LocationType,
+        MultipartUpload, Object, Part, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp,
+        UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -206,11 +204,10 @@ impl<B: Backend> S3 for TeleS3<B> {
         if let Some(expected) = req.input.content_md5 {
             // Decode instead of comparing strings so padding/whitespace
             // variations in the client header don't cause false mismatches.
-            let expected_digest =
-                match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
-                    Ok(v) => v,
-                    Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
-                };
+            let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
+                Ok(v) => v,
+                Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
+            };
 
             if expected_digest[..] != hash_md5[..] {
                 if let Some(id) = id {
@@ -325,7 +322,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             .collect::<Vec<_>>();
 
         let delete_old_futures = {
-            if let Ok(old) = self.repo.get_object(&req.input.bucket, &req.input.key).await {
+            if let Ok(old) = self
+                .repo
+                .get_object(&req.input.bucket, &req.input.key)
+                .await
+            {
                 let old_metadata: Metadata =
                     serde_json::from_value(old.content).map_err(S3Error::internal_error)?;
 
@@ -449,11 +450,10 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         if let Some(expected) = req.input.content_md5 {
-            let expected_digest =
-                match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
-                    Ok(v) => v,
-                    Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
-                };
+            let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
+                Ok(v) => v,
+                Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
+            };
 
             if expected_digest[..] != hash_md5[..] {
                 let _ = self.backend.delete(id).await;
@@ -893,7 +893,10 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.delimiter.clone(),
                 // start-after only applies to the first page; once a
                 // continuation token is present it takes precedence.
-                req.input.continuation_token.clone().or(req.input.start_after.clone()),
+                req.input
+                    .continuation_token
+                    .clone()
+                    .or(req.input.start_after.clone()),
                 limit,
             )
             .await?;
@@ -990,11 +993,12 @@ impl<B: Backend> S3 for TeleS3<B> {
         let mut next_part_number_marker: Option<i32> = None;
 
         if let Some(max_parts) = req.input.max_parts
-            && parts.len() > max_parts as usize {
-                parts.truncate(max_parts as usize);
-                next_part_number_marker = parts.last().and_then(|p| p.part_number);
-                is_truncated = true;
-            }
+            && parts.len() > max_parts as usize
+        {
+            parts.truncate(max_parts as usize);
+            next_part_number_marker = parts.last().and_then(|p| p.part_number);
+            is_truncated = true;
+        }
 
         let res = S3Response::new(ListPartsOutput {
             bucket: Some(req.input.bucket),
@@ -1036,10 +1040,11 @@ impl<B: Backend> S3 for TeleS3<B> {
         let mut is_truncated = false;
 
         if let Some(max_uploads) = req.input.max_uploads
-            && uploads.len() > max_uploads as usize {
-                uploads.truncate(max_uploads as usize);
-                is_truncated = true;
-            }
+            && uploads.len() > max_uploads as usize
+        {
+            uploads.truncate(max_uploads as usize);
+            is_truncated = true;
+        }
 
         let res = S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(req.input.bucket),
@@ -1155,7 +1160,8 @@ impl<B: Backend> S3 for TeleS3<B> {
             let chain_readers = ChainReaders::from_vec(readers);
             let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
 
-            let reader_with_hasher = Box::pin(ReaderWithHasher::new(chain_readers, hasher_md5.clone()));
+            let reader_with_hasher =
+                Box::pin(ReaderWithHasher::new(chain_readers, hasher_md5.clone()));
 
             let id = self
                 .backend
@@ -1188,7 +1194,8 @@ impl<B: Backend> S3 for TeleS3<B> {
 
                     content.insert(req.input.part_number, multipart_upload_part.clone());
 
-                    let content_json = serde_json::to_value(&content).map_err(S3Error::internal_error)?;
+                    let content_json =
+                        serde_json::to_value(&content).map_err(S3Error::internal_error)?;
 
                     let mut active_model: entity::multipart_upload_state::ActiveModel =
                         model.into();

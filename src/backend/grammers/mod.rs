@@ -64,7 +64,8 @@ impl Grammers {
                 handle,
                 updates,
             } = pool;
-            let _ = tokio::spawn(runner.run());
+            // Dropping the JoinHandle detaches the task; it keeps running.
+            tokio::spawn(runner.run());
             let _ = client.stream_updates(updates, Default::default());
 
             handle
