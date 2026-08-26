@@ -1091,3 +1091,128 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_list_parts() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "list-parts";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test";
+    let objects_content = ["part1", "part2content"];
+
+    let upload_id = {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await
+            .context("create multipart upload")?;
+
+        res.upload_id.context("missing upload id")?
+    };
+
+    for (idx, content) in objects_content.iter().enumerate() {
+        let part_number = (idx as i32) + 1;
+        let _ = client
+            .upload_part()
+            .bucket(bucket_name)
+            .upload_id(&upload_id)
+            .key(object_name)
+            .part_number(part_number)
+            .body(ByteStream::from_static(content.as_bytes()))
+            .send()
+            .await
+            .context("upload part")?;
+    }
+
+    // Full listing
+    {
+        let res = client
+            .list_parts()
+            .bucket(bucket_name)
+            .key(object_name)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .context("list parts")?;
+
+        let parts = res.parts();
+        assert_eq!(parts.len(), 2, "length of parts is not 2");
+        assert_eq!(parts[0].part_number(), Some(1));
+        assert_eq!(parts[0].size(), Some(objects_content[0].len() as i64));
+        assert_eq!(parts[1].part_number(), Some(2));
+        assert_eq!(parts[1].size(), Some(objects_content[1].len() as i64));
+        assert_eq!(
+            res.is_truncated(),
+            Some(false),
+            "full listing should not be truncated"
+        );
+    }
+
+    // Paginated listing
+    let (is_truncated, next_marker) = {
+        let res = client
+            .list_parts()
+            .bucket(bucket_name)
+            .key(object_name)
+            .upload_id(&upload_id)
+            .max_parts(1)
+            .send()
+            .await
+            .context("list parts first page")?;
+
+        let parts = res.parts();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number(), Some(1));
+
+        (
+            res.is_truncated(),
+            res.next_part_number_marker().map(str::to_owned),
+        )
+    };
+
+    assert_eq!(is_truncated, Some(true), "first page should be truncated");
+    assert_eq!(
+        next_marker.as_deref(),
+        Some("1"),
+        "next marker should be last returned part"
+    );
+
+    let second_page = {
+        let res = client
+            .list_parts()
+            .bucket(bucket_name)
+            .key(object_name)
+            .upload_id(&upload_id)
+            .max_parts(1)
+            .part_number_marker(next_marker.unwrap())
+            .send()
+            .await
+            .context("list parts second page")?;
+
+        res.parts().to_owned()
+    };
+
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].part_number(), Some(2));
+
+    Ok(())
+}

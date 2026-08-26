@@ -19,7 +19,8 @@ use s3s::{
         GetBucketLocationInput, GetBucketLocationOutput, GetObjectInput, GetObjectOutput,
         HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
         ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-        ListObjectsV2Output, LocationType, Object, PutObjectInput, PutObjectOutput, StreamingBlob,
+        ListObjectsV2Output, ListPartsInput, ListPartsOutput, Part, LocationType,
+        Object, PutObjectInput, PutObjectOutput, StreamingBlob,
         Timestamp, UploadPartInput, UploadPartOutput,
     },
 };
@@ -947,6 +948,61 @@ impl<B: Backend> S3 for TeleS3<B> {
             max_keys: Some(limit as i32),
             name: Some(req.input.bucket),
             prefix: req.input.prefix,
+            ..Default::default()
+        });
+
+        Ok(res)
+    }
+
+    #[instrument(skip(self), err)]
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let model = self
+            .repo
+            .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await?;
+
+        let content = serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
+            .map_err(S3Error::internal_error)?;
+
+        // BTreeMap iteration is ascending by part number already.
+        let mut parts: Vec<Part> = content
+            .into_iter()
+            .filter(|(num, _)| {
+                req.input
+                    .part_number_marker
+                    .map(|marker| *num > marker)
+                    .unwrap_or(true)
+            })
+            .map(|(num, p)| Part {
+                part_number: Some(num),
+                size: Some(p.metadata_item.size as i64),
+                e_tag: Some(ETag::Strong(p.hash)),
+                ..Default::default()
+            })
+            .collect();
+
+        let mut is_truncated = false;
+        let mut next_part_number_marker: Option<i32> = None;
+
+        if let Some(max_parts) = req.input.max_parts
+            && parts.len() > max_parts as usize {
+                parts.truncate(max_parts as usize);
+                next_part_number_marker = parts.last().and_then(|p| p.part_number);
+                is_truncated = true;
+            }
+
+        let res = S3Response::new(ListPartsOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
+            upload_id: Some(req.input.upload_id),
+            parts: Some(parts),
+            is_truncated: Some(is_truncated),
+            max_parts: req.input.max_parts,
+            part_number_marker: req.input.part_number_marker,
+            next_part_number_marker,
             ..Default::default()
         });
 
