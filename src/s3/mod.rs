@@ -500,25 +500,20 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         self.repo
-            .update_multipart_upload_state(
+            .cas_update_multipart_content(
                 &req.input.bucket,
                 &req.input.key,
                 &req.input.upload_id,
-                |model| {
-                    let mut content: BTreeMap<i32, MultipartUploadPart> =
-                        serde_json::from_value(model.content.clone())
+                |content| {
+                    let mut parts: BTreeMap<i32, MultipartUploadPart> =
+                        serde_json::from_value(content.take())
                             .map_err(S3Error::internal_error)?;
 
-                    content.insert(req.input.part_number, multipart_upload_part.clone());
+                    parts.insert(req.input.part_number, multipart_upload_part.clone());
 
-                    let content_json =
-                        serde_json::to_value(&content).map_err(S3Error::internal_error)?;
+                    *content = serde_json::to_value(parts).map_err(S3Error::internal_error)?;
 
-                    let mut active_model: entity::multipart_upload_state::ActiveModel =
-                        model.into();
-                    active_model.content = sea_orm::Set(content_json);
-
-                    Ok(active_model)
+                    Ok(())
                 },
             )
             .await?;
@@ -1268,25 +1263,20 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         self.repo
-            .update_multipart_upload_state(
+            .cas_update_multipart_content(
                 &req.input.bucket,
                 &req.input.key,
                 &req.input.upload_id,
-                |model| {
-                    let mut content: BTreeMap<i32, MultipartUploadPart> =
-                        serde_json::from_value(model.content.clone())
+                |content| {
+                    let mut parts: BTreeMap<i32, MultipartUploadPart> =
+                        serde_json::from_value(content.take())
                             .map_err(S3Error::internal_error)?;
 
-                    content.insert(req.input.part_number, multipart_upload_part.clone());
+                    parts.insert(req.input.part_number, multipart_upload_part.clone());
 
-                    let content_json =
-                        serde_json::to_value(&content).map_err(S3Error::internal_error)?;
+                    *content = serde_json::to_value(parts).map_err(S3Error::internal_error)?;
 
-                    let mut active_model: entity::multipart_upload_state::ActiveModel =
-                        model.into();
-                    active_model.content = sea_orm::Set(content_json);
-
-                    Ok(active_model)
+                    Ok(())
                 },
             )
             .await?;
