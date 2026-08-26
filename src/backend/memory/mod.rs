@@ -14,7 +14,11 @@ struct ObjectReader<const M: usize> {
 }
 
 impl<const M: usize> ObjectReader<M> {
-    fn new(object: Arc<RwLock<Object<M>>>, start: usize, end: Option<usize>) -> Self {
+    /// `limit` is a byte count relative to `start`; it is converted to an
+    /// absolute end position so remaining-length math can never underflow.
+    fn new(object: Arc<RwLock<Object<M>>>, start: usize, limit: Option<usize>) -> Self {
+        let end = limit.map(|limit| start.saturating_add(limit));
+
         Self {
             object,
             end,
@@ -39,9 +43,16 @@ impl<const M: usize> AsyncRead for ObjectReader<M> {
             }
         };
 
+        let end = this.end.unwrap_or(object.len).min(object.len);
+
+        if this.pos >= end {
+            return std::task::Poll::Ready(Ok(0));
+        }
+
         let idx_chunk = this.pos / M;
         let chunk_pos = this.pos % M;
-        let chunk_end = ((this.end.unwrap_or(object.len) - this.pos) + chunk_pos).min(M);
+        let remaining = end - this.pos;
+        let chunk_end = (chunk_pos + remaining).min(M);
 
         let available = &object.chunks[idx_chunk][chunk_pos..chunk_end];
         let n = std::cmp::min(buf.len(), available.len());
@@ -282,6 +293,50 @@ mod tests {
         let _ = reader.read_to_end(&mut out).await?;
 
         assert_eq!(out[..], content[1..]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_then_read_with_offset_and_limit() -> anyhow::Result<()> {
+        let backend = Memory::<8, 2>::default();
+
+        let content: Vec<u8> = (0..10).collect();
+        let content_reader = Box::pin(Cursor::new(content.clone()));
+
+        let key = backend.write(content.len() as u64, content_reader).await?;
+
+        let mut reader = backend
+            .read(key, 2, Some(5))
+            .await?
+            .expect("key should be exist after write");
+
+        let mut out = Vec::new();
+        let _ = reader.read_to_end(&mut out).await?;
+
+        assert_eq!(out[..], content[2..7]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_then_read_with_offset_larger_than_limit() -> anyhow::Result<()> {
+        let backend = Memory::<8, 2>::default();
+
+        let content: Vec<u8> = (0..10).collect();
+        let content_reader = Box::pin(Cursor::new(content.clone()));
+
+        let key = backend.write(content.len() as u64, content_reader).await?;
+
+        let mut reader = backend
+            .read(key, 5, Some(3))
+            .await?
+            .expect("key should be exist after write");
+
+        let mut out = Vec::new();
+        let _ = reader.read_to_end(&mut out).await?;
+
+        assert_eq!(out[..], content[5..8]);
 
         Ok(())
     }
