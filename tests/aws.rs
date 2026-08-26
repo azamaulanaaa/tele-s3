@@ -1778,3 +1778,181 @@ async fn test_upload_part_copy_shares_without_harming_source() -> anyhow::Result
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_conditional_writes() -> anyhow::Result<()> {
+    let config = config::<2, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "conditional-writes";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    // Seed the object and capture its ETag.
+    let etag_v1 = {
+        let res = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("k")
+            .body(ByteStream::from_static(b"v1".as_slice()))
+            .send()
+            .await
+            .context("put v1")?;
+        res.e_tag.context("missing etag")?
+    };
+
+    // If-Match with the current ETag succeeds and rotates the ETag.
+    let etag_v2 = {
+        let res = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("k")
+            .if_match(&etag_v1)
+            .body(ByteStream::from_static(b"v2".as_slice()))
+            .send()
+            .await
+            .context("put v2 with matching If-Match")?;
+        res.e_tag.context("missing etag")?
+    };
+
+    assert_ne!(etag_v1, etag_v2, "content changed so ETag must rotate");
+
+    // Stale If-Match is rejected.
+    {
+        let err = {
+            let res = client
+                .put_object()
+                .bucket(bucket_name)
+                .key("k")
+                .if_match(&etag_v1)
+                .body(ByteStream::from_static(b"stale".as_slice()))
+                .send()
+                .await;
+            res.err()
+        };
+
+        assert_eq!(
+            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            Some("PreconditionFailed".to_string())
+        );
+    }
+
+    // If-None-Match: * creates only once.
+    {
+        client
+            .put_object()
+            .bucket(bucket_name)
+            .key("fresh")
+            .if_none_match("*")
+            .body(ByteStream::from_static(b"first".as_slice()))
+            .send()
+            .await
+            .context("create-only put should succeed on missing key")?;
+
+        let err = {
+            let res = client
+                .put_object()
+                .bucket(bucket_name)
+                .key("fresh")
+                .if_none_match("*")
+                .body(ByteStream::from_static(b"second".as_slice()))
+                .send()
+                .await;
+            res.err()
+        };
+
+        assert_eq!(
+            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            Some("PreconditionFailed".to_string())
+        );
+    }
+
+    // If-Match against a missing object reports NoSuchKey.
+    {
+        let err = {
+            let res = client
+                .put_object()
+                .bucket(bucket_name)
+                .key("missing")
+                .if_match(&etag_v1)
+                .body(ByteStream::from_static(b"x".as_slice()))
+                .send()
+                .await;
+            res.err()
+        };
+
+        assert_eq!(
+            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            Some("NoSuchKey".to_string())
+        );
+    }
+
+    // Conditional completion: completing over an existing object with a
+    // mismatched If-Match fails without consuming the upload.
+    {
+        let upload_id = {
+            let res = client
+                .create_multipart_upload()
+                .bucket(bucket_name)
+                .key("k")
+                .send()
+                .await
+                .context("create multipart upload")?;
+            res.upload_id.expect("missing upload id")
+        };
+
+        let completed = CompletedMultipartUpload::builder()
+            .parts(CompletedPart::builder().part_number(1).build())
+            .build();
+
+        let err = {
+            let res = client
+                .complete_multipart_upload()
+                .bucket(bucket_name)
+                .key("k")
+                .upload_id(upload_id.clone())
+                .if_match(&etag_v1)
+                .multipart_upload(completed)
+                .send()
+                .await;
+            res.err()
+        };
+
+        assert_eq!(
+            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            Some("PreconditionFailed".to_string()),
+            "stale If-Match must reject completion"
+        );
+
+        // The upload survives a rejected completion; an unconditional
+        // retry succeeds.
+        let completed = CompletedMultipartUpload::builder()
+            .parts(CompletedPart::builder().part_number(1).build())
+            .build();
+
+        let _ = client
+            .complete_multipart_upload()
+            .bucket(bucket_name)
+            .key("k")
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .context("unconditional completion should succeed");
+    }
+
+    Ok(())
+}
