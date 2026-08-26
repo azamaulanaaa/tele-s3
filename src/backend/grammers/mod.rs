@@ -125,17 +125,22 @@ impl Grammers {
     }
 
     async fn catch_flood_error(&self, err: &InvocationError) -> Option<Duration> {
-        if let InvocationError::Rpc(rpc_err) = err
-            && rpc_err.name == "FLOOD_WAIT" {
-                let seconds = rpc_err.value.unwrap_or(0) as u64;
+        if let InvocationError::Rpc(rpc_err) = err {
+            // Code 420 covers every timed rate-limit variant (FLOOD_WAIT_X,
+            // FLOOD_PREMIUM_WAIT_X, ...). X is the required wait in seconds;
+            // variants without a duration can't be waited out here.
+            if rpc_err.code == 420 {
+                let seconds = rpc_err.value? as u64;
+
                 let duration = Duration::from_secs(seconds + 1);
 
                 let mut guard = self.flood_guard.lock().unwrap();
                 *guard = Some(Instant::now() + duration);
 
-                tracing::warn!("Hit FLOOD_WAIT. Blocking for {}s.", seconds);
+                tracing::warn!("Hit {} ({}s). Blocking.", rpc_err.name, seconds);
                 return Some(duration);
             }
+        }
 
         None
     }
