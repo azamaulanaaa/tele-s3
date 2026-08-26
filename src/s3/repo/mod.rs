@@ -346,6 +346,29 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> S3Result<Vec<entity::multipart_upload_state::Model>> {
+        let mut query = entity::multipart_upload_state::Entity::find()
+            .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket));
+
+        if let Some(prefix) = prefix {
+            query = query
+                .filter(entity::multipart_upload_state::Column::ObjectId.starts_with(prefix))
+                .order_by_asc(entity::multipart_upload_state::Column::ObjectId);
+        }
+
+        let models = query
+            .order_by_asc(entity::multipart_upload_state::Column::ObjectId)
+            .all(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(models)
+    }
+
     pub async fn get_multipart_upload_state(
         &self,
         bucket: &str,

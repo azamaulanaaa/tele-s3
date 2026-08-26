@@ -1216,3 +1216,112 @@ async fn test_list_parts() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_list_multipart_uploads() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "list-multipart-uploads";
+    let other_bucket_name = "list-multipart-uploads-other";
+
+    for name in [bucket_name, other_bucket_name] {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let mut created: Vec<(String, String)> = Vec::new();
+    for object_name in ["a", "b"] {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await
+            .context("create multipart upload")?;
+
+        created.push((
+            object_name.to_string(),
+            res.upload_id.expect("missing upload id"),
+        ));
+    }
+
+    let _ = client
+        .create_multipart_upload()
+        .bucket(other_bucket_name)
+        .key("c")
+        .send()
+        .await
+        .context("create multipart upload in other bucket")?;
+
+    // Bucket-scoped listing
+    {
+        let res = client
+            .list_multipart_uploads()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("list multipart uploads")?;
+
+        let uploads = res.uploads();
+        assert_eq!(uploads.len(), 2, "length of uploads is not 2");
+        assert_eq!(uploads[0].key(), Some("a"));
+        assert_eq!(uploads[1].key(), Some("b"));
+
+        for (idx, upload) in uploads.iter().enumerate() {
+            assert_eq!(
+                upload.upload_id(),
+                Some(created[idx].1.as_str()),
+                "upload id mismatch"
+            );
+        }
+    }
+
+    // Prefix filter
+    let (prefix_uploads, is_truncated) = {
+        let res = client
+            .list_multipart_uploads()
+            .bucket(bucket_name)
+            .prefix("a")
+            .send()
+            .await
+            .context("list multipart uploads with prefix")?;
+
+        (
+            res.uploads().to_owned(),
+            res.is_truncated(),
+        )
+    };
+
+    assert_eq!(prefix_uploads.len(), 1);
+    assert_eq!(prefix_uploads[0].key(), Some("a"));
+    assert_eq!(is_truncated, Some(false));
+
+    // Max uploads truncation
+    let is_truncated = {
+        let res = client
+            .list_multipart_uploads()
+            .bucket(bucket_name)
+            .max_uploads(1)
+            .send()
+            .await
+            .context("list multipart uploads with max uploads")?;
+
+        assert_eq!(res.uploads().len(), 1);
+        res.is_truncated()
+    };
+
+    assert_eq!(is_truncated, Some(true), "should be truncated by max uploads");
+
+    Ok(())
+}

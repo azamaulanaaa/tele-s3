@@ -21,7 +21,8 @@ use s3s::{
         ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
         ListObjectsV2Output, ListPartsInput, ListPartsOutput, Part, LocationType,
         Object, PutObjectInput, PutObjectOutput, StreamingBlob,
-        Timestamp, UploadPartInput, UploadPartOutput,
+        Timestamp, UploadPartInput, UploadPartOutput, ListMultipartUploadsInput,
+        ListMultipartUploadsOutput, MultipartUpload,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -1003,6 +1004,49 @@ impl<B: Backend> S3 for TeleS3<B> {
             max_parts: req.input.max_parts,
             part_number_marker: req.input.part_number_marker,
             next_part_number_marker,
+            ..Default::default()
+        });
+
+        Ok(res)
+    }
+
+    #[instrument(skip(self), err)]
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        self.repo.get_bucket(&req.input.bucket).await?;
+
+        let models = self
+            .repo
+            .list_multipart_uploads(&req.input.bucket, req.input.prefix.as_deref())
+            .await?;
+
+        // Ordered by key ascending (repo query).
+        let mut uploads: Vec<MultipartUpload> = models
+            .into_iter()
+            .map(|model| MultipartUpload {
+                key: Some(model.object_id),
+                upload_id: Some(model.upload_id),
+                ..Default::default()
+            })
+            .collect();
+
+        let mut is_truncated = false;
+
+        if let Some(max_uploads) = req.input.max_uploads {
+            if uploads.len() > max_uploads as usize {
+                uploads.truncate(max_uploads as usize);
+                is_truncated = true;
+            }
+        }
+
+        let res = S3Response::new(ListMultipartUploadsOutput {
+            bucket: Some(req.input.bucket),
+            uploads: Some(uploads),
+            max_uploads: req.input.max_uploads,
+            is_truncated: Some(is_truncated),
+            prefix: req.input.prefix,
             ..Default::default()
         });
 
