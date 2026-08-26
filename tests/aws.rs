@@ -1474,3 +1474,150 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_copied_object_survives_sibling_deletion() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "refcount-copy";
+    let source_content = "hello world";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key("source")
+        .body(ByteStream::from_static(source_content.as_bytes()))
+        .send()
+        .await
+        .context("put source object")?;
+
+    let copy_source = format!("{}/source", bucket_name);
+
+    // Deleting one alias must not corrupt the other.
+    {
+        let _ = client
+            .copy_object()
+            .bucket(bucket_name)
+            .key("alias")
+            .copy_source(&copy_source)
+            .send()
+            .await
+            .context("copy object")?;
+
+        let _ = client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("alias")
+            .send()
+            .await
+            .context("delete alias")?;
+
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("source")
+            .send()
+            .await
+            .context("source should survive alias deletion")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(
+            data.into_bytes().as_ref(),
+            source_content.as_bytes(),
+            "source content mismatch after sibling deletion"
+        );
+    }
+
+    // Overwriting a copy must not corrupt its source either.
+    {
+        let _ = client
+            .copy_object()
+            .bucket(bucket_name)
+            .key("alias")
+            .copy_source(&copy_source)
+            .send()
+            .await
+            .context("copy object again")?;
+
+        let _ = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("alias")
+            .body(ByteStream::from_static(b"replacement".as_slice()))
+            .send()
+            .await
+            .context("overwrite alias")?;
+
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("source")
+            .send()
+            .await
+            .context("source should survive alias overwrite")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(
+            data.into_bytes().as_ref(),
+            source_content.as_bytes(),
+            "source content mismatch after alias overwrite"
+        );
+    }
+
+    // The final delete of the last reference removes the blob for good.
+    {
+        let _ = client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("source")
+            .send()
+            .await
+            .context("delete source")?;
+
+        let err = {
+            let res = client
+                .get_object()
+                .bucket(bucket_name)
+                .key("source")
+                .send()
+                .await;
+            res.err()
+        };
+
+        assert_eq!(
+            err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+            Some("NoSuchKey".to_string()),
+            "deleted source should be gone"
+        );
+
+        // The untouched alias keeps working on its own content.
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("alias")
+            .send()
+            .await
+            .context("alias should survive unrelated deletion")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(data.into_bytes().as_ref(), b"replacement");
+    }
+
+    Ok(())
+}

@@ -48,6 +48,19 @@ impl<B: Backend> TeleS3<B> {
 
         Ok(Self { backend, repo })
     }
+
+    /// Release metadata references and hard-delete blobs whose reference
+    /// count reached zero.
+    ///
+    /// Backend deletion failures are ignored (best-effort cleanup);
+    /// refcount bookkeeping failures propagate.
+    async fn release_blobs(&self, ids: Vec<String>) -> S3Result<()> {
+        let zero_ids = self.repo.release_blob_refs(&ids).await?;
+        let delete_futures = zero_ids.into_iter().map(|id| self.backend.delete(id));
+        let _ = futures::future::join_all(delete_futures).await;
+
+        Ok(())
+    }
 }
 
 impl From<BackendError> for S3Error {
@@ -201,6 +214,12 @@ impl<B: Backend> S3 for TeleS3<B> {
             (id, hash_md5)
         };
 
+        // The backend blob now exists and is owned solely by the incoming
+        // object until it replaces a previous version.
+        if let Some(ref id) = id {
+            self.repo.register_new_blob(id.clone(), size).await?;
+        }
+
         if let Some(expected) = req.input.content_md5 {
             // Decode instead of comparing strings so padding/whitespace
             // variations in the client header don't cause false mismatches.
@@ -211,7 +230,7 @@ impl<B: Backend> S3 for TeleS3<B> {
 
             if expected_digest[..] != hash_md5[..] {
                 if let Some(id) = id {
-                    let _ = self.backend.delete(id).await;
+                    self.release_blobs(vec![id]).await?;
                 }
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
@@ -248,9 +267,10 @@ impl<B: Backend> S3 for TeleS3<B> {
 
                 let metadata: Metadata =
                     serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-                let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
 
-                Some(delete_futures)
+                // Refcount-aware: shared blobs survive if something else
+                // still references them.
+                Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
             } else {
                 None
             }
@@ -271,15 +291,15 @@ impl<B: Backend> S3 for TeleS3<B> {
 
             if let Err(err) = result {
                 if let Some(id) = id {
-                    let _ = self.backend.delete(id).await;
+                    self.release_blobs(vec![id]).await?;
                 }
 
                 return Err(err);
             }
         }
 
-        if let Some(delete_future) = delete_old_future {
-            let _ = futures::future::join_all(delete_future).await;
+        if let Some(delete_old_future) = delete_old_future {
+            delete_old_future.await?;
         }
 
         let res = S3Response::new(PutObjectOutput {
@@ -314,18 +334,19 @@ impl<B: Backend> S3 for TeleS3<B> {
         // instead of duplicating them: backends may be capacity-limited,
         // Telegram uploads are expensive, and S3 semantics only require the
         // destination to expose equivalent content.
-        let content_json = serde_json::to_value(&metadata).map_err(S3Error::internal_error)?;
-
-        // Blob IDs the copied object now shares; never delete these when
-        // cleaning up an overwritten destination (covers copying an object
-        // onto itself).
-        let new_ids = metadata
+        //
+        // Acquire references BEFORE releasing anything, so copying an
+        // object onto itself (or an alias of it) nets out safely.
+        let acquire_items: Vec<(String, u64)> = metadata
             .item
             .iter()
-            .map(|v| v.id.as_str())
-            .collect::<Vec<_>>();
+            .map(|v| (v.id.clone(), v.size))
+            .collect();
+        self.repo.acquire_blob_refs(&acquire_items).await?;
 
-        let delete_old_futures = {
+        let content_json = serde_json::to_value(&metadata).map_err(S3Error::internal_error)?;
+
+        let delete_old_future = {
             if let Ok(old) = self
                 .repo
                 .get_object(&req.input.bucket, &req.input.key)
@@ -334,13 +355,10 @@ impl<B: Backend> S3 for TeleS3<B> {
                 let old_metadata: Metadata =
                     serde_json::from_value(old.content).map_err(S3Error::internal_error)?;
 
-                let delete_futures = old_metadata
-                    .item
-                    .into_iter()
-                    .filter(|v| !new_ids.contains(&v.id.as_str()))
-                    .map(|v| self.backend.delete(v.id));
-
-                Some(delete_futures)
+                // Refcount-aware: blobs still referenced elsewhere survive.
+                Some(
+                    self.release_blobs(old_metadata.item.into_iter().map(|v| v.id).collect()),
+                )
             } else {
                 None
             }
@@ -357,8 +375,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             )
             .await?;
 
-        if let Some(delete_futures) = delete_old_futures {
-            let _ = futures::future::join_all(delete_futures).await;
+        // On an upsert failure the acquired refs above are simply kept:
+        // over-protecting blobs is safe, under-protecting them is not.
+        if let Some(delete_old_future) = delete_old_future {
+            delete_old_future.await?;
         }
 
         let res = S3Response::new(CopyObjectOutput {
@@ -453,6 +473,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             (id, hash_md5)
         };
 
+        // The part blob is owned by the multipart upload state until the
+        // upload completes (ownership moves to the object) or aborts.
+        self.repo.register_new_blob(id.clone(), size).await?;
+
         if let Some(expected) = req.input.content_md5 {
             let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
                 Ok(v) => v,
@@ -460,7 +484,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             };
 
             if expected_digest[..] != hash_md5[..] {
-                let _ = self.backend.delete(id).await;
+                self.release_blobs(vec![id]).await?;
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
             }
@@ -569,7 +593,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             Some(format!("{}-{}", hash_md5, part_count))
         };
 
-        let delete_old_object_futures = {
+        let delete_old_object_future = {
             let model = self
                 .repo
                 .get_object(&req.input.bucket, &req.input.key)
@@ -577,9 +601,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             if let Ok(model) = model {
                 let metadata: Metadata =
                     serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-                let delete_futures = metadata.item.into_iter().map(|v| self.backend.delete(v.id));
 
-                Some(delete_futures)
+                // Refcount-aware: shared blobs survive if something else
+                // still references them.
+                Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
             } else {
                 None
             }
@@ -602,14 +627,17 @@ impl<B: Backend> S3 for TeleS3<B> {
             .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
             .await?;
 
-        if let Some(delete_futures) = delete_old_object_futures {
-            let _ = futures::future::join_all(delete_futures).await;
+        if let Some(delete_old_object_future) = delete_old_object_future {
+            delete_old_object_future.await?;
         }
 
-        let delete_dangling_futures = content.into_values().map(|multipart_upload_part| {
-            self.backend.delete(multipart_upload_part.metadata_item.id)
-        });
-        let _ = futures::future::join_all(delete_dangling_futures).await;
+        // Parts not included in the request lose their reference; blobs
+        // whose last reference disappeared are removed from the backend.
+        let dangling_ids: Vec<String> = content
+            .into_values()
+            .map(|multipart_upload_part| multipart_upload_part.metadata_item.id)
+            .collect();
+        self.release_blobs(dangling_ids).await?;
 
         let res = S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(req.input.bucket),
@@ -635,10 +663,13 @@ impl<B: Backend> S3 for TeleS3<B> {
         let content = serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
             .map_err(S3Error::internal_error)?;
 
-        let delete_futures = content.into_values().map(|multipart_upload_part| {
-            self.backend.delete(multipart_upload_part.metadata_item.id)
-        });
-        let _ = futures::future::join_all(delete_futures).await;
+        // Released parts may be shared with other objects; only unreferenced
+        // blobs are removed from the backend.
+        let part_ids: Vec<String> = content
+            .into_values()
+            .map(|multipart_upload_part| multipart_upload_part.metadata_item.id)
+            .collect();
+        self.release_blobs(part_ids).await?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
@@ -751,11 +782,8 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
 
-        let delete_futures = metadata
-            .item
-            .iter()
-            .map(|item| self.backend.delete(item.id.clone()));
-        let _ = futures::future::join_all(delete_futures).await;
+        let ids: Vec<String> = metadata.item.iter().map(|item| item.id.clone()).collect();
+        self.release_blobs(ids).await?;
 
         let res = S3Response::new(DeleteObjectOutput::default());
 
@@ -784,11 +812,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let delete_futures = metadatas
+        let ids: Vec<String> = metadatas
             .iter()
-            .flat_map(|metadata| metadata.item.clone())
-            .map(|item| self.backend.delete(item.id.clone()));
-        let _ = futures::future::join_all(delete_futures).await;
+            .flat_map(|metadata| metadata.item.iter().map(|item| item.id.clone()))
+            .collect();
+        self.release_blobs(ids).await?;
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
 
@@ -1193,6 +1221,10 @@ impl<B: Backend> S3 for TeleS3<B> {
 
             (id, hash_md5)
         };
+
+        // The copied blob is owned by the multipart upload state until the
+        // upload completes or aborts.
+        self.repo.register_new_blob(id.clone(), read_len).await?;
 
         let multipart_upload_part = MultipartUploadPart {
             hash: hex::encode(hash_md5),

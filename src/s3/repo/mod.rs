@@ -101,6 +101,120 @@ impl Repository {
         Ok(bucket_exists)
     }
 
+    /// Register a freshly created backend blob with a single reference.
+    ///
+    /// Called immediately after a successful backend write, when the caller
+    /// is guaranteed to be the blob's first and only owner.
+    #[instrument(skip(self), level = "debug", err)]
+    pub async fn register_new_blob(&self, id: String, size: u64) -> S3Result<()> {
+        let active_model = entity::blob::ActiveModel {
+            id: Set(id),
+            size: Set(size as u32),
+            refs: Set(1),
+            created_at: Set(chrono::Local::now().to_utc()),
+        };
+
+        entity::blob::Entity::insert(active_model)
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(())
+    }
+
+    /// Acquire one additional reference for each listed blob.
+    ///
+    /// Rows are created on first sight with refs=2 rather than 1: besides
+    /// the newly acquired reference this counts a possible pre-existing
+    /// reference from an object written before tracking existed (legacy
+    /// objects carry no blob record). Over-counting only keeps blobs alive
+    /// longer; under-counting would corrupt surviving aliases.
+    #[instrument(skip(self, items), level = "debug", err)]
+    pub async fn acquire_blob_refs(&self, items: &[(String, u64)]) -> S3Result<()> {
+        for (id, size) in items {
+            let existing = entity::blob::Entity::find_by_id(id)
+                .one(&self.db)
+                .await
+                .map_err(S3Error::internal_error)?;
+
+            if existing.is_some() {
+                // Server-side arithmetic so concurrent acquires can't lose
+                // updates between read and write.
+                entity::blob::Entity::update_many()
+                    .col_expr(
+                        entity::blob::Column::Refs,
+                        Expr::col(entity::blob::Column::Refs).add(1),
+                    )
+                    .filter(entity::blob::Column::Id.eq(id.clone()))
+                    .exec(&self.db)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+            } else {
+                let active_model = entity::blob::ActiveModel {
+                    id: Set(id.clone()),
+                    size: Set(*size as u32),
+                    refs: Set(2),
+                    created_at: Set(chrono::Local::now().to_utc()),
+                };
+
+                entity::blob::Entity::insert(active_model)
+                    .on_conflict(
+                        OnConflict::columns([entity::blob::Column::Id])
+                            .do_nothing()
+                            .to_owned(),
+                    )
+                    .exec(&self.db)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Drop one reference for each listed blob id.
+    ///
+    /// Returns the ids whose reference count reached zero; callers must
+    /// delete those blobs from the backend. Ids without a tracking row are
+    /// ignored: hard-deleting them could corrupt an alias that predates
+    /// tracking, whereas leaking an unreferenced backend blob is only a
+    /// storage cost.
+    #[instrument(skip(self, ids), level = "debug", err)]
+    pub async fn release_blob_refs(&self, ids: &[String]) -> S3Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Server-side decrement so concurrent releases can't lose updates.
+        entity::blob::Entity::update_many()
+            .col_expr(
+                entity::blob::Column::Refs,
+                Expr::col(entity::blob::Column::Refs).sub(1),
+            )
+            .filter(entity::blob::Column::Id.is_in(ids.to_vec()))
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        let released = entity::blob::Entity::find()
+            .filter(entity::blob::Column::Refs.lte(0))
+            .all(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        if released.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        entity::blob::Entity::delete_many()
+            .filter(entity::blob::Column::Refs.lte(0))
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(released.into_iter().map(|model| model.id).collect())
+    }
+
     #[instrument(skip(self), level = "debug", err)]
     pub async fn get_bucket(&self, name: &str) -> S3Result<entity::bucket::Model> {
         let bucket = entity::bucket::Entity::find_by_id(name)
