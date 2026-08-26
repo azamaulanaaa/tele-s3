@@ -521,36 +521,69 @@ impl Repository {
         Ok(model)
     }
 
+    /// Compare-and-swap update of a multipart upload state's content.
+    ///
+    /// The closure mutates a snapshot of the stored content; the result is
+    /// swapped in only if the stored value is unchanged since the snapshot
+    /// (optimistic locking). Conflicting concurrent updates retry from a
+    /// fresh snapshot, bounded before surfacing an error. This closes the
+    /// lost-update race where two parts uploaded concurrently could
+    /// overwrite each other's metadata.
     #[instrument(skip(self, action), level = "debug", err)]
-    pub async fn update_multipart_upload_state<F>(
+    pub async fn cas_update_multipart_content<F>(
         &self,
         bucket: &str,
         key: &str,
         upload_id: &str,
-        action: F,
+        mut action: F,
     ) -> S3Result<()>
     where
-        F: Fn(
-            entity::multipart_upload_state::Model,
-        ) -> S3Result<entity::multipart_upload_state::ActiveModel>,
+        F: FnMut(&mut serde_json::Value) -> S3Result<()>,
     {
-        let model = entity::multipart_upload_state::Entity::find_by_id((
-            bucket.to_string(),
-            key.to_string(),
-            upload_id.to_string(),
-        ))
-        .one(&self.db)
-        .await
-        .map_err(S3Error::internal_error)?
-        .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+        const MAX_ATTEMPTS: usize = 8;
 
-        let model = action(model)?;
+        for _ in 0..MAX_ATTEMPTS {
+            let model = self
+                .get_multipart_upload_state(bucket, key, upload_id)
+                .await?;
 
-        model
-            .update(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?;
+            let mut new_content = model.content.clone();
+            action(&mut new_content)?;
 
-        Ok(())
+            // Closure changed nothing → nothing to swap; treat as success
+            // so idempotent retries converge.
+            if new_content == model.content {
+                return Ok(());
+            }
+
+            // Conditional swap: only succeeds when the stored content is
+            // identical to the snapshot the change was based on. JSON
+            // serialization is deterministic here (BTreeMap + serde), so
+            // value equality is a reliable change detector.
+            let result = entity::multipart_upload_state::Entity::update_many()
+                .col_expr(
+                    entity::multipart_upload_state::Column::Content,
+                    Expr::value(new_content),
+                )
+                .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
+                .filter(entity::multipart_upload_state::Column::ObjectId.eq(key))
+                .filter(entity::multipart_upload_state::Column::UploadId.eq(upload_id))
+                .filter(entity::multipart_upload_state::Column::Content.eq(model.content.clone()))
+                .exec(&self.db)
+                .await
+                .map_err(S3Error::internal_error)?;
+
+            if result.rows_affected == 1 {
+                return Ok(());
+            }
+
+            // Someone updated the state between our read and write; retry
+            // from a fresh snapshot.
+        }
+
+        Err(S3Error::internal_error(std::io::Error::other(format!(
+            "multipart upload state changed concurrently {} times",
+            MAX_ATTEMPTS
+        ))))
     }
 }
