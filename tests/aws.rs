@@ -1781,7 +1781,7 @@ async fn test_upload_part_copy_shares_without_harming_source() -> anyhow::Result
 
 #[tokio::test]
 async fn test_conditional_writes() -> anyhow::Result<()> {
-    let config = config::<2, 1024>().await?;
+    let config = config::<4, 1024>().await?;
     let client = Client::new(&config);
 
     let bucket_name = "conditional-writes";
@@ -1918,6 +1918,18 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
             .parts(CompletedPart::builder().part_number(1).build())
             .build();
 
+        // A real part must exist for the eventual unconditional retry.
+        let _ = client
+            .upload_part()
+            .bucket(bucket_name)
+            .key("k")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"part".as_slice()))
+            .send()
+            .await
+            .context("upload part")?;
+
         let err = {
             let res = client
                 .complete_multipart_upload()
@@ -1951,7 +1963,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
             .multipart_upload(completed)
             .send()
             .await
-            .context("unconditional completion should succeed");
+            .context("unconditional completion should succeed")?;
     }
 
     Ok(())
@@ -2055,6 +2067,148 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
     assert_eq!(
         err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
         Some("NoSuchBucket".to_string())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_object_metadata() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "object-metadata";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let assert_metadata = |metadata: &std::collections::HashMap<String, String>| {
+        assert_eq!(
+            metadata.get("purpose").map(String::as_str),
+            Some("backup"),
+            "purpose metadata mismatch"
+        );
+        assert_eq!(
+            metadata.get("team").map(String::as_str),
+            Some("infra"),
+            "team metadata mismatch"
+        );
+    };
+
+    // Put with user metadata.
+    client
+        .put_object()
+        .bucket(bucket_name)
+        .key("meta")
+        .metadata("purpose", "backup")
+        .metadata("team", "infra")
+        .body(ByteStream::from_static(b"content".as_slice()))
+        .send()
+        .await
+        .context("put with metadata")?;
+
+    // Head echoes it back.
+    let head = client
+        .head_object()
+        .bucket(bucket_name)
+        .key("meta")
+        .send()
+        .await
+        .context("head object")?;
+    assert_metadata(&head.metadata.clone().unwrap_or_default());
+
+    // Get echoes it back too.
+    let out = client
+        .get_object()
+        .bucket(bucket_name)
+        .key("meta")
+        .send()
+        .await
+        .context("get object")?;
+    assert_metadata(&out.metadata.clone().unwrap_or_default());
+
+    // CopyObject carries metadata to the destination by default.
+    client
+        .copy_object()
+        .bucket(bucket_name)
+        .key("meta-copy")
+        .copy_source(format!("{}/meta", bucket_name))
+        .send()
+        .await
+        .context("copy object")?;
+
+    let copied = client
+        .get_object()
+        .bucket(bucket_name)
+        .key("meta-copy")
+        .send()
+        .await
+        .context("get copied object")?;
+    assert_metadata(&copied.metadata.clone().unwrap_or_default());
+
+    // Multipart uploads replay CreateMultipartUpload metadata onto the
+    // completed object.
+    let upload_id = {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key("mpu-meta")
+            .metadata("origin", "mpu")
+            .send()
+            .await
+            .context("create multipart upload")?;
+        res.upload_id.context("missing upload id")?
+    };
+
+    let _ = client
+        .upload_part()
+        .bucket(bucket_name)
+        .key("mpu-meta")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"part".as_slice()))
+        .send()
+        .await
+        .context("upload part")?;
+
+    let completed = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).build())
+        .build();
+
+    let _ = client
+        .complete_multipart_upload()
+        .bucket(bucket_name)
+        .key("mpu-meta")
+        .upload_id(upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .context("complete multipart upload")?;
+
+    let mpu_out = client
+        .get_object()
+        .bucket(bucket_name)
+        .key("mpu-meta")
+        .send()
+        .await
+        .context("get completed multipart object")?;
+
+    assert_eq!(
+        mpu_out.metadata.clone().unwrap_or_default().get("origin").map(String::as_str),
+        Some("mpu"),
+        "multipart metadata not replayed"
     );
 
     Ok(())
