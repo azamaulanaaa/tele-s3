@@ -322,27 +322,40 @@ impl Backend for Grammers {
         let this = self.clone();
 
         let stream = try_stream! {
-            let mut prefix_trim = offset % MAX_CHUNK_SIZE as usize;
+            // Absolute position (relative to media start) of the next byte
+            // to deliver.
+            let mut pos = offset;
             let mut bytes_remaining = limit;
 
-            let mut download_iter = {
-                let skip_chunks = offset / MAX_CHUNK_SIZE as usize;
-
-                this.client
-                    .iter_download(&media)
-                    .chunk_size(MAX_CHUNK_SIZE)
-                    .skip_chunks(skip_chunks as i32)
-            };
-
             loop {
+                if bytes_remaining == Some(0) {
+                    break;
+                }
+
                 this.check_flood_wait().await.map_err(std::io::Error::other)?;
 
-                let chunk_result = download_iter.next().await;
+                // Build a fresh iterator positioned at the chunk containing
+                // `pos`. DownloadIter loses its internal state after any
+                // error (its variant is replaced by Empty), so reusing one
+                // across errors makes next() return Ok(None) and silently
+                // truncate the stream — one instance per chunk is the only
+                // way to resume reliably.
+                let skip_chunks = pos / MAX_CHUNK_SIZE as usize;
 
-                let mut chunk = match chunk_result {
+                let mut download_iter = this
+                    .client
+                    .iter_download(&media)
+                    .chunk_size(MAX_CHUNK_SIZE)
+                    .skip_chunks(skip_chunks as i32);
+
+                let mut chunk = match download_iter.next().await {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
                     Err(e) => {
+                        // Long floods set the shared guard; sleep it off and
+                        // retry the same position. Any other error aborts the
+                        // stream so the client sees a real failure instead of
+                        // a short body.
                         if this
                             .catch_flood_error(&e)
                             .await
@@ -355,28 +368,22 @@ impl Backend for Grammers {
                     }
                 };
 
-                if prefix_trim > 0 {
-                    if chunk.len() <= prefix_trim {
-                        prefix_trim -= chunk.len();
-                        continue;
-                    }
-                    chunk.drain(0..prefix_trim);
-                    prefix_trim = 0;
+                // Trim bytes below `pos` inside the first fetched chunk.
+                let chunk_pos = pos % MAX_CHUNK_SIZE as usize;
+                let cut = chunk_pos.min(chunk.len());
+                chunk.drain(0..cut);
+                if chunk.is_empty() {
+                    break;
                 }
 
                 if let Some(rem) = bytes_remaining {
-                    if rem == 0 {
-                        break;
-                    }
-
-                    let current_len = chunk.len() ;
-                    if current_len > rem {
+                    if chunk.len() > rem {
                         chunk.truncate(rem);
-                        bytes_remaining = Some(0);
-                    } else {
-                        bytes_remaining = Some(rem - current_len);
                     }
+                    bytes_remaining = Some(rem.saturating_sub(chunk.len()));
                 }
+
+                pos += chunk.len();
 
                 yield bytes::Bytes::from(chunk);
             }
