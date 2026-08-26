@@ -75,7 +75,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         let model = self.repo.get_bucket(&req.input.bucket).await?;
 
         let res = S3Response::new(GetBucketLocationOutput {
-            location_constraint: model.region.map(|v| BucketLocationConstraint::from(v)),
+            location_constraint: model.region.map(BucketLocationConstraint::from),
         });
 
         Ok(res)
@@ -189,7 +189,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         if let Some(expected_hash) = req.input.content_md5 {
-            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(&hash_md5);
+            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(hash_md5);
 
             if expected_hash != hash_md5 {
                 if let Some(id) = id {
@@ -426,7 +426,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         if let Some(expected_hash) = req.input.content_md5 {
-            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(&hash_md5);
+            let hash_md5 = base64::prelude::BASE64_STANDARD.encode(hash_md5);
 
             if expected_hash != hash_md5 {
                 let _ = self.backend.delete(id).await;
@@ -829,7 +829,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         );
 
         let next_marker = if models.len() as u64 == limit {
-            models.last().and_then(|model| Some(model.id.clone()))
+            models.last().map(|model| model.id.clone())
         } else {
             None
         };
@@ -905,7 +905,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         );
 
         let next_marker = if models.len() as u64 == limit {
-            models.last().and_then(|model| Some(model.id.clone()))
+            models.last().map(|model| model.id.clone())
         } else {
             None
         };
