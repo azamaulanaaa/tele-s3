@@ -411,9 +411,8 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let model = self
             .repo
-            .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
-            .await?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+            .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await?;
 
         let mut content =
             serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
@@ -481,6 +480,12 @@ impl<B: Backend> S3 for TeleS3<B> {
                 etag.clone(),
                 metadata_json,
             )
+            .await?;
+
+        // Delete the multipart upload state only after the object row is
+        // committed, so a failed upsert doesn't orphan the uploaded parts.
+        self.repo
+            .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
             .await?;
 
         if let Some(delete_futures) = delete_old_object_futures {
