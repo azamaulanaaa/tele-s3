@@ -160,7 +160,8 @@ impl Repository {
                     .execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "INSERT INTO \"s3_object\" (bucket_id, id, size, last_modified, \
-                         content_type, etag, content, user_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                         content_type, etag, content, user_metadata, tags) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
                          ON CONFLICT (bucket_id, id) DO NOTHING",
                         [
                             bucket.into(),
@@ -171,6 +172,7 @@ impl Repository {
                             data.etag.into(),
                             data.content.into(),
                             data.user_metadata.into(),
+                            serde_json::json!([]).into(),
                         ],
                     ))
                     .await
@@ -396,6 +398,30 @@ impl Repository {
         Ok(released.into_iter().map(|model| model.id).collect())
     }
 
+    /// Replace the tag set stored on an object. The object must exist;
+    /// a missing key yields NoSuchKey.
+    #[instrument(skip(self, tags), level = "debug", err)]
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: serde_json::Value,
+    ) -> S3Result<()> {
+        let result = entity::object::Entity::update_many()
+            .col_expr(entity::object::Column::Tags, Expr::value(tags))
+            .filter(entity::object::Column::BucketId.eq(bucket))
+            .filter(entity::object::Column::Id.eq(key))
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        if result.rows_affected == 0 {
+            return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+        }
+
+        Ok(())
+    }
+
     #[instrument(skip(self), level = "debug", err)]
     pub async fn get_bucket(&self, name: &str) -> S3Result<entity::bucket::Model> {
         let bucket = entity::bucket::Entity::find_by_id(name)
@@ -417,6 +443,7 @@ impl Repository {
             content_type: Set(data.content_type),
             etag: Set(data.etag),
             user_metadata: Set(data.user_metadata),
+            tags: Set(serde_json::json!([])),
             content: Set(data.content),
         };
 
