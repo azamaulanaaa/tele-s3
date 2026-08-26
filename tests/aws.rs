@@ -1956,3 +1956,106 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_acl_stubs() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "acl-stubs";
+    let object_name = "obj";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_name)
+        .body(ByteStream::from_static(b"data".as_slice()))
+        .send()
+        .await
+        .context("put object")?;
+
+    // Bucket ACL round-trip: accepted on put, canned owner + grant on get.
+    let _ = client
+        .put_bucket_acl()
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("put bucket acl")?;
+
+    let bucket_acl = client
+        .get_bucket_acl()
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("get bucket acl")?;
+
+    assert!(
+        bucket_acl.owner().is_some(),
+        "bucket acl should carry an owner"
+    );
+    assert!(
+        !bucket_acl.grants().is_empty(),
+        "bucket acl should carry at least one grant"
+    );
+
+    // Object ACL round-trip.
+    let _ = client
+        .put_object_acl()
+        .bucket(bucket_name)
+        .key(object_name)
+        .send()
+        .await
+        .context("put object acl")?;
+
+    let object_acl = client
+        .get_object_acl()
+        .bucket(bucket_name)
+        .key(object_name)
+        .send()
+        .await
+        .context("get object acl")?;
+
+    assert!(object_acl.owner().is_some(), "object acl should have owner");
+    assert!(!object_acl.grants().is_empty());
+
+    // ACLs against missing resources still report the right errors.
+    let err = {
+        let res = client
+            .get_object_acl()
+            .bucket(bucket_name)
+            .key("no-such-object")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("NoSuchKey".to_string())
+    );
+
+    let err = {
+        let res = client.get_bucket_acl().bucket("no-such-bucket").send().await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("NoSuchBucket".to_string())
+    );
+
+    Ok(())
+}
