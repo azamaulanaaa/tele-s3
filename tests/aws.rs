@@ -22,12 +22,10 @@ async fn test_create_bucket_and_list_bucket() -> anyhow::Result<()> {
 
     let is_exists = {
         let res = client.list_buckets().send().await.context("list bucket")?;
-        let is_exists = res
-            .buckets()
-            .iter()
-            .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name));
 
-        is_exists
+        res.buckets()
+            .iter()
+            .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name))
     };
     assert!(!is_exists, "buckets should not exist before create");
 
@@ -48,12 +46,10 @@ async fn test_create_bucket_and_list_bucket() -> anyhow::Result<()> {
 
     let is_exists = {
         let res = client.list_buckets().send().await.context("list bucket")?;
-        let is_exists = res
-            .buckets()
-            .iter()
-            .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name));
 
-        is_exists
+        res.buckets()
+            .iter()
+            .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name))
     };
     assert!(is_exists, "buckets should exist after create");
 
@@ -72,7 +68,7 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchBucket".to_string())
     );
 
@@ -100,12 +96,10 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
 
     let is_exists = {
         let res = client.list_buckets().send().await.context("list bucket")?;
-        let is_exists = res
-            .buckets()
-            .iter()
-            .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name));
 
-        is_exists
+        res.buckets()
+            .iter()
+            .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name))
     };
     assert!(!is_exists, "buckets should not exist after delete");
 
@@ -124,7 +118,7 @@ async fn test_head_bucket() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchBucket".to_string())
     );
 
@@ -314,7 +308,7 @@ async fn test_put_object_and_head_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|e| e.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -373,7 +367,7 @@ async fn test_put_object_and_get_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|e| e.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -460,7 +454,7 @@ async fn test_delete_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|e| e.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -505,7 +499,7 @@ async fn test_copy_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|e| e.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -1025,7 +1019,7 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
             res.err()
         };
         assert_eq!(
-            err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+            err.and_then(|e| e.code().map(|e| e.to_owned())),
             Some("NoSuchBucket".to_string())
         );
     }
@@ -1297,10 +1291,7 @@ async fn test_list_multipart_uploads() -> anyhow::Result<()> {
             .await
             .context("list multipart uploads with prefix")?;
 
-        (
-            res.uploads().to_owned(),
-            res.is_truncated(),
-        )
+        (res.uploads().to_owned(), res.is_truncated())
     };
 
     assert_eq!(prefix_uploads.len(), 1);
@@ -1321,7 +1312,11 @@ async fn test_list_multipart_uploads() -> anyhow::Result<()> {
         res.is_truncated()
     };
 
-    assert_eq!(is_truncated, Some(true), "should be truncated by max uploads");
+    assert_eq!(
+        is_truncated,
+        Some(true),
+        "should be truncated by max uploads"
+    );
 
     Ok(())
 }
@@ -1391,10 +1386,7 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
                 .expect("missing part etag")
         };
 
-        let completed_part = CompletedPart::builder()
-            .e_tag(e_tag)
-            .part_number(1)
-            .build();
+        let completed_part = CompletedPart::builder().e_tag(e_tag).part_number(1).build();
 
         let completed = CompletedMultipartUpload::builder()
             .parts(completed_part)
