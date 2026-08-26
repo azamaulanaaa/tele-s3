@@ -22,7 +22,8 @@ use s3s::{
         ListObjectsV2Output, ListPartsInput, ListPartsOutput, Part, LocationType,
         Object, PutObjectInput, PutObjectOutput, StreamingBlob,
         Timestamp, UploadPartInput, UploadPartOutput, ListMultipartUploadsInput,
-        ListMultipartUploadsOutput, MultipartUpload,
+        ListMultipartUploadsOutput, MultipartUpload, UploadPartCopyInput, UploadPartCopyOutput,
+        CopyPartResult,
     },
 };
 use sea_orm::DatabaseConnection;
@@ -1034,12 +1035,11 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let mut is_truncated = false;
 
-        if let Some(max_uploads) = req.input.max_uploads {
-            if uploads.len() > max_uploads as usize {
+        if let Some(max_uploads) = req.input.max_uploads
+            && uploads.len() > max_uploads as usize {
                 uploads.truncate(max_uploads as usize);
                 is_truncated = true;
             }
-        }
 
         let res = S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(req.input.bucket),
@@ -1047,6 +1047,164 @@ impl<B: Backend> S3 for TeleS3<B> {
             max_uploads: req.input.max_uploads,
             is_truncated: Some(is_truncated),
             prefix: req.input.prefix,
+            ..Default::default()
+        });
+
+        Ok(res)
+    }
+
+    #[instrument(skip(self), err)]
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        self.repo
+            .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .await?;
+
+        // Access-point sources are not supported.
+        let (src_bucket, src_key) = match &req.input.copy_source {
+            CopySource::Bucket { bucket, key, .. } => (&**bucket, &**key),
+            CopySource::AccessPoint { .. } => {
+                return Err(S3Error::new(S3ErrorCode::NotImplemented));
+            }
+        };
+
+        let model = self.repo.get_object(src_bucket, src_key).await?;
+
+        let metadata: Metadata =
+            serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
+        let source_size = model.size as u64;
+
+        // Parse "bytes=start-end" (inclusive on both ends per S3 spec).
+        let range = match req.input.copy_source_range.as_deref() {
+            None => None,
+            Some(r) => {
+                let body = r
+                    .trim()
+                    .strip_prefix("bytes=")
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument))?;
+
+                if body.contains(',') {
+                    return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+                }
+
+                let (start_str, end_str) = body
+                    .split_once('-')
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument))?;
+
+                let start = start_str
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+                let end = end_str
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+
+                if end < start || end >= source_size {
+                    return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+                }
+
+                Some((start, end))
+            }
+        };
+
+        let (read_offset, read_len) = match range {
+            Some((start, end)) => (start, end - start + 1),
+            None => (0, source_size),
+        };
+
+        if read_len == 0 {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+        }
+
+        // Walk the source blobs to cover [read_offset, read_offset + read_len).
+        let mut remaining = read_len;
+        let mut cur = read_offset;
+
+        let reader_futures = metadata.item.iter().filter_map(|item| {
+            if remaining == 0 {
+                return None;
+            }
+
+            let item_size = item.size;
+            if cur >= item_size {
+                cur -= item_size;
+                return None;
+            }
+
+            let local_offset = cur;
+            let bytes_available = item_size - local_offset;
+            let take = std::cmp::min(bytes_available, remaining);
+
+            cur = 0;
+            remaining -= take;
+
+            Some(self.backend.read(item.id.clone(), local_offset, Some(take)))
+        });
+
+        let readers = futures::future::try_join_all(reader_futures)
+            .await
+            .map_err(S3Error::from)?
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError))?;
+
+        let (id, hash_md5) = {
+            let chain_readers = ChainReaders::from_vec(readers);
+            let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+
+            let reader_with_hasher = Box::pin(ReaderWithHasher::new(chain_readers, hasher_md5.clone()));
+
+            let id = self
+                .backend
+                .write(read_len, reader_with_hasher)
+                .await
+                .map_err(S3Error::from)?;
+
+            let hash_md5 = hasher_md5
+                .lock()
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
+                .finalize_reset();
+
+            (id, hash_md5)
+        };
+
+        let multipart_upload_part = MultipartUploadPart {
+            hash: hex::encode(hash_md5),
+            metadata_item: MetadataItem { id, size: read_len },
+        };
+
+        self.repo
+            .update_multipart_upload_state(
+                &req.input.bucket,
+                &req.input.key,
+                &req.input.upload_id,
+                |model| {
+                    let mut content: BTreeMap<i32, MultipartUploadPart> =
+                        serde_json::from_value(model.content.clone())
+                            .map_err(S3Error::internal_error)?;
+
+                    content.insert(req.input.part_number, multipart_upload_part.clone());
+
+                    let content_json = serde_json::to_value(&content).map_err(S3Error::internal_error)?;
+
+                    let mut active_model: entity::multipart_upload_state::ActiveModel =
+                        model.into();
+                    active_model.content = sea_orm::Set(content_json);
+
+                    Ok(active_model)
+                },
+            )
+            .await?;
+
+        let res = S3Response::new(UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(ETag::Strong(multipart_upload_part.hash)),
+                last_modified: Some(chrono_to_timestamp(chrono::Local::now().to_utc())),
+                ..Default::default()
+            }),
             ..Default::default()
         });
 

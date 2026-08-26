@@ -1325,3 +1325,160 @@ async fn test_list_multipart_uploads() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_upload_part_copy() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "upload-part-copy";
+    let source_name = "source";
+    let source_content = "hello world";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key(source_name)
+        .body(ByteStream::from_static(source_content.as_bytes()))
+        .send()
+        .await
+        .context("put source object")?;
+
+    // Full-object copy as a single part
+    {
+        let upload_id = {
+            let res = client
+                .create_multipart_upload()
+                .bucket(bucket_name)
+                .key("dest-full")
+                .send()
+                .await
+                .context("create multipart upload")?;
+            res.upload_id.context("missing upload id")?
+        };
+
+        let copy_source = format!("{}/{}", bucket_name, source_name);
+
+        let e_tag = {
+            let res = client
+                .upload_part_copy()
+                .bucket(bucket_name)
+                .key("dest-full")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .copy_source(&copy_source)
+                .send()
+                .await
+                .context("upload part copy")?;
+
+            res.copy_part_result
+                .and_then(|r| r.e_tag)
+                .expect("missing part etag")
+        };
+
+        let completed_part = CompletedPart::builder()
+            .e_tag(e_tag)
+            .part_number(1)
+            .build();
+
+        let completed = CompletedMultipartUpload::builder()
+            .parts(completed_part)
+            .build();
+
+        let _ = client
+            .complete_multipart_upload()
+            .bucket(bucket_name)
+            .key("dest-full")
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .context("complete multipart upload")?;
+
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("dest-full")
+            .send()
+            .await
+            .context("get copied object")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(
+            data.into_bytes().as_ref(),
+            source_content.as_bytes(),
+            "full copy content mismatch"
+        );
+    }
+
+    // Ranged copy: bytes 6-10 of "hello world" is "world"
+    {
+        let upload_id = {
+            let res = client
+                .create_multipart_upload()
+                .bucket(bucket_name)
+                .key("dest-ranged")
+                .send()
+                .await
+                .context("create multipart upload")?;
+            res.upload_id.context("missing upload id")?
+        };
+
+        let copy_source = format!("{}/{}", bucket_name, source_name);
+
+        let _ = client
+            .upload_part_copy()
+            .bucket(bucket_name)
+            .key("dest-ranged")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .copy_source(&copy_source)
+            .copy_source_range("bytes=6-10")
+            .send()
+            .await
+            .context("upload ranged part copy")?;
+
+        let completed_part = CompletedPart::builder().part_number(1).build();
+        let completed = CompletedMultipartUpload::builder()
+            .parts(completed_part)
+            .build();
+
+        let _ = client
+            .complete_multipart_upload()
+            .bucket(bucket_name)
+            .key("dest-ranged")
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .context("complete ranged multipart upload")?;
+
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("dest-ranged")
+            .send()
+            .await
+            .context("get ranged copy object")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(data.into_bytes().as_ref(), b"world", "range copy mismatch");
+    }
+
+    Ok(())
+}
