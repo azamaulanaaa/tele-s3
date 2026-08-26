@@ -29,6 +29,17 @@ pub struct Repository {
     pub db: DatabaseConnection,
 }
 
+/// Field bundle for writing an object row.
+pub struct ObjectWrite {
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub etag: Option<String>,
+    /// Ordered blob-item list describing the object's content.
+    pub content: serde_json::Value,
+    /// x-amz-meta-* map as a JSON object; empty object when none.
+    pub user_metadata: serde_json::Value,
+}
+
 impl Repository {
     #[instrument(skip(db), level = "debug")]
     pub async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
@@ -126,15 +137,12 @@ impl Repository {
     /// follow-up writes and mask the 412 as an InternalError. Failing
     /// conditions return 412 PreconditionFailed (or NoSuchKey for If-Match
     /// on a missing object) leaving the previous state untouched.
-    #[instrument(skip(self, content_type, etag, metadata, condition), level = "debug", err)]
+    #[instrument(skip(self, data, condition), level = "debug", err)]
     pub async fn cas_put_object(
         &self,
         bucket: String,
         key: String,
-        size: u64,
-        content_type: Option<String>,
-        etag: Option<String>,
-        metadata: serde_json::Value,
+        data: ObjectWrite,
         condition: PutCondition,
     ) -> S3Result<()> {
         let now = chrono::Local::now().to_utc();
@@ -144,8 +152,7 @@ impl Repository {
 
         match condition {
             PutCondition::None => {
-                self.upsert_object(bucket, key, size, content_type, etag, metadata)
-                    .await
+                self.upsert_object(bucket, key, data).await
             }
             PutCondition::IfNoneMatchAny => {
                 let res = self
@@ -153,16 +160,17 @@ impl Repository {
                     .execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "INSERT INTO \"s3_object\" (bucket_id, id, size, last_modified, \
-                         content_type, etag, content) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                         content_type, etag, content, user_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
                          ON CONFLICT (bucket_id, id) DO NOTHING",
                         [
                             bucket.into(),
                             key.into(),
-                            (size as i64).into(),
+                            (data.size as i64).into(),
                             now.into(),
-                            content_type.into(),
-                            etag.into(),
-                            metadata.into(),
+                            data.content_type.into(),
+                            data.etag.into(),
+                            data.content.into(),
+                            data.user_metadata.into(),
                         ],
                     ))
                     .await
@@ -183,11 +191,11 @@ impl Repository {
                             "{SET_SQL} WHERE bucket_id = ? AND id = ? AND etag = ?"
                         ),
                         [
-                            (size as i64).into(),
+                            (data.size as i64).into(),
                             now.into(),
-                            content_type.clone().into(),
-                            etag.clone().into(),
-                            metadata.clone().into(),
+                            data.content_type.clone().into(),
+                            data.etag.clone().into(),
+                            data.content.clone().into(),
                             bucket.as_str().into(),
                             key.as_str().into(),
                             expected.as_str().into(),
@@ -215,11 +223,12 @@ impl Repository {
                             "{SET_SQL} WHERE bucket_id = ? AND id = ?"
                         ),
                         [
-                            (size as i64).into(),
+                            (data.size as i64).into(),
                             now.into(),
-                            content_type.into(),
-                            etag.into(),
-                            metadata.into(),
+                            data.content_type.into(),
+                            data.etag.into(),
+                            data.content.into(),
+                            data.user_metadata.into(),
                             bucket.as_str().into(),
                             key.as_str().into(),
                         ],
@@ -246,11 +255,12 @@ impl Repository {
                              AND (etag IS NULL OR etag <> ?)"
                         ),
                         [
-                            (size as i64).into(),
+                            (data.size as i64).into(),
                             now.into(),
-                            content_type.clone().into(),
-                            etag.clone().into(),
-                            metadata.clone().into(),
+                            data.content_type.clone().into(),
+                            data.etag.clone().into(),
+                            data.content.clone().into(),
+                            data.user_metadata.clone().into(),
                             bucket.as_str().into(),
                             key.as_str().into(),
                             expected.as_str().into(),
@@ -264,9 +274,7 @@ impl Repository {
                 }
 
                 if !self.object_exists(&bucket, &key).await? {
-                    return self
-                        .upsert_object(bucket, key, size, content_type, etag, metadata)
-                        .await;
+                    return self.upsert_object(bucket, key, data).await;
                 }
 
                 Err(S3Error::new(S3ErrorCode::PreconditionFailed))
@@ -399,24 +407,17 @@ impl Repository {
         Ok(bucket)
     }
 
-    #[instrument(skip(self), level = "debug", err)]
-    pub async fn upsert_object(
-        &self,
-        bucket: String,
-        key: String,
-        size: u64,
-        content_type: Option<String>,
-        etag: Option<String>,
-        metadata: serde_json::Value,
-    ) -> S3Result<()> {
+    #[instrument(skip(self, data), level = "debug", err)]
+    pub async fn upsert_object(&self, bucket: String, key: String, data: ObjectWrite) -> S3Result<()> {
         let active_model = entity::object::ActiveModel {
             bucket_id: Set(bucket),
             id: Set(key),
-            size: Set(size as u32),
+            size: Set(data.size as u32),
             last_modified: Set(chrono::Local::now().to_utc()),
-            content_type: Set(content_type),
-            etag: Set(etag),
-            content: Set(metadata),
+            content_type: Set(data.content_type),
+            etag: Set(data.etag),
+            user_metadata: Set(data.user_metadata),
+            content: Set(data.content),
         };
 
         entity::object::Entity::insert(active_model)
@@ -602,6 +603,7 @@ impl Repository {
         key: String,
         upload_id: String,
         content_type: Option<String>,
+        user_metadata: serde_json::Value,
         content: serde_json::Value,
     ) -> S3Result<()> {
         let active_model = entity::multipart_upload_state::ActiveModel {
@@ -609,6 +611,7 @@ impl Repository {
             object_id: Set(key),
             upload_id: Set(upload_id),
             content_type: Set(content_type),
+            user_metadata: Set(user_metadata),
             content: Set(content),
         };
 
@@ -786,10 +789,13 @@ mod tests {
             .cas_put_object(
                 "b".into(),
                 "k".into(),
-                1,
-                None,
-                Some("e1".into()),
-                serde_json::json!({}),
+                ObjectWrite {
+                    size: 1,
+                    content_type: None,
+                    etag: Some("e1".into()),
+                    content: serde_json::json!({}),
+                    user_metadata: serde_json::json!({}),
+                },
                 PutCondition::IfNoneMatchAny,
             )
             .await;
@@ -803,10 +809,13 @@ mod tests {
             .cas_put_object(
                 "b".into(),
                 "k".into(),
-                1,
-                None,
-                Some("e2".into()),
-                serde_json::json!({}),
+                ObjectWrite {
+                    size: 1,
+                    content_type: None,
+                    etag: Some("e2".into()),
+                    content: serde_json::json!({}),
+                    user_metadata: serde_json::json!({}),
+                },
                 PutCondition::IfNoneMatchAny,
             )
             .await;

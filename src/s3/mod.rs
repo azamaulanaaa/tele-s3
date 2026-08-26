@@ -34,7 +34,7 @@ use tracing::instrument;
 use crate::{
     backend::{Backend, BackendError, BoxedAsyncReader, ChainReaders, ReaderWithHasher},
 };
-use repo::{PutCondition, Repository};
+use repo::{ObjectWrite, PutCondition, Repository};
 
 mod repo;
 
@@ -338,18 +338,18 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         };
 
+        let data = ObjectWrite {
+            size,
+            content_type: req.input.content_type.take(),
+            etag: etag.clone(),
+            content: content_json,
+            user_metadata: metadata_to_json(req.input.metadata.take()),
+        };
+
         {
             let result = self
                 .repo
-                .cas_put_object(
-                    req.input.bucket,
-                    req.input.key,
-                    size,
-                    req.input.content_type,
-                    etag.clone(),
-                    content_json,
-                    condition,
-                )
+                .cas_put_object(req.input.bucket, req.input.key, data, condition)
                 .await;
 
             if let Err(err) = result {
@@ -429,15 +429,17 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         };
 
+        let data = ObjectWrite {
+            size,
+            content_type: model.content_type.clone(),
+            etag: model.etag.clone(),
+            content: content_json,
+            // AWS MetadataDirective defaults to COPY; carry source metadata.
+            user_metadata: model.user_metadata.clone(),
+        };
+
         self.repo
-            .upsert_object(
-                req.input.bucket.clone(),
-                req.input.key.clone(),
-                size,
-                model.content_type.clone(),
-                model.etag.clone(),
-                content_json,
-            )
+            .upsert_object(req.input.bucket.clone(), req.input.key.clone(), data)
             .await?;
 
         // On an upsert failure the acquired refs above are simply kept:
@@ -476,6 +478,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 req.input.key.clone(),
                 upload_id.clone(),
                 req.input.content_type,
+                metadata_to_json(req.input.metadata.clone()),
                 content_json,
             )
             .await?;
@@ -685,14 +688,19 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         };
 
+        let data = ObjectWrite {
+            size,
+            content_type: model.content_type,
+            etag: etag.clone(),
+            content: metadata_json,
+            user_metadata: model.user_metadata,
+        };
+
         self.repo
             .cas_put_object(
                 req.input.bucket.clone(),
                 req.input.key.clone(),
-                size,
-                model.content_type,
-                etag.clone(),
-                metadata_json,
+                data,
                 condition,
             )
             .await?;
@@ -814,11 +822,14 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let body = StreamingBlob::wrap(chain_readers);
 
+        let object_metadata = json_to_metadata(&model.user_metadata);
+
         let res = S3Response::new(GetObjectOutput {
             content_type: model.content_type,
             content_length: Some(content_length as i64),
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
             e_tag: model.etag.map(ETag::Strong),
+            metadata: object_metadata,
             body: Some(body),
             ..Default::default()
         });
@@ -842,6 +853,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             content_type: model.content_type,
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
             e_tag: model.etag.map(ETag::Strong),
+            metadata: json_to_metadata(&model.user_metadata),
             ..Default::default()
         });
 
@@ -1469,6 +1481,26 @@ fn full_control_grant() -> Grant {
             uri: None,
         }),
         permission: Some(s3s::dto::Permission::FULL_CONTROL.to_string().into()),
+    }
+}
+
+fn metadata_to_json(metadata: Option<s3s::dto::Metadata>) -> serde_json::Value {
+    match metadata {
+        Some(map) if !map.is_empty() => {
+            serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    }
+}
+
+fn json_to_metadata(value: &serde_json::Value) -> Option<s3s::dto::Metadata> {
+    if value.is_null() {
+        return None;
+    }
+
+    match serde_json::from_value::<s3s::dto::Metadata>(value.clone()) {
+        Ok(map) if !map.is_empty() => Some(map),
+        _ => None,
     }
 }
 
