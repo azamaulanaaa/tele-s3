@@ -164,10 +164,7 @@ impl Backend for Grammers {
         let name = uuid::Uuid::new_v4().to_string();
         let mut compat_reader = reader.compat();
 
-        loop {
-            self.check_flood_wait().await?;
-            break;
-        }
+        self.check_flood_wait().await?;
 
         let mut part_index = 0;
         let total_parts = size.div_ceil(PART_SIZE as u64) as i32;
@@ -260,10 +257,7 @@ impl Backend for Grammers {
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
 
-        loop {
-            self.check_flood_wait().await?;
-            break;
-        }
+        self.check_flood_wait().await?;
 
         let media = {
             let mut messages = self
