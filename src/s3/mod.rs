@@ -15,7 +15,8 @@ use s3s::{
         CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
         CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
         DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, GetBucketLocationInput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, ETagCondition,
+        GetBucketLocationInput,
         GetBucketLocationOutput, GetObjectInput, GetObjectOutput, HeadBucketInput,
         HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
         ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput, ListObjectsOutput,
@@ -30,9 +31,8 @@ use tracing::instrument;
 
 use crate::{
     backend::{Backend, BackendError, BoxedAsyncReader, ChainReaders, ReaderWithHasher},
-    s3::repo::entity,
 };
-use repo::Repository;
+use repo::{PutCondition, Repository};
 
 mod repo;
 
@@ -58,6 +58,56 @@ impl<B: Backend> TeleS3<B> {
         let zero_ids = self.repo.release_blob_refs(&ids).await?;
         let delete_futures = zero_ids.into_iter().map(|id| self.backend.delete(id));
         let _ = futures::future::join_all(delete_futures).await;
+
+        Ok(())
+    }
+
+    /// Fast-fail doomed conditional writes before any expensive work or
+    /// validation. The atomic re-check still happens in cas_put_object at
+    /// commit time; this only avoids wasted effort and gives preconditions
+    /// correct precedence over other errors (e.g. InvalidPart).
+    async fn precondition_gate(
+        &self,
+        bucket: &str,
+        key: &str,
+        condition: &PutCondition,
+    ) -> S3Result<()> {
+        if matches!(condition, PutCondition::None) {
+            return Ok(());
+        }
+
+        let exists = self.repo.object_exists(bucket, key).await?;
+        let current_etag: Option<String> = if exists {
+            self.repo.get_object(bucket, key).await?.etag
+        } else {
+            None
+        };
+
+        match condition {
+            PutCondition::IfMatch(expected) => match &current_etag {
+                None => return Err(S3Error::new(S3ErrorCode::NoSuchKey)),
+                Some(current) if current != expected => {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
+                _ => {}
+            },
+            PutCondition::IfMatchAny => {
+                if current_etag.is_none() {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+            }
+            PutCondition::IfNoneMatchAny => {
+                if current_etag.is_some() {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
+            }
+            PutCondition::IfNoneMatch(expected) => {
+                if current_etag.as_deref() == Some(expected.as_str()) {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
+            }
+            PutCondition::None => {}
+        }
 
         Ok(())
     }
@@ -179,6 +229,16 @@ impl<B: Backend> S3 for TeleS3<B> {
                 .content_length
                 .ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))? as u64;
 
+        let condition = build_put_condition(
+            req.input.if_match.as_ref(),
+            req.input.if_none_match.as_ref(),
+        )?;
+
+        // Fast-fail doomed conditional writes before streaming into the
+        // backend; the atomic re-check still happens in cas_put_object.
+        self.precondition_gate(&req.input.bucket, &req.input.key, &condition)
+            .await?;
+
         let reader = {
             let body_stream = req
                 .input
@@ -279,19 +339,22 @@ impl<B: Backend> S3 for TeleS3<B> {
         {
             let result = self
                 .repo
-                .upsert_object(
+                .cas_put_object(
                     req.input.bucket,
                     req.input.key,
                     size,
                     req.input.content_type,
                     etag.clone(),
                     content_json,
+                    condition,
                 )
                 .await;
 
             if let Err(err) = result {
                 if let Some(id) = id {
-                    self.release_blobs(vec![id]).await?;
+                    // Best-effort cleanup only: a cleanup failure must not
+                    // replace the original error the client should see.
+                    let _ = self.release_blobs(vec![id]).await;
                 }
 
                 return Err(err);
@@ -531,6 +594,17 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let condition = build_put_condition(
+            req.input.if_match.as_ref(),
+            req.input.if_none_match.as_ref(),
+        )?;
+
+        // Preconditions take precedence over other completion errors, so
+        // evaluate them before touching parts; the atomic re-check happens
+        // in cas_put_object at commit time.
+        self.precondition_gate(&req.input.bucket, &req.input.key, &condition)
+            .await?;
+
         let requested_parts = req
             .input
             .multipart_upload
@@ -610,13 +684,14 @@ impl<B: Backend> S3 for TeleS3<B> {
         };
 
         self.repo
-            .upsert_object(
+            .cas_put_object(
                 req.input.bucket.clone(),
                 req.input.key.clone(),
                 size,
                 model.content_type,
                 etag.clone(),
                 metadata_json,
+                condition,
             )
             .await?;
 
@@ -672,7 +747,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 multipart_upload_part.metadata_items.into_iter().map(|i| i.id)
             })
             .collect();
-        self.release_blobs(part_ids).await?;;
+        self.release_blobs(part_ids).await?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
@@ -1322,6 +1397,30 @@ fn chrono_to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> Timestamp {
     let datetime: SystemTime = datetime.into();
 
     Timestamp::from(datetime)
+}
+
+/// Translate If-Match / If-None-Match headers into a write precondition.
+fn build_put_condition(
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+) -> S3Result<PutCondition> {
+    if if_match.is_some() && if_none_match.is_some() {
+        return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+    }
+
+    fn etag_value(e: &ETag) -> String {
+        match e {
+            ETag::Strong(v) | ETag::Weak(v) => v.clone(),
+        }
+    }
+
+    Ok(match (if_match, if_none_match) {
+        (Some(ETagCondition::ETag(e)), _) => PutCondition::IfMatch(etag_value(e)),
+        (Some(ETagCondition::Any), _) => PutCondition::IfMatchAny,
+        (_, Some(ETagCondition::Any)) => PutCondition::IfNoneMatchAny,
+        (_, Some(ETagCondition::ETag(e))) => PutCondition::IfNoneMatch(etag_value(e)),
+        _ => PutCondition::None,
+    })
 }
 
 trait StreamingBlobExt {

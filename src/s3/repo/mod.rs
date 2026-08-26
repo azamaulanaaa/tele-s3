@@ -1,13 +1,29 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, ExprTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, SqlErr,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbBackend, DbErr, EntityTrait,
+    ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, Statement,
     prelude::Expr,
     sea_query::{OnConflict, Query},
 };
 use tracing::instrument;
 
 pub mod entity;
+
+/// Precondition for a compare-and-swap object write.
+pub enum PutCondition {
+    /// Unconditional upsert (no If-Match / If-None-Match header).
+    None,
+    /// If-Match with a specific ETag: write only if the object exists
+    /// and its stored ETag matches. Missing object → NoSuchKey.
+    IfMatch(String),
+    /// If-Match: * — write only if the object exists.
+    IfMatchAny,
+    /// If-None-Match: * — create-only; any existing object → 412.
+    IfNoneMatchAny,
+    /// If-None-Match with a specific ETag: fail only if the object exists
+    /// and its stored ETag matches.
+    IfNoneMatch(String),
+}
 
 pub struct Repository {
     pub db: DatabaseConnection,
@@ -99,6 +115,163 @@ impl Repository {
             .is_some();
 
         Ok(bucket_exists)
+    }
+
+    /// Compare-and-swap object write.
+    ///
+    /// Every branch lands as a single atomic SQL statement whose guard
+    /// lives in the WHERE clause, so racing conditional writers serialize
+    /// at the database level without explicit transactions — an abandoned
+    /// open transaction on a precondition failure would otherwise race
+    /// follow-up writes and mask the 412 as an InternalError. Failing
+    /// conditions return 412 PreconditionFailed (or NoSuchKey for If-Match
+    /// on a missing object) leaving the previous state untouched.
+    #[instrument(skip(self, content_type, etag, metadata, condition), level = "debug", err)]
+    pub async fn cas_put_object(
+        &self,
+        bucket: String,
+        key: String,
+        size: u64,
+        content_type: Option<String>,
+        etag: Option<String>,
+        metadata: serde_json::Value,
+        condition: PutCondition,
+    ) -> S3Result<()> {
+        let now = chrono::Local::now().to_utc();
+
+        const SET_SQL: &str = "UPDATE \"s3_object\" SET size = ?, last_modified = ?, \
+             content_type = ?, etag = ?, content = ?";
+
+        match condition {
+            PutCondition::None => {
+                self.upsert_object(bucket, key, size, content_type, etag, metadata)
+                    .await
+            }
+            PutCondition::IfNoneMatchAny => {
+                let res = self
+                    .db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO \"s3_object\" (bucket_id, id, size, last_modified, \
+                         content_type, etag, content) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT (bucket_id, id) DO NOTHING",
+                        [
+                            bucket.into(),
+                            key.into(),
+                            (size as i64).into(),
+                            now.into(),
+                            content_type.into(),
+                            etag.into(),
+                            metadata.into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if res.rows_affected() == 0 {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
+
+                Ok(())
+            }
+            PutCondition::IfMatch(expected) => {
+                let res = self
+                    .db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!(
+                            "{SET_SQL} WHERE bucket_id = ? AND id = ? AND etag = ?"
+                        ),
+                        [
+                            (size as i64).into(),
+                            now.into(),
+                            content_type.clone().into(),
+                            etag.clone().into(),
+                            metadata.clone().into(),
+                            bucket.as_str().into(),
+                            key.as_str().into(),
+                            expected.as_str().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if res.rows_affected() == 1 {
+                    return Ok(());
+                }
+
+                if !self.object_exists(&bucket, &key).await? {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+
+                Err(S3Error::new(S3ErrorCode::PreconditionFailed))
+            }
+            PutCondition::IfMatchAny => {
+                let res = self
+                    .db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!(
+                            "{SET_SQL} WHERE bucket_id = ? AND id = ?"
+                        ),
+                        [
+                            (size as i64).into(),
+                            now.into(),
+                            content_type.into(),
+                            etag.into(),
+                            metadata.into(),
+                            bucket.as_str().into(),
+                            key.as_str().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if res.rows_affected() == 0 {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+
+                Ok(())
+            }
+            PutCondition::IfNoneMatch(expected) => {
+                // The guarded update only lands when the current ETag differs;
+                // falling through means the object is absent (create it) or
+                // already carries the forbidden digest (412).
+                let res = self
+                    .db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!(
+                            "{SET_SQL} WHERE bucket_id = ? AND id = ? \
+                             AND (etag IS NULL OR etag <> ?)"
+                        ),
+                        [
+                            (size as i64).into(),
+                            now.into(),
+                            content_type.clone().into(),
+                            etag.clone().into(),
+                            metadata.clone().into(),
+                            bucket.as_str().into(),
+                            key.as_str().into(),
+                            expected.as_str().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if res.rows_affected() == 1 {
+                    return Ok(());
+                }
+
+                if !self.object_exists(&bucket, &key).await? {
+                    return self
+                        .upsert_object(bucket, key, size, content_type, etag, metadata)
+                        .await;
+                }
+
+                Err(S3Error::new(S3ErrorCode::PreconditionFailed))
+            }
+        }
     }
 
     /// Register a freshly created backend blob with a single reference.
@@ -585,5 +758,68 @@ impl Repository {
             "multipart upload state changed concurrently {} times",
             MAX_ATTEMPTS
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn repo() -> Repository {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        Repository::init(db).await.expect("init")
+    }
+
+    #[tokio::test]
+    async fn cas_put_if_none_match_any_rejects_second_create() {
+        let repo = repo().await;
+
+        // s3_object carries a foreign key to s3_bucket; the bucket row must
+        // exist before any object insert can land.
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let first = repo
+            .cas_put_object(
+                "b".into(),
+                "k".into(),
+                1,
+                None,
+                Some("e1".into()),
+                serde_json::json!({}),
+                PutCondition::IfNoneMatchAny,
+            )
+            .await;
+        assert!(
+            first.is_ok(),
+            "first create-only put should succeed: {first:?}"
+        );
+
+        // Second create-only put must be rejected with PreconditionFailed.
+        let second = repo
+            .cas_put_object(
+                "b".into(),
+                "k".into(),
+                1,
+                None,
+                Some("e2".into()),
+                serde_json::json!({}),
+                PutCondition::IfNoneMatchAny,
+            )
+            .await;
+
+        match second {
+            Ok(()) => panic!("second create-only put should fail"),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(
+                    msg.contains("PreconditionFailed"),
+                    "expected PreconditionFailed, got: {msg}"
+                );
+            }
+        }
     }
 }
