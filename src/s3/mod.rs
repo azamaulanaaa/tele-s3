@@ -224,7 +224,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             let mut content = Metadata { item: vec![] };
 
             if let Some(id) = id.clone() {
-                content.item.push(MetadataItem { id, size })
+                content.item.push(MetadataItem {
+                    id,
+                    offset: 0,
+                    size,
+                })
             }
 
             serde_json::to_value(&content).map_err(S3Error::internal_error)?
@@ -464,7 +468,11 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let multipart_upload_part = MultipartUploadPart {
             hash: hex::encode(hash_md5),
-            metadata_item: MetadataItem { id, size },
+            metadata_item: MetadataItem {
+                id,
+                offset: 0,
+                size,
+            },
         };
 
         self.repo
@@ -676,7 +684,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             offset = 0;
             remain_length -= take_amount;
 
-            let reader = self.backend.read(item.id, local_offset, Some(take_amount));
+            // Items may be slices of larger shared blobs, so the read
+            // position is the item's own blob offset plus the walk offset.
+            let reader = self
+                .backend
+                .read(item.id, item.offset + local_offset, Some(take_amount));
 
             Some(reader)
         });
@@ -1146,7 +1158,12 @@ impl<B: Backend> S3 for TeleS3<B> {
             cur = 0;
             remaining -= take;
 
-            Some(self.backend.read(item.id.clone(), local_offset, Some(take)))
+            // Items may be slices of larger shared blobs; read from the
+            // item's own start offset within its blob.
+            Some(
+                self.backend
+                    .read(item.id.clone(), item.offset + local_offset, Some(take)),
+            )
         });
 
         let readers = futures::future::try_join_all(reader_futures)
@@ -1179,7 +1196,13 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let multipart_upload_part = MultipartUploadPart {
             hash: hex::encode(hash_md5),
-            metadata_item: MetadataItem { id, size: read_len },
+            // The range was physically copied into a fresh blob owned by
+            // this part, so its slice starts at zero within that blob.
+            metadata_item: MetadataItem {
+                id,
+                offset: 0,
+                size: read_len,
+            },
         };
 
         self.repo
@@ -1227,6 +1250,11 @@ struct Metadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetadataItem {
     id: String,
+    // Start of this item's data within the backend blob. Zero for objects
+    // that own whole blobs; non-zero when an item is a shared slice of a
+    // larger blob (e.g. produced by a ranged upload part copy).
+    #[serde(default)]
+    offset: u64,
     size: u64,
 }
 
