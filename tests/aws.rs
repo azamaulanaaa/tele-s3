@@ -1381,16 +1381,17 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
                 .await
                 .context("upload part copy")?;
 
-            // Shared slices carry no digest, so the response omits the ETag.
-            assert!(
-                res.copy_part_result
-                    .and_then(|r| r.e_tag)
-                    .is_none(),
-                "shared slice should not report an ETag"
-            );
+            // Option A: the slice digest is computed by streaming the shared
+            // bytes back once, so the response carries a real ETag.
+            res.copy_part_result
+                .and_then(|r| r.e_tag)
+                .expect("shared slice should report a computed ETag")
         };
 
-        let completed_part = CompletedPart::builder().part_number(1).build();
+        let completed_part = CompletedPart::builder()
+            .e_tag(e_tag)
+            .part_number(1)
+            .build();
 
         let completed = CompletedMultipartUpload::builder()
             .parts(completed_part)
