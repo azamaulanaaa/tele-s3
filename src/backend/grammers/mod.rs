@@ -196,18 +196,32 @@ impl Backend for Grammers {
             }
             remaining -= n;
 
-            let result = self
-                .client
-                .invoke(&SaveBigFilePart {
-                    file_id,
-                    file_part: part_index,
-                    file_total_parts: total_parts,
-                    bytes: buffer,
-                })
-                .await;
-            if let Err(e) = result {
-                self.catch_flood_error(&e).await?;
-                return Err(BackendError::Other(Box::new(e)));
+            // Retry the part through flood waits; re-uploading the same
+            // part index is idempotent on Telegram's side.
+            loop {
+                self.check_flood_wait().await?;
+
+                match self
+                    .client
+                    .invoke(&SaveBigFilePart {
+                        file_id,
+                        file_part: part_index,
+                        file_total_parts: total_parts,
+                        // cloned so a failed attempt can be retried with
+                        // the same bytes
+                        bytes: buffer.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(e) => {
+                        if self.catch_flood_error(&e).await?.is_some() {
+                            continue;
+                        }
+
+                        return Err(BackendError::Other(Box::new(e)));
+                    }
+                }
             }
 
             part_index += 1;
