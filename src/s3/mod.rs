@@ -12,6 +12,7 @@ use s3s::{
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
         CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+        CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
         CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
         CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
         DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
@@ -262,6 +263,84 @@ impl<B: Backend> S3 for TeleS3<B> {
         let res = S3Response::new(PutObjectOutput {
             e_tag: etag.map(ETag::Strong),
             size: Some(size as i64),
+            ..Default::default()
+        });
+
+        Ok(res)
+    }
+
+    #[instrument(skip(self), err)]
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        // Access-point sources are not supported.
+        let (src_bucket, src_key) = match &req.input.copy_source {
+            CopySource::Bucket { bucket, key, .. } => (&**bucket, &**key),
+            CopySource::AccessPoint { .. } => {
+                return Err(S3Error::new(S3ErrorCode::NotImplemented));
+            }
+        };
+
+        let model = self.repo.get_object(src_bucket, src_key).await?;
+
+        let metadata: Metadata =
+            serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
+        let size = model.size as u64;
+
+        // Point the destination at the source's existing backend blobs
+        // instead of duplicating them: backends may be capacity-limited,
+        // Telegram uploads are expensive, and S3 semantics only require the
+        // destination to expose equivalent content.
+        let content_json = serde_json::to_value(&metadata).map_err(S3Error::internal_error)?;
+
+        // Blob IDs the copied object now shares; never delete these when
+        // cleaning up an overwritten destination (covers copying an object
+        // onto itself).
+        let new_ids = metadata
+            .item
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect::<Vec<_>>();
+
+        let delete_old_futures = {
+            if let Ok(old) = self.repo.get_object(&req.input.bucket, &req.input.key).await {
+                let old_metadata: Metadata =
+                    serde_json::from_value(old.content).map_err(S3Error::internal_error)?;
+
+                let delete_futures = old_metadata
+                    .item
+                    .into_iter()
+                    .filter(|v| !new_ids.contains(&v.id.as_str()))
+                    .map(|v| self.backend.delete(v.id));
+
+                Some(delete_futures)
+            } else {
+                None
+            }
+        };
+
+        self.repo
+            .upsert_object(
+                req.input.bucket.clone(),
+                req.input.key.clone(),
+                size,
+                model.content_type.clone(),
+                model.etag.clone(),
+                content_json,
+            )
+            .await?;
+
+        if let Some(delete_futures) = delete_old_futures {
+            let _ = futures::future::join_all(delete_futures).await;
+        }
+
+        let res = S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: model.etag.map(ETag::Strong),
+                last_modified: Some(chrono_to_timestamp(model.last_modified)),
+                ..Default::default()
+            }),
             ..Default::default()
         });
 
