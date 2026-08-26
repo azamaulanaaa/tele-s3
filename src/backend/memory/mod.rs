@@ -121,7 +121,7 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
         {
             let reminder_len = object.len % M;
-            let last_idx = object.chunks.len() - 1;
+            let last_idx = object.chunks.len().saturating_sub(1);
             for idx in 0..object.chunks.len() {
                 let is_last = idx == last_idx;
 
@@ -332,6 +332,28 @@ mod tests {
         let _ = reader.read_to_end(&mut out).await?;
 
         assert_eq!(out[..], content[5..8]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_zero_size_then_read() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        let content: [u8; 0] = [];
+        let content_reader = Box::pin(Cursor::new(content));
+
+        let key = backend.write(0, content_reader).await?;
+
+        let mut reader = backend
+            .read(key, 0, None)
+            .await?
+            .expect("key should be exist after write");
+
+        let mut out = Vec::new();
+        let _ = reader.read_to_end(&mut out).await?;
+
+        assert!(out.is_empty());
 
         Ok(())
     }
