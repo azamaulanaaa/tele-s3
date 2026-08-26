@@ -492,11 +492,11 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let multipart_upload_part = MultipartUploadPart {
             hash: hex::encode(hash_md5),
-            metadata_item: MetadataItem {
+            metadata_items: vec![MetadataItem {
                 id,
                 offset: 0,
                 size,
-            },
+            }],
         };
 
         self.repo
@@ -565,7 +565,7 @@ impl<B: Backend> S3 for TeleS3<B> {
         let metadata_json = {
             let metadata_items = filtered_content
                 .iter()
-                .map(|v| v.metadata_item.clone())
+                .flat_map(|v| v.metadata_items.clone())
                 .collect::<Vec<_>>();
             let metadata = Metadata {
                 item: metadata_items,
@@ -574,18 +574,22 @@ impl<B: Backend> S3 for TeleS3<B> {
             serde_json::to_value(&metadata).map_err(S3Error::internal_error)?
         };
 
-        let size = filtered_content.iter().map(|v| v.metadata_item.size).sum();
+        let size: u64 = filtered_content
+            .iter()
+            .flat_map(|v| v.metadata_items.iter().map(|i| i.size))
+            .sum();
         let etag = {
             let part_count = filtered_content.len();
 
-            let hashes_byte = filtered_content
-                .iter()
-                .map(|v| hex::decode(&v.hash))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(S3Error::internal_error)?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            // Parts created by UploadPartCopy carry no digest; they simply
+            // don't contribute bytes to the combined ETag.
+            let mut hashes_byte = Vec::new();
+            for part in &filtered_content {
+                if part.hash.len() == 32
+                    && let Ok(bytes) = hex::decode(&part.hash) {
+                        hashes_byte.extend(bytes);
+                    }
+            }
 
             let hash_md5 = md5::Md5::digest(&hashes_byte);
             let hash_md5 = hex::encode(hash_md5);
@@ -635,7 +639,9 @@ impl<B: Backend> S3 for TeleS3<B> {
         // whose last reference disappeared are removed from the backend.
         let dangling_ids: Vec<String> = content
             .into_values()
-            .map(|multipart_upload_part| multipart_upload_part.metadata_item.id)
+            .flat_map(|multipart_upload_part| {
+                multipart_upload_part.metadata_items.into_iter().map(|i| i.id)
+            })
             .collect();
         self.release_blobs(dangling_ids).await?;
 
@@ -667,9 +673,11 @@ impl<B: Backend> S3 for TeleS3<B> {
         // blobs are removed from the backend.
         let part_ids: Vec<String> = content
             .into_values()
-            .map(|multipart_upload_part| multipart_upload_part.metadata_item.id)
+            .flat_map(|multipart_upload_part| {
+                multipart_upload_part.metadata_items.into_iter().map(|i| i.id)
+            })
             .collect();
-        self.release_blobs(part_ids).await?;
+        self.release_blobs(part_ids).await?;;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
@@ -1023,7 +1031,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             })
             .map(|(num, p)| Part {
                 part_number: Some(num),
-                size: Some(p.metadata_item.size as i64),
+                size: Some(p.metadata_items.iter().map(|i| i.size).sum::<u64>() as i64),
                 e_tag: Some(ETag::Strong(p.hash)),
                 ..Default::default()
             })
@@ -1164,77 +1172,56 @@ impl<B: Backend> S3 for TeleS3<B> {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument));
         }
 
-        // Walk the source blobs to cover [read_offset, read_offset + read_len).
-        let mut remaining = read_len;
-        let mut cur = read_offset;
+        // The requested window [read_offset, read_offset + read_len) is
+        // expressed as clipped slices of the source's existing blobs —
+        // pure metadata surgery with reference acquisition, no data
+        // movement. Every slice holds its own reference, so aborting this
+        // upload can never damage the source object.
+        let mut part_items: Vec<MetadataItem> = Vec::new();
+        {
+            let win_start = read_offset;
+            let win_end = read_offset + read_len;
 
-        let reader_futures = metadata.item.iter().filter_map(|item| {
-            if remaining == 0 {
-                return None;
+            let mut item_start = 0u64;
+            for item in &metadata.item {
+                if item_start >= win_end {
+                    break;
+                }
+
+                let item_end = item_start + item.size;
+                let overlap_start = item_start.max(win_start);
+                let overlap_end = item_end.min(win_end);
+
+                if overlap_start < overlap_end {
+                    part_items.push(MetadataItem {
+                        id: item.id.clone(),
+                        offset: item.offset + (overlap_start - item_start),
+                        size: overlap_end - overlap_start,
+                    });
+                }
+
+                item_start = item_end;
             }
 
-            let item_size = item.size;
-            if cur >= item_size {
-                cur -= item_size;
-                return None;
+            // The source metadata must fully cover the requested window.
+            let covered: u64 = part_items.iter().map(|v| v.size).sum();
+            if covered != read_len {
+                return Err(S3Error::new(S3ErrorCode::InternalError));
             }
+        }
 
-            let local_offset = cur;
-            let bytes_available = item_size - local_offset;
-            let take = std::cmp::min(bytes_available, remaining);
+        // Every emitted slice takes its own reference on the shared blobs.
+        let acquire_items: Vec<(String, u64)> = part_items
+            .iter()
+            .map(|v| (v.id.clone(), v.size))
+            .collect();
+        self.repo.acquire_blob_refs(&acquire_items).await?;
 
-            cur = 0;
-            remaining -= take;
-
-            // Items may be slices of larger shared blobs; read from the
-            // item's own start offset within its blob.
-            Some(
-                self.backend
-                    .read(item.id.clone(), item.offset + local_offset, Some(take)),
-            )
-        });
-
-        let readers = futures::future::try_join_all(reader_futures)
-            .await
-            .map_err(S3Error::from)?
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError))?;
-
-        let (id, hash_md5) = {
-            let chain_readers = ChainReaders::from_vec(readers);
-            let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
-
-            let reader_with_hasher =
-                Box::pin(ReaderWithHasher::new(chain_readers, hasher_md5.clone()));
-
-            let id = self
-                .backend
-                .write(read_len, reader_with_hasher)
-                .await
-                .map_err(S3Error::from)?;
-
-            let hash_md5 = hasher_md5
-                .lock()
-                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
-                .finalize_reset();
-
-            (id, hash_md5)
-        };
-
-        // The copied blob is owned by the multipart upload state until the
-        // upload completes or aborts.
-        self.repo.register_new_blob(id.clone(), read_len).await?;
-
+        // Digesting a shared slice would require reading its bytes back;
+        // leave the hash empty and omit the ETag instead.
         let multipart_upload_part = MultipartUploadPart {
-            hash: hex::encode(hash_md5),
-            // The range was physically copied into a fresh blob owned by
-            // this part, so its slice starts at zero within that blob.
-            metadata_item: MetadataItem {
-                id,
-                offset: 0,
-                size: read_len,
-            },
+            hash: String::new(),
+            metadata_items: part_items,
         };
 
         self.repo
@@ -1263,7 +1250,8 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let res = S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
-                e_tag: Some(ETag::Strong(multipart_upload_part.hash)),
+                // Shared slices carry no digest; omit rather than re-read.
+                e_tag: None,
                 last_modified: Some(chrono_to_timestamp(chrono::Local::now().to_utc())),
                 ..Default::default()
             }),
@@ -1292,8 +1280,10 @@ struct MetadataItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultipartUploadPart {
+    // Digest of the part's bytes; empty when unknown (parts created by
+    // UploadPartCopy share existing blobs and skip re-reading them).
     hash: String,
-    metadata_item: MetadataItem,
+    metadata_items: Vec<MetadataItem>,
 }
 
 fn chrono_to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> Timestamp {

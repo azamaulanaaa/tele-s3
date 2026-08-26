@@ -1381,12 +1381,16 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
                 .await
                 .context("upload part copy")?;
 
-            res.copy_part_result
-                .and_then(|r| r.e_tag)
-                .expect("missing part etag")
+            // Shared slices carry no digest, so the response omits the ETag.
+            assert!(
+                res.copy_part_result
+                    .and_then(|r| r.e_tag)
+                    .is_none(),
+                "shared slice should not report an ETag"
+            );
         };
 
-        let completed_part = CompletedPart::builder().e_tag(e_tag).part_number(1).build();
+        let completed_part = CompletedPart::builder().part_number(1).build();
 
         let completed = CompletedMultipartUpload::builder()
             .parts(completed_part)
@@ -1617,6 +1621,158 @@ async fn test_copied_object_survives_sibling_deletion() -> anyhow::Result<()> {
 
         let data = out.body.collect().await.context("collect body")?;
         assert_eq!(data.into_bytes().as_ref(), b"replacement");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_shares_without_harming_source() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "upload-part-copy-share";
+    let source_content = "hello world";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key("source")
+        .body(ByteStream::from_static(source_content.as_bytes()))
+        .send()
+        .await
+        .context("put source object")?;
+
+    let copy_source = format!("{}/source", bucket_name);
+
+    // Ranged copy-part into an upload that is then aborted: the source
+    // must remain fully intact.
+    {
+        let upload_id = {
+            let res = client
+                .create_multipart_upload()
+                .bucket(bucket_name)
+                .key("dest-abort")
+                .send()
+                .await
+                .context("create multipart upload")?;
+            res.upload_id.context("missing upload id")?
+        };
+
+        let _ = client
+            .upload_part_copy()
+            .bucket(bucket_name)
+            .key("dest-abort")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .copy_source(&copy_source)
+            .copy_source_range("bytes=6-10")
+            .send()
+            .await
+            .context("ranged part copy")?;
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket_name)
+            .key("dest-abort")
+            .upload_id(upload_id)
+            .send()
+            .await
+            .context("abort multipart upload")?;
+
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("source")
+            .send()
+            .await
+            .context("source should survive aborted shared copy")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(
+            data.into_bytes().as_ref(),
+            source_content.as_bytes(),
+            "source corrupted by aborted shared copy"
+        );
+    }
+
+    // Completing a ranged copy and then deleting the source: the
+    // destination's shared slices must survive.
+    {
+        let upload_id = {
+            let res = client
+                .create_multipart_upload()
+                .bucket(bucket_name)
+                .key("dest-survives")
+                .send()
+                .await
+                .context("create multipart upload")?;
+            res.upload_id.context("missing upload id")?
+        };
+
+        let _ = client
+            .upload_part_copy()
+            .bucket(bucket_name)
+            .key("dest-survives")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .copy_source(&copy_source)
+            .copy_source_range("bytes=6-10")
+            .send()
+            .await
+            .context("ranged part copy")?;
+
+        let completed = CompletedMultipartUpload::builder()
+            .parts(CompletedPart::builder().part_number(1).build())
+            .build();
+
+        let _ = client
+            .complete_multipart_upload()
+            .bucket(bucket_name)
+            .key("dest-survives")
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .context("complete multipart upload")?;
+
+        let _ = client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("source")
+            .send()
+            .await
+            .context("delete source")?;
+
+        let out = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("dest-survives")
+            .send()
+            .await
+            .context("destination should survive source deletion")?;
+
+        let data = out.body.collect().await.context("collect body")?;
+        assert_eq!(
+            data.into_bytes().as_ref(),
+            b"world",
+            "shared slices lost after source deletion"
+        );
     }
 
     Ok(())
