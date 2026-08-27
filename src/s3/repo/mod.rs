@@ -93,14 +93,6 @@ impl Repository {
         Ok(())
     }
 
-    fn is_versioning_enabled(&self, status: &Option<String>) -> bool {
-        matches!(status.as_deref(), Some("Enabled"))
-    }
-
-    fn is_versioning_suspended(&self, status: &Option<String>) -> bool {
-        matches!(status.as_deref(), Some("Suspended"))
-    }
-
     // ---- Bucket ops ----
 
     #[instrument(skip(self), level = "debug", err)]
@@ -506,18 +498,6 @@ impl Repository {
         Ok(released.into_iter().map(|model| model.id).collect())
     }
 
-    /// Replace the tag set stored on an object. The object must exist;
-    /// a missing key yields NoSuchKey. Operates on latest version.
-    #[instrument(skip(self, tags), level = "debug", err)]
-    pub async fn set_object_tags(
-        &self,
-        bucket: &str,
-        key: &str,
-        tags: serde_json::Value,
-    ) -> S3Result<()> {
-        self.set_object_tags_versioned(bucket, key, None, tags).await
-    }
-
     pub async fn set_object_tags_versioned(
         &self,
         bucket: &str,
@@ -574,84 +554,6 @@ impl Repository {
             return Err(S3Error::new(S3ErrorCode::NoSuchKey));
         }
         Ok(m)
-    }
-
-    pub async fn get_object_with_version(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<&str>,
-    ) -> S3Result<entity::object::Model> {
-        if let Some(vid) = version_id {
-            let m = self.get_object_version(bucket, key, vid).await?;
-            if m.is_delete_marker {
-                // For get with specific version that is delete marker, S3 returns 405 MethodNotAllowed.
-                // We map to NoSuchKey with delete marker info; caller can translate.
-                return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
-            }
-            Ok(m)
-        } else {
-            self.get_object(bucket, key).await
-        }
-    }
-
-    // Returns model even if delete marker (for delete handling)
-    pub async fn get_latest_including_delete_marker(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> S3Result<Option<entity::object::Model>> {
-        self.get_latest_model(bucket, key).await
-    }
-
-    #[instrument(skip(self), level = "debug", err)]
-    pub async fn delete_object(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> S3Result<Option<entity::object::Model>> {
-        // Non-versioned path: permanently delete null version
-        // Versioned path: this method is now used only for non-versioned bucket case.
-        // For versioned, callers should use delete_object_versioned.
-        // Keep backward compat: if bucket versioning is enabled/suspended, create delete marker instead.
-        let bucket_model = self.get_bucket(bucket).await?;
-        let status = bucket_model.versioning_status;
-        if status.is_some() {
-            // Versioned bucket: delegate to versioned delete without version_id -> create delete marker
-            let (_, marker) = self.delete_object_versioned(bucket, key, None).await?;
-            // Return old latest if needed? For non-versioned caller expects deleted model.
-            // For versioned delete marker case, we return None to indicate marker creation?
-            // s3 handler expects Some(model) for non-versioned to release blobs. For versioned marker, there are no blobs.
-            // So return None
-            if marker {
-                return Ok(None);
-            } else {
-                // Should not happen
-                return Ok(None);
-            }
-        }
-
-        // Non-versioned: permanent delete
-        let m = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .filter(entity::object::Column::Id.eq(key))
-            .filter(entity::object::Column::VersionId.eq("null"))
-            .one(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?;
-
-        if let Some(model) = m {
-            entity::object::Entity::delete_many()
-                .filter(entity::object::Column::BucketId.eq(bucket))
-                .filter(entity::object::Column::Id.eq(key))
-                .filter(entity::object::Column::VersionId.eq("null"))
-                .exec(&self.db)
-                .await
-                .map_err(S3Error::internal_error)?;
-            Ok(Some(model))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Versioned delete: if version_id is Some, permanently delete that version.
@@ -786,66 +688,6 @@ impl Repository {
 
                 Ok((Some(marker_model), true))
             }
-        }
-    }
-
-    #[instrument(skip(self), level = "debug", err)]
-    pub async fn delete_objects(
-        &self,
-        bucket: &str,
-        keys: Vec<String>,
-    ) -> S3Result<Vec<entity::object::Model>> {
-        // For versioned buckets, this should version-delete each key (create delete marker).
-        // For non-versioned, permanent delete.
-        let bucket_model = self.get_bucket(bucket).await?;
-        let status = bucket_model.versioning_status;
-        if status.is_some() {
-            // Versioned bulk delete: create delete markers for each key that exists
-            let mut deleted = Vec::new();
-            for key in keys {
-                // Only create delete marker if object exists (latest not delete marker?) 
-                // S3 spec: delete_objects with versionId not provided creates delete markers even if object doesn't exist? It still creates marker.
-                // For simplicity, create marker regardless, but collect marker models.
-                let (opt, is_marker) = self.delete_object_versioned(bucket, &key, None).await?;
-                if let Some(m) = opt {
-                    // Only collect if we created marker? For idempotency, we should return deleted entries.
-                    // For simplicity return marker models or old models?
-                    // s3 handler currently expects models to release blobs; for marker there are no blobs.
-                    // We'll return marker models as deleted entries for response.
-                    if is_marker {
-                        deleted.push(m);
-                    } else {
-                        deleted.push(m);
-                    }
-                } else {
-                    // No object existed, but we still created a delete marker; find it
-                    // delete_object_versioned already created marker and returned it as Some, so this branch not needed
-                }
-            }
-            // For compatibility, we need to return models that were actually deleted? For versioned, we return markers.
-            // To keep handler releasing blobs logic, we need to return those with contents but markers have no blobs.
-            // Handler will try to release blobs; empty is fine.
-            Ok(deleted)
-        } else {
-            // Non-versioned: permanent delete where version_id = null and is_latest
-            // Need to collect models before delete for blob release
-            let models = entity::object::Entity::find()
-                .filter(entity::object::Column::BucketId.eq(bucket))
-                .filter(entity::object::Column::Id.is_in(keys.clone()))
-                .filter(entity::object::Column::VersionId.eq("null"))
-                .all(&self.db)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            entity::object::Entity::delete_many()
-                .filter(entity::object::Column::BucketId.eq(bucket))
-                .filter(entity::object::Column::Id.is_in(keys.clone()))
-                .filter(entity::object::Column::VersionId.eq("null"))
-                .exec(&self.db)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            Ok(models)
         }
     }
 
