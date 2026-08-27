@@ -8,6 +8,8 @@ pub struct Model {
     pub id: String,
     pub region: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Versioning state: None (disabled/unset), Some("Enabled"), Some("Suspended")
+    pub versioning_status: Option<String>,
     #[sea_orm(has_many)]
     pub object: HasMany<super::object::Entity>,
     #[sea_orm(has_many)]
