@@ -2313,3 +2313,208 @@ async fn test_object_tagging() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_checksum_echo() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "checksum-echo";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    // sha256("data") and sha1("data"), standard base64.
+    const SHA256_DATA: &str = "Om6weQ85rIfJTzhWst0sXREOaBFgImGpqSPTuyOtyLc=";
+    const SHA1_DATA: &str = "oXyaqmHoChv3HQ2FCvTluqmAC70=";
+
+    let put_out = client
+        .put_object()
+        .bucket(bucket_name)
+        .key("with-checksum")
+        .body(ByteStream::from_static(b"data".as_slice()))
+        .content_length(4)
+        .checksum_sha256(SHA256_DATA)
+        .checksum_sha1(SHA1_DATA)
+        .send()
+        .await
+        .context("put object with checksums")?;
+
+    assert_eq!(put_out.checksum_sha256(), Some(SHA256_DATA));
+    assert_eq!(put_out.checksum_sha1(), Some(SHA1_DATA));
+
+    let head_out = client
+        .head_object()
+        .bucket(bucket_name)
+        .key("with-checksum")
+        .send()
+        .await
+        .context("head object")?;
+
+    assert_eq!(head_out.checksum_sha256(), Some(SHA256_DATA));
+    assert_eq!(head_out.checksum_sha1(), Some(SHA1_DATA));
+
+    client
+        .get_object()
+        .bucket(bucket_name)
+        .key("with-checksum")
+        .send()
+        .await
+        .context("get object")?
+        .body
+        .collect()
+        .await
+        .context("collect body")?;
+
+    let get_out = client
+        .get_object()
+        .bucket(bucket_name)
+        .key("with-checksum")
+        .send()
+        .await
+        .context("get object")?;
+
+    assert_eq!(get_out.checksum_sha256(), Some(SHA256_DATA));
+    drop(get_out);
+
+    // Metadata-level copy carries checksums to the destination.
+    client
+        .copy_object()
+        .bucket(bucket_name)
+        .key("copied")
+        .copy_source(format!("{bucket_name}/with-checksum"))
+        .send()
+        .await
+        .context("copy object")?;
+
+    let head_copied = client
+        .head_object()
+        .bucket(bucket_name)
+        .key("copied")
+        .send()
+        .await
+        .context("head copied object")?;
+
+    assert_eq!(head_copied.checksum_sha256(), Some(SHA256_DATA));
+
+    // Malformed base64 is rejected.
+    let err = {
+        let res = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("bad-b64")
+            .body(ByteStream::from_static(b"data".as_slice()))
+            .content_length(4)
+            .checksum_sha256("!!!not-base64!!!")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("InvalidRequest".to_string())
+    );
+
+    // Valid base64 but wrong digest length is rejected ("AAAA" is 3 bytes).
+    let err = {
+        let res = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("bad-len")
+            .body(ByteStream::from_static(b"data".as_slice()))
+            .content_length(4)
+            .checksum_sha256("AAAA")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("InvalidRequest".to_string())
+    );
+
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn test_metadata_replaced_on_overwrite() -> anyhow::Result<()> {
+    // Two slots: the replacement is ingested before the previous
+    // version's blob is released.
+    let config = config::<2, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "metadata-overwrite";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    client
+        .put_object()
+        .bucket(bucket_name)
+        .key("k")
+        .body(ByteStream::from_static(b"data".as_slice()))
+        .content_length(4)
+        .metadata("old", "value")
+        .send()
+        .await
+        .context("put v1")?;
+
+    client
+        .put_object()
+        .bucket(bucket_name)
+        .key("k")
+        .body(ByteStream::from_static(b"data".as_slice()))
+        .content_length(4)
+        .metadata("new", "value")
+        .send()
+        .await
+        .context("put v2")?;
+
+    let head = client
+        .head_object()
+        .bucket(bucket_name)
+        .key("k")
+        .send()
+        .await
+        .context("head after overwrite")?;
+
+    let metadata = head
+        .metadata()
+        .expect("overwrite should carry a metadata map");
+
+    assert!(
+        metadata.contains_key("new"),
+        "overwritten object must carry the new metadata"
+    );
+    assert!(
+        !metadata.contains_key("old"),
+        "stale metadata from the previous version must not survive"
+    );
+
+    Ok(())
+}
