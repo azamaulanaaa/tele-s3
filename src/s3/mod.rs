@@ -244,6 +244,13 @@ impl<B: Backend> S3 for TeleS3<B> {
         self.precondition_gate(&req.input.bucket, &req.input.key, &condition)
             .await?;
 
+        let checksums = checksums_to_json(
+            req.input.checksum_crc32.take(),
+            req.input.checksum_crc32c.take(),
+            req.input.checksum_sha1.take(),
+            req.input.checksum_sha256.take(),
+        )?;
+
         let reader = {
             let body_stream = req
                 .input
@@ -347,6 +354,8 @@ impl<B: Backend> S3 for TeleS3<B> {
             etag: etag.clone(),
             content: content_json,
             user_metadata: metadata_to_json(req.input.metadata.take()),
+            // Keep a copy for the response echo before the map is stored.
+            checksums: checksums.clone(),
         };
 
         {
@@ -370,9 +379,16 @@ impl<B: Backend> S3 for TeleS3<B> {
             delete_old_future.await?;
         }
 
+        let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
+            json_to_checksum_fields(&checksums);
+
         let res = S3Response::new(PutObjectOutput {
             e_tag: etag.map(ETag::Strong),
             size: Some(size as i64),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
             ..Default::default()
         });
 
@@ -432,13 +448,46 @@ impl<B: Backend> S3 for TeleS3<B> {
             }
         };
 
+        let is_replace = req
+            .input
+            .metadata_directive
+            .as_ref()
+            .is_some_and(|d| d.as_str() == "REPLACE");
+
+        let user_metadata = if is_replace {
+            metadata_to_json(req.input.metadata.clone())
+        } else {
+            // AWS MetadataDirective defaults to COPY; carry source metadata.
+            model.user_metadata.clone()
+        };
+
+        // Content-Type follows the same directive semantics in S3; when
+        // REPLACE is specified the request value (if any) takes effect,
+        // otherwise the source is preserved.
+        let content_type = if is_replace {
+            req.input.content_type.clone().or(model.content_type.clone())
+        } else {
+            model.content_type.clone()
+        };
+
+        let checksums = if is_replace {
+            // New metadata implies new object semantics; do not carry
+            // stale checksums unless the caller also supplies them
+            // (CopyObject does not carry checksum headers, so clear).
+            serde_json::json!({})
+        } else {
+            // The bytes are identical on a metadata-level copy, so the
+            // source checksums remain valid for the destination.
+            model.checksums.clone()
+        };
+
         let data = ObjectWrite {
             size,
-            content_type: model.content_type.clone(),
+            content_type,
             etag: model.etag.clone(),
             content: content_json,
-            // AWS MetadataDirective defaults to COPY; carry source metadata.
-            user_metadata: model.user_metadata.clone(),
+            user_metadata,
+            checksums,
         };
 
         self.repo
@@ -697,6 +746,8 @@ impl<B: Backend> S3 for TeleS3<B> {
             etag: etag.clone(),
             content: metadata_json,
             user_metadata: model.user_metadata,
+            // Per-part checksum composition is out of scope.
+            checksums: serde_json::json!({}),
         };
 
         self.repo
@@ -826,6 +877,8 @@ impl<B: Backend> S3 for TeleS3<B> {
         let body = StreamingBlob::wrap(chain_readers);
 
         let object_metadata = json_to_metadata(&model.user_metadata);
+        let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
+            json_to_checksum_fields(&model.checksums);
 
         let res = S3Response::new(GetObjectOutput {
             content_type: model.content_type,
@@ -834,6 +887,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             e_tag: model.etag.map(ETag::Strong),
             metadata: object_metadata,
             body: Some(body),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
             ..Default::default()
         });
 
@@ -850,6 +907,9 @@ impl<B: Backend> S3 for TeleS3<B> {
             .get_object(&req.input.bucket, &req.input.key)
             .await?;
 
+        let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
+            json_to_checksum_fields(&model.checksums);
+
         let res = S3Response::new(HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             content_length: Some(model.size as i64),
@@ -857,6 +917,10 @@ impl<B: Backend> S3 for TeleS3<B> {
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
             e_tag: model.etag.map(ETag::Strong),
             metadata: json_to_metadata(&model.user_metadata),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
             ..Default::default()
         });
 
@@ -1546,6 +1610,53 @@ fn json_to_metadata(value: &serde_json::Value) -> Option<s3s::dto::Metadata> {
         Ok(map) if !map.is_empty() => Some(map),
         _ => None,
     }
+}
+
+/// Validate client-provided checksums and serialize them for storage.
+/// Each value must be standard base64 decoding to the algorithm's digest
+/// length.
+fn checksums_to_json(
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+) -> S3Result<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+
+    for (name, expected_bytes, provided) in [
+        ("crc32", 4usize, crc32),
+        ("crc32c", 4, crc32c),
+        ("sha1", 20, sha1),
+        ("sha256", 32, sha256),
+    ] {
+        if let Some(value) = provided {
+            let decoded = base64::prelude::BASE64_STANDARD
+                .decode(value.trim())
+                .map_err(|_| S3Error::new(S3ErrorCode::InvalidRequest))?;
+
+            if decoded.len() != expected_bytes {
+                return Err(S3Error::new(S3ErrorCode::InvalidRequest));
+            }
+
+            map.insert(name.to_string(), serde_json::Value::String(value));
+        }
+    }
+
+    Ok(serde_json::Value::Object(map))
+}
+
+/// Extract stored checksum values as (crc32, crc32c, sha1, sha256).
+fn json_to_checksum_fields(
+    value: &serde_json::Value,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let get = |key: &str| value.get(key).and_then(|v| v.as_str()).map(String::from);
+
+    (get("crc32"), get("crc32c"), get("sha1"), get("sha256"))
 }
 
 fn tags_to_json(tagging: s3s::dto::Tagging) -> serde_json::Value {

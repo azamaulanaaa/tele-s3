@@ -38,6 +38,9 @@ pub struct ObjectWrite {
     pub content: serde_json::Value,
     /// x-amz-meta-* map as a JSON object; empty object when none.
     pub user_metadata: serde_json::Value,
+    /// Client-provided checksums as a JSON object keyed by algorithm;
+    /// empty object when none.
+    pub checksums: serde_json::Value,
 }
 
 impl Repository {
@@ -148,7 +151,7 @@ impl Repository {
         let now = chrono::Local::now().to_utc();
 
         const SET_SQL: &str = "UPDATE \"s3_object\" SET size = ?, last_modified = ?, \
-             content_type = ?, etag = ?, content = ?";
+             content_type = ?, etag = ?, content = ?, user_metadata = ?, checksums = ?";
 
         match condition {
             PutCondition::None => {
@@ -160,8 +163,8 @@ impl Repository {
                     .execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "INSERT INTO \"s3_object\" (bucket_id, id, size, last_modified, \
-                         content_type, etag, content, user_metadata, tags) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         content_type, etag, content, user_metadata, tags, checksums) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                          ON CONFLICT (bucket_id, id) DO NOTHING",
                         [
                             bucket.into(),
@@ -173,6 +176,7 @@ impl Repository {
                             data.content.into(),
                             data.user_metadata.into(),
                             serde_json::json!([]).into(),
+                            data.checksums.into(),
                         ],
                     ))
                     .await
@@ -198,6 +202,8 @@ impl Repository {
                             data.content_type.clone().into(),
                             data.etag.clone().into(),
                             data.content.clone().into(),
+                            data.user_metadata.clone().into(),
+                            data.checksums.clone().into(),
                             bucket.as_str().into(),
                             key.as_str().into(),
                             expected.as_str().into(),
@@ -231,6 +237,7 @@ impl Repository {
                             data.etag.into(),
                             data.content.into(),
                             data.user_metadata.into(),
+                            data.checksums.into(),
                             bucket.as_str().into(),
                             key.as_str().into(),
                         ],
@@ -263,6 +270,7 @@ impl Repository {
                             data.etag.clone().into(),
                             data.content.clone().into(),
                             data.user_metadata.clone().into(),
+                            data.checksums.clone().into(),
                             bucket.as_str().into(),
                             key.as_str().into(),
                             expected.as_str().into(),
@@ -444,6 +452,7 @@ impl Repository {
             etag: Set(data.etag),
             user_metadata: Set(data.user_metadata),
             tags: Set(serde_json::json!([])),
+            checksums: Set(data.checksums),
             content: Set(data.content),
         };
 
@@ -456,6 +465,10 @@ impl Repository {
                         entity::object::Column::ContentType,
                         entity::object::Column::Etag,
                         entity::object::Column::Content,
+                        // Overwrites replace metadata, but tags persist:
+                        // tagging is managed via its own API.
+                        entity::object::Column::UserMetadata,
+                        entity::object::Column::Checksums,
                     ])
                     .to_owned(),
             )
@@ -822,6 +835,7 @@ mod tests {
                     etag: Some("e1".into()),
                     content: serde_json::json!({}),
                     user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
                 },
                 PutCondition::IfNoneMatchAny,
             )
@@ -842,6 +856,7 @@ mod tests {
                     etag: Some("e2".into()),
                     content: serde_json::json!({}),
                     user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
                 },
                 PutCondition::IfNoneMatchAny,
             )

@@ -16,6 +16,9 @@ pub struct Model {
     pub user_metadata: serde_json::Value,
     /// Object tagging set as a JSON array of {key, value} pairs.
     pub tags: serde_json::Value,
+    /// Client-provided checksums as a JSON object keyed by algorithm
+    /// (e.g. {"sha256": "<base64>"}).
+    pub checksums: serde_json::Value,
     pub content: serde_json::Value,
     #[sea_orm(belongs_to, from = "bucket_id", to = "id")]
     pub bucket: HasOne<super::bucket::Entity>,
