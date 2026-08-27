@@ -8,6 +8,12 @@ pub struct Model {
     pub bucket_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub version_id: String,
+    /// Whether this is the current version for the key.
+    pub is_latest: bool,
+    /// Whether this version is a delete marker.
+    pub is_delete_marker: bool,
     pub size: u32,
     pub last_modified: chrono::DateTime<chrono::Utc>,
     pub content_type: Option<String>,

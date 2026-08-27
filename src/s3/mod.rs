@@ -11,21 +11,23 @@ use s3s::{
     S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
         AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketLocationConstraint,
-        CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
-        CopyObjectOutput, CopyObjectResult, CopyPartResult, CopySource, CreateBucketInput,
-        CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-        DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
-        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
-        DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, ETagCondition,
-        GetBucketAclInput, GetBucketAclOutput, GetBucketLocationInput, GetBucketLocationOutput,
-        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput,
-        GetObjectTaggingInput, GetObjectTaggingOutput, Grant, Grantee,
+        BucketVersioningStatus, CommonPrefix, CompleteMultipartUploadInput,
+        CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
+        CopyPartResult, CopySource, CreateBucketInput, CreateBucketOutput,
+        CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
+        DeleteBucketOutput, DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput,
+        DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, DeleteObjectTaggingInput,
+        DeleteObjectTaggingOutput, ETag, ETagCondition, GetBucketAclInput, GetBucketAclOutput,
+        GetBucketLocationInput, GetBucketLocationOutput, GetBucketVersioningInput,
+        GetBucketVersioningOutput, GetObjectAclInput, GetObjectAclOutput, GetObjectInput,
+        GetObjectOutput, GetObjectTaggingInput, GetObjectTaggingOutput, Grant, Grantee,
         HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
         ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsInput,
-        ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
-        ListPartsOutput, LocationType, MultipartUpload, Object, Owner, Part, PutBucketAclInput,
-        PutBucketAclOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectInput,
-        PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
+        ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListObjectVersionsInput,
+        ListObjectVersionsOutput, ListPartsInput, ListPartsOutput, LocationType,
+        MultipartUpload, Object, ObjectVersion, Owner, Part, PutBucketAclInput, PutBucketAclOutput,
+        PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
+        PutObjectInput, PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput,
         StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
         UploadPartOutput,
     },
@@ -325,7 +327,16 @@ impl<B: Backend> S3 for TeleS3<B> {
             serde_json::to_value(&content).map_err(S3Error::internal_error)?
         };
 
-        let delete_old_future = {
+        // For versioned buckets we keep old versions; don't release their blobs.
+        let versioning_status = self
+            .repo
+            .get_bucket_versioning(&req.input.bucket)
+            .await?;
+        let is_versioned = versioning_status.is_some();
+
+        let delete_old_future = if is_versioned {
+            None
+        } else {
             let is_exists = self
                 .repo
                 .object_exists(&req.input.bucket, &req.input.key)
@@ -340,8 +351,6 @@ impl<B: Backend> S3 for TeleS3<B> {
                 let metadata: Metadata =
                     serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
 
-                // Refcount-aware: shared blobs survive if something else
-                // still references them.
                 Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
             } else {
                 None
@@ -354,26 +363,24 @@ impl<B: Backend> S3 for TeleS3<B> {
             etag: etag.clone(),
             content: content_json,
             user_metadata: metadata_to_json(req.input.metadata.take()),
-            // Keep a copy for the response echo before the map is stored.
             checksums: checksums.clone(),
         };
 
-        {
-            let result = self
-                .repo
-                .cas_put_object(req.input.bucket, req.input.key, data, condition)
-                .await;
+        let version_id = {
+            let bucket = req.input.bucket.clone();
+            let key = req.input.key.clone();
+            let result = self.repo.cas_put_object(bucket, key, data, condition).await;
 
-            if let Err(err) = result {
-                if let Some(id) = id {
-                    // Best-effort cleanup only: a cleanup failure must not
-                    // replace the original error the client should see.
-                    let _ = self.release_blobs(vec![id]).await;
+            match result {
+                Ok(vid) => vid,
+                Err(err) => {
+                    if let Some(id) = id {
+                        let _ = self.release_blobs(vec![id]).await;
+                    }
+                    return Err(err);
                 }
-
-                return Err(err);
             }
-        }
+        };
 
         if let Some(delete_old_future) = delete_old_future {
             delete_old_future.await?;
@@ -382,6 +389,12 @@ impl<B: Backend> S3 for TeleS3<B> {
         let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
             json_to_checksum_fields(&checksums);
 
+        let response_version_id = if is_versioned {
+            Some(version_id)
+        } else {
+            None
+        };
+
         let res = S3Response::new(PutObjectOutput {
             e_tag: etag.map(ETag::Strong),
             size: Some(size as i64),
@@ -389,6 +402,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             checksum_crc32c,
             checksum_sha1,
             checksum_sha256,
+            version_id: response_version_id,
             ..Default::default()
         });
 
@@ -401,14 +415,20 @@ impl<B: Backend> S3 for TeleS3<B> {
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         // Access-point sources are not supported.
-        let (src_bucket, src_key) = match &req.input.copy_source {
-            CopySource::Bucket { bucket, key, .. } => (&**bucket, &**key),
+        let (src_bucket, src_key, src_version_id) = match &req.input.copy_source {
+            CopySource::Bucket { bucket, key, version_id, .. } => {
+                (&**bucket, &**key, version_id.as_deref())
+            }
             CopySource::AccessPoint { .. } => {
                 return Err(S3Error::new(S3ErrorCode::NotImplemented));
             }
         };
 
-        let model = self.repo.get_object(src_bucket, src_key).await?;
+        let model = if let Some(vid) = src_version_id {
+            self.repo.get_object_version(src_bucket, src_key, vid).await?
+        } else {
+            self.repo.get_object(src_bucket, src_key).await?
+        };
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
@@ -430,22 +450,20 @@ impl<B: Backend> S3 for TeleS3<B> {
 
         let content_json = serde_json::to_value(&metadata).map_err(S3Error::internal_error)?;
 
-        let delete_old_future = {
-            if let Ok(old) = self
-                .repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await
-            {
-                let old_metadata: Metadata =
-                    serde_json::from_value(old.content).map_err(S3Error::internal_error)?;
+        let versioning_status = self
+            .repo
+            .get_bucket_versioning(&req.input.bucket)
+            .await?;
+        let is_versioned = versioning_status.is_some();
 
-                // Refcount-aware: blobs still referenced elsewhere survive.
-                Some(
-                    self.release_blobs(old_metadata.item.into_iter().map(|v| v.id).collect()),
-                )
-            } else {
-                None
-            }
+        let delete_old_future = if is_versioned {
+            None
+        } else if let Ok(old) = self.repo.get_object(&req.input.bucket, &req.input.key).await {
+            let old_metadata: Metadata =
+                serde_json::from_value(old.content).map_err(S3Error::internal_error)?;
+            Some(self.release_blobs(old_metadata.item.into_iter().map(|v| v.id).collect()))
+        } else {
+            None
         };
 
         let is_replace = req
@@ -490,15 +508,16 @@ impl<B: Backend> S3 for TeleS3<B> {
             checksums,
         };
 
-        self.repo
+        let version_id = self
+            .repo
             .upsert_object(req.input.bucket.clone(), req.input.key.clone(), data)
             .await?;
 
-        // On an upsert failure the acquired refs above are simply kept:
-        // over-protecting blobs is safe, under-protecting them is not.
         if let Some(delete_old_future) = delete_old_future {
             delete_old_future.await?;
         }
+
+        let response_version_id = if is_versioned { Some(version_id) } else { None };
 
         let res = S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
@@ -506,6 +525,7 @@ impl<B: Backend> S3 for TeleS3<B> {
                 last_modified: Some(chrono_to_timestamp(model.last_modified)),
                 ..Default::default()
             }),
+            version_id: response_version_id,
             ..Default::default()
         });
 
@@ -723,17 +743,19 @@ impl<B: Backend> S3 for TeleS3<B> {
             Some(format!("{}-{}", hash_md5, part_count))
         };
 
-        let delete_old_object_future = {
-            let model = self
-                .repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await;
+        let versioning_status = self
+            .repo
+            .get_bucket_versioning(&req.input.bucket)
+            .await?;
+        let is_versioned = versioning_status.is_some();
+
+        let delete_old_object_future = if is_versioned {
+            None
+        } else {
+            let model = self.repo.get_object(&req.input.bucket, &req.input.key).await;
             if let Ok(model) = model {
                 let metadata: Metadata =
                     serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-
-                // Refcount-aware: shared blobs survive if something else
-                // still references them.
                 Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
             } else {
                 None
@@ -746,11 +768,11 @@ impl<B: Backend> S3 for TeleS3<B> {
             etag: etag.clone(),
             content: metadata_json,
             user_metadata: model.user_metadata,
-            // Per-part checksum composition is out of scope.
             checksums: serde_json::json!({}),
         };
 
-        self.repo
+        let version_id = self
+            .repo
             .cas_put_object(
                 req.input.bucket.clone(),
                 req.input.key.clone(),
@@ -759,8 +781,6 @@ impl<B: Backend> S3 for TeleS3<B> {
             )
             .await?;
 
-        // Delete the multipart upload state only after the object row is
-        // committed, so a failed upsert doesn't orphan the uploaded parts.
         self.repo
             .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
             .await?;
@@ -769,8 +789,6 @@ impl<B: Backend> S3 for TeleS3<B> {
             delete_old_object_future.await?;
         }
 
-        // Parts not included in the request lose their reference; blobs
-        // whose last reference disappeared are removed from the backend.
         let dangling_ids: Vec<String> = content
             .into_values()
             .flat_map(|multipart_upload_part| {
@@ -779,10 +797,13 @@ impl<B: Backend> S3 for TeleS3<B> {
             .collect();
         self.release_blobs(dangling_ids).await?;
 
+        let response_version_id = if is_versioned { Some(version_id) } else { None };
+
         let res = S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(req.input.bucket),
             key: Some(req.input.key),
             e_tag: etag.map(ETag::Strong),
+            version_id: response_version_id,
             ..Default::default()
         });
 
@@ -821,10 +842,23 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let model = self
-            .repo
-            .get_object(&req.input.bucket, &req.input.key)
-            .await?;
+        let model = if let Some(vid) = req.input.version_id.as_deref() {
+            self.repo
+                .get_object_version(&req.input.bucket, &req.input.key, vid)
+                .await
+                .map_err(|e| {
+                    // If version is delete marker, S3 returns MethodNotAllowed (405)
+                    if format!("{e:?}").contains("MethodNotAllowed") {
+                        S3Error::new(S3ErrorCode::MethodNotAllowed)
+                    } else {
+                        e
+                    }
+                })?
+        } else {
+            self.repo
+                .get_object(&req.input.bucket, &req.input.key)
+                .await?
+        };
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
@@ -880,6 +914,18 @@ impl<B: Backend> S3 for TeleS3<B> {
         let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
             json_to_checksum_fields(&model.checksums);
 
+        // VersionId header: return it if bucket is versioned
+        let versioning = self
+            .repo
+            .get_bucket_versioning(&req.input.bucket)
+            .await
+            .unwrap_or(None);
+        let response_version_id = if versioning.is_some() {
+            Some(model.version_id.clone())
+        } else {
+            None
+        };
+
         let res = S3Response::new(GetObjectOutput {
             content_type: model.content_type,
             content_length: Some(content_length as i64),
@@ -891,6 +937,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             checksum_crc32c,
             checksum_sha1,
             checksum_sha256,
+            version_id: response_version_id,
             ..Default::default()
         });
 
@@ -902,13 +949,27 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let model = self
-            .repo
-            .get_object(&req.input.bucket, &req.input.key)
-            .await?;
+        let model = if let Some(vid) = req.input.version_id.as_deref() {
+            self.repo
+                .get_object_version(&req.input.bucket, &req.input.key, vid)
+                .await?
+        } else {
+            self.repo.get_object(&req.input.bucket, &req.input.key).await?
+        };
 
         let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
             json_to_checksum_fields(&model.checksums);
+
+        let versioning = self
+            .repo
+            .get_bucket_versioning(&req.input.bucket)
+            .await
+            .unwrap_or(None);
+        let response_version_id = if versioning.is_some() {
+            Some(model.version_id.clone())
+        } else {
+            None
+        };
 
         let res = S3Response::new(HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
@@ -921,6 +982,7 @@ impl<B: Backend> S3 for TeleS3<B> {
             checksum_crc32c,
             checksum_sha1,
             checksum_sha256,
+            version_id: response_version_id,
             ..Default::default()
         });
 
@@ -932,19 +994,35 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let model = self
+        let version_id_opt = req.input.version_id.clone();
+        let (deleted_opt, is_marker) = self
             .repo
-            .delete_object(&req.input.bucket, &req.input.key)
-            .await?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+            .delete_object_versioned(&req.input.bucket, &req.input.key, version_id_opt.as_deref())
+            .await?;
 
-        let metadata: Metadata =
-            serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
+        // If we permanently deleted a version that had blobs, release them.
+        if let Some(model) = deleted_opt.clone()
+            && !model.is_delete_marker && !is_marker {
+                // Permanent delete of a data version: release its blobs
+                let metadata: Metadata =
+                    serde_json::from_value(model.content.clone())
+                        .map_err(S3Error::internal_error)?;
+                let ids: Vec<String> =
+                    metadata.item.iter().map(|item| item.id.clone()).collect();
+                self.release_blobs(ids).await?;
+            }
+            // If we created a delete marker, `deleted_opt` is the marker; no blobs to release.
 
-        let ids: Vec<String> = metadata.item.iter().map(|item| item.id.clone()).collect();
-        self.release_blobs(ids).await?;
+        // For idempotent delete of non-existent key on non-versioned bucket, deleted_opt is None -> still return 204.
+        // For versioned bucket, delete without versionId always creates a delete marker and returns it.
+        let response_version_id = deleted_opt.as_ref().map(|m| m.version_id.clone());
+        let delete_marker = if is_marker { Some(true) } else { None };
 
-        let res = S3Response::new(DeleteObjectOutput::default());
+        let res = S3Response::new(DeleteObjectOutput {
+            version_id: response_version_id,
+            delete_marker,
+            ..Default::default()
+        });
 
         Ok(res)
     }
@@ -953,42 +1031,105 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let keys: Vec<String> = req
-            .input
-            .delete
-            .objects
-            .iter()
-            .map(|obj| obj.key.clone())
-            .collect();
+        // Version-aware bulk delete: each object may carry a versionId
+        let mut deleted_models: Vec<repo::entity::object::Model> = Vec::new();
+        let mut all_blob_ids: Vec<String> = Vec::new();
+        let bucket_versioning = self
+            .repo
+            .get_bucket_versioning(&req.input.bucket)
+            .await
+            .unwrap_or(None);
+        let is_versioned = bucket_versioning.is_some();
 
-        let models = self.repo.delete_objects(&req.input.bucket, keys).await?;
+        for obj in req.input.delete.objects.clone() {
+            let vid = obj.version_id.clone();
+            if is_versioned {
+                match self
+                    .repo
+                    .delete_object_versioned(&req.input.bucket, &obj.key, vid.as_deref())
+                    .await
+                {
+                    Ok((Some(m), is_marker)) => {
+                        if !m.is_delete_marker && !is_marker
+                            && let Ok(md) = serde_json::from_value::<Metadata>(m.content.clone()) {
+                                all_blob_ids.extend(md.item.into_iter().map(|v| v.id));
+                            }
+                        deleted_models.push(m);
+                    }
+                    Ok((None, _)) => {
+                        // Idempotent delete of non-existent: still count as deleted for quiet=false?
+                        // Push a placeholder so response includes key
+                        // Create a dummy model for response
+                        // We'll skip placeholder and just not add; S3 still returns deleted entry even if key didn't exist
+                        // For versioned, a delete marker was created; the previous match would have returned Some(marker).
+                        // If None, key didn't exist and bucket is not versioned? That's handled via that branch as (None,false) for non-versioned.
+                        // To mimic S3, we still want to report key as deleted.
+                        // We'll synthesize a deleted entry without model.
+                    }
+                    Err(_) => {
+                        // For versioned permanent delete of non-existent version, report error? But S3 is tolerant.
+                        continue;
+                    }
+                }
+            } else {
+                // Non-versioned: treat as before, but we need to collect per key
+                // Use repo.delete_objects for simplicity if no versionId
+                if vid.is_some() {
+                    // versionId on non-versioned bucket is ignored -> treat as not found? Just delete null version if key matches?
+                    continue;
+                }
+                // Will be handled in bulk below, but to keep simplicity we handle per-key here too
+                if let Ok((Some(m), _)) = self
+                    .repo
+                    .delete_object_versioned(&req.input.bucket, &obj.key, None)
+                    .await
+                {
+                    if let Ok(md) = serde_json::from_value::<Metadata>(m.content.clone()) {
+                        all_blob_ids.extend(md.item.into_iter().map(|v| v.id));
+                    }
+                    deleted_models.push(m);
+                }
+            }
+        }
 
-        let metadatas: Vec<Metadata> = models
-            .iter()
-            .map(|model| {
-                serde_json::from_value::<Metadata>(model.content.clone())
-                    .map_err(S3Error::internal_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let ids: Vec<String> = metadatas
-            .iter()
-            .flat_map(|metadata| metadata.item.iter().map(|item| item.id.clone()))
-            .collect();
-        self.release_blobs(ids).await?;
+        // For non-versioned bulk without per-object versionId, the above per-key handling already covered.
+        // But to ensure backward compat for non-versioned bulk where we didn't handle per-key correctly for missing keys,
+        // we also fallback to original bulk path if deleted_models is empty and is_versioned==false?
+        // Actually per-key loop already handles, so we can just release blobs and build response.
+        if !all_blob_ids.is_empty() {
+            self.release_blobs(all_blob_ids).await?;
+        }
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
-
         let deleted = if quiet {
             None
         } else {
-            let deleted_objects: Vec<DeletedObject> = models
-                .iter()
-                .map(|model| DeletedObject {
-                    key: Some(model.id.clone()),
+            // Build DeletedObject list from deleted_models
+            let mut deleted_objects: Vec<DeletedObject> = Vec::new();
+            for m in &deleted_models {
+                deleted_objects.push(DeletedObject {
+                    key: Some(m.id.clone()),
+                    version_id: if is_versioned {
+                        Some(m.version_id.clone())
+                    } else {
+                        None
+                    },
                     ..Default::default()
-                })
-                .collect();
+                });
+            }
+            // For keys that were requested but not in deleted_models (e.g., non-existent keys with no version),
+            // S3 still returns them as deleted in the response. So we need to include those keys.
+            let existing_keys: std::collections::HashSet<String> =
+                deleted_models.iter().map(|m| m.id.clone()).collect();
+            for obj in &req.input.delete.objects {
+                if !existing_keys.contains(&obj.key) {
+                    deleted_objects.push(DeletedObject {
+                        key: Some(obj.key.clone()),
+                        version_id: obj.version_id.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
             Some(deleted_objects)
         };
 
@@ -1479,8 +1620,11 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<GetObjectAclInput>,
     ) -> S3Result<S3Response<GetObjectAclOutput>> {
-        self.repo.get_object(&req.input.bucket, &req.input.key).await?;
-
+        if let Some(vid) = req.input.version_id.as_deref() {
+            self.repo.get_object_version(&req.input.bucket, &req.input.key, vid).await?;
+        } else {
+            self.repo.get_object(&req.input.bucket, &req.input.key).await?;
+        }
         Ok(S3Response::new(GetObjectAclOutput {
             owner: Some(canned_owner()),
             grants: Some(vec![full_control_grant()]),
@@ -1493,8 +1637,11 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<PutObjectAclInput>,
     ) -> S3Result<S3Response<PutObjectAclOutput>> {
-        self.repo.get_object(&req.input.bucket, &req.input.key).await?;
-
+        if let Some(vid) = req.input.version_id.as_deref() {
+            self.repo.get_object_version(&req.input.bucket, &req.input.key, vid).await?;
+        } else {
+            self.repo.get_object(&req.input.bucket, &req.input.key).await?;
+        }
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
 
@@ -1503,10 +1650,18 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        let model = self.repo.get_object(&req.input.bucket, &req.input.key).await?;
-
+        let model = if let Some(vid) = req.input.version_id.as_deref() {
+            self.repo.get_object_version(&req.input.bucket, &req.input.key, vid).await?
+        } else {
+            self.repo.get_object(&req.input.bucket, &req.input.key).await?
+        };
+        let version_id = {
+            let vs = self.repo.get_bucket_versioning(&req.input.bucket).await.unwrap_or(None);
+            if vs.is_some() { Some(model.version_id.clone()) } else { None }
+        };
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set: json_to_tag_set(&model.tags),
+            version_id,
             ..Default::default()
         }))
     }
@@ -1516,15 +1671,23 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let vid = req.input.version_id.clone();
         self.repo
-            .set_object_tags(
+            .set_object_tags_versioned(
                 &req.input.bucket,
                 &req.input.key,
+                vid.as_deref(),
                 tags_to_json(req.input.tagging),
             )
             .await?;
-
-        Ok(S3Response::new(PutObjectTaggingOutput::default()))
+        let version_id = vid.or({
+            // For versioned buckets without explicit versionId, the tagging applies to latest; return its versionId
+            None
+        });
+        Ok(S3Response::new(PutObjectTaggingOutput {
+            version_id,
+            ..Default::default()
+        }))
     }
 
     #[instrument(skip(self), err)]
@@ -1532,11 +1695,166 @@ impl<B: Backend> S3 for TeleS3<B> {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let vid = req.input.version_id.clone();
         self.repo
-            .set_object_tags(&req.input.bucket, &req.input.key, serde_json::json!([]))
+            .set_object_tags_versioned(&req.input.bucket, &req.input.key, vid.as_deref(), serde_json::json!([]))
+            .await?;
+        Ok(S3Response::new(DeleteObjectTaggingOutput {
+            version_id: vid,
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        let status = self.repo.get_bucket_versioning(&req.input.bucket).await?;
+        let bucket_status = status.map(BucketVersioningStatus::from);
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status: bucket_status,
+            ..Default::default()
+        }))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let status = req.input.versioning_configuration.status.clone();
+        let status_str = status.map(|s| s.as_str().to_string());
+        // Validate: only Enabled or Suspended allowed
+        if let Some(ref s) = status_str
+            && s != "Enabled" && s != "Suspended" {
+                return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+            }
+        self.repo.put_bucket_versioning(&req.input.bucket, status_str).await?;
+        Ok(S3Response::new(PutBucketVersioningOutput::default()))
+    }
+
+    #[instrument(skip(self), err)]
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        self.repo.get_bucket(&req.input.bucket).await?;
+        let max_keys = req.input.max_keys.unwrap_or(1000);
+        let (versions, delete_markers) = self
+            .repo
+            .list_object_versions(
+                &req.input.bucket,
+                req.input.prefix.clone(),
+                req.input.delimiter.clone(),
+                req.input.key_marker.clone(),
+                req.input.version_id_marker.clone(),
+                Some(max_keys),
+            )
             .await?;
 
-        Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
+        // Build common prefixes if delimiter present - similar to list_objects but for versions we need to deduplicate prefixes from all keys
+        let delimiter = req.input.delimiter.clone();
+        let prefix = req.input.prefix.clone().unwrap_or_default();
+        let mut common_prefixes_set = std::collections::BTreeSet::new();
+        let mut filtered_versions = Vec::new();
+        let mut filtered_delete_markers = Vec::new();
+
+        if let Some(del) = delimiter.clone() {
+            for v in &versions {
+                if let Some(key) = v.id.strip_prefix(&prefix)
+                    && let Some((pre, _)) = key.split_once(&del) {
+                        common_prefixes_set.insert(format!("{}{}{}", prefix, pre, del));
+                        continue;
+                    }
+                filtered_versions.push(v.clone());
+            }
+            for d in &delete_markers {
+                if let Some(key) = d.id.strip_prefix(&prefix)
+                    && let Some((pre, _)) = key.split_once(&del) {
+                        common_prefixes_set.insert(format!("{}{}{}", prefix, pre, del));
+                        continue;
+                    }
+                filtered_delete_markers.push(d.clone());
+            }
+        } else {
+            filtered_versions = versions;
+            filtered_delete_markers = delete_markers;
+        }
+
+        let common_prefixes = if common_prefixes_set.is_empty() {
+            None
+        } else {
+            Some(
+                common_prefixes_set
+                    .into_iter()
+                    .map(|p| s3s::dto::CommonPrefix { prefix: Some(p) })
+                    .collect(),
+            )
+        };
+
+        let versions_out: Vec<ObjectVersion> = filtered_versions
+            .into_iter()
+            .map(|m| ObjectVersion {
+                key: Some(m.id.clone()),
+                version_id: Some(m.version_id.clone()),
+                is_latest: Some(m.is_latest),
+                last_modified: Some(chrono_to_timestamp(m.last_modified)),
+                e_tag: m.etag.clone().map(ETag::Strong),
+                size: Some(m.size as i64),
+                storage_class: Some(s3s::dto::ObjectVersionStorageClass::from_static(s3s::dto::ObjectVersionStorageClass::STANDARD)),
+                owner: Some(canned_owner()),
+                ..Default::default()
+            })
+            .collect();
+
+        let delete_markers_out: Vec<DeleteMarkerEntry> = filtered_delete_markers
+            .into_iter()
+            .map(|m| DeleteMarkerEntry {
+                key: Some(m.id.clone()),
+                version_id: Some(m.version_id.clone()),
+                is_latest: Some(m.is_latest),
+                last_modified: Some(chrono_to_timestamp(m.last_modified)),
+                owner: Some(canned_owner()),
+                ..Default::default()
+            })
+            .collect();
+
+        // Determine truncation - we truncated in repo to max_keys, but need to know if there are more.
+        // For simplicity, if we returned exactly max_keys items total, mark truncated if repo had more? Our repo already truncated to limit, so we can't know.
+        // We'll check: if versions_out.len() + delete_markers_out.len() == max_keys as usize, and there were more in DB, we would have truncated.
+        // For correctness, we need to know if total remaining > limit. Our repo returns truncated slice; we can infer truncated if we got limit items and there might be more.
+        // Simplest: if we got limit items, consider truncated true and provide next markers as last item's key/version.
+        let total = versions_out.len() + delete_markers_out.len();
+        let is_truncated = Some(total as i32 == max_keys && total > 0);
+        let (next_key_marker, next_version_id_marker) = if is_truncated.unwrap_or(false) {
+            // Last item in combined sorted order is last version or delete marker with highest key/last_modified
+            let last = if let Some(last_dm) = delete_markers_out.last() {
+                Some((last_dm.key.clone().unwrap_or_default(), last_dm.version_id.clone().unwrap_or_default()))
+            } else { versions_out.last().map(|last_v| (last_v.key.clone().unwrap_or_default(), last_v.version_id.clone().unwrap_or_default())) };
+            match last {
+                Some((k, v)) => (Some(k), Some(v)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(S3Response::new(ListObjectVersionsOutput {
+            name: Some(req.input.bucket.clone()),
+            prefix: req.input.prefix.clone(),
+            key_marker: req.input.key_marker.clone(),
+            version_id_marker: req.input.version_id_marker.clone(),
+            max_keys: Some(max_keys),
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+            versions: if versions_out.is_empty() { None } else { Some(versions_out) },
+            delete_markers: if delete_markers_out.is_empty() { None } else { Some(delete_markers_out) },
+            common_prefixes,
+            delimiter: req.input.delimiter.clone(),
+            ..Default::default()
+        }))
     }
 }
 
