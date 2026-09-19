@@ -92,6 +92,47 @@ pub(crate) fn checksums_to_json(
     Ok(serde_json::Value::Object(map))
 }
 
+/// Verify client-supplied checksums against streaming digests.
+///
+/// Each supplied value is base64-decoded (already length-validated by
+/// `checksums_to_json`) and compared to the computed digest bytes. CRC
+/// values are the 4-byte big-endian encoding per S3. Mismatch -> `BadDigest`
+/// so corrupt archive uploads fail instead of being stored.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_checksums(
+    computed_crc32: u32,
+    computed_crc32c: u32,
+    computed_sha1: &[u8],
+    computed_sha256: &[u8],
+    expected_crc32: Option<&str>,
+    expected_crc32c: Option<&str>,
+    expected_sha1: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> S3Result<()> {
+    let compare = |expected: &str, computed: &[u8]| -> S3Result<()> {
+        let decoded = base64::prelude::BASE64_STANDARD
+            .decode(expected.trim())
+            .map_err(|_| S3Error::new(S3ErrorCode::InvalidDigest))?;
+        if decoded.as_slice() != computed {
+            return Err(S3Error::new(S3ErrorCode::BadDigest));
+        }
+        Ok(())
+    };
+
+    if let Some(v) = expected_crc32 {
+        compare(v, &computed_crc32.to_be_bytes())?;
+    }
+    if let Some(v) = expected_crc32c {
+        compare(v, &computed_crc32c.to_be_bytes())?;
+    }
+    if let Some(v) = expected_sha1 {
+        compare(v, computed_sha1)?;
+    }
+    if let Some(v) = expected_sha256 {
+        compare(v, computed_sha256)?;
+    }
+    Ok(())
+}
 /// Extract stored checksum values as (crc32, crc32c, sha1, sha256).
 pub(crate) fn json_to_checksum_fields(
     value: &serde_json::Value,
