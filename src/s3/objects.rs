@@ -560,13 +560,11 @@ impl<B: Backend> TeleS3<B> {
         // Version-aware bulk delete: each object may carry a versionId.
         // Per-key failures are reported in the `errors` list (S3 semantics);
         // only whole-request failures (e.g. blob GC) abort with Err.
-        let mut deleted_models: Vec<super::repo::entity::object::Model> = Vec::new();
+        // One `Deleted` entry is emitted per requested object, in request
+        // order, so duplicate keys and distinct versions are all reported.
+        let mut deleted_objects: Vec<DeletedObject> = Vec::new();
         let mut all_blob_ids: Vec<String> = Vec::new();
         let mut errors: Vec<Error> = Vec::new();
-        // (key, version_id) pairs that failed, so the idempotent Deleted
-        // synthesis below does not misreport them as deleted.
-        let mut errored: std::collections::HashSet<(String, Option<String>)> =
-            std::collections::HashSet::new();
         let bucket_versioning = self
             .repo
             .get_bucket_versioning(&req.input.bucket)
@@ -589,18 +587,31 @@ impl<B: Backend> TeleS3<B> {
                         {
                             all_blob_ids.extend(md.item.into_iter().map(|v| v.id));
                         }
-                        deleted_models.push(m);
+                        deleted_objects.push(DeletedObject {
+                            key: Some(m.id.clone()),
+                            version_id: Some(m.version_id.clone()),
+                            ..Default::default()
+                        });
                     }
                     Ok((None, _)) => {
                         // Idempotent delete of non-existent key: S3 still
-                        // reports the key as deleted (synthesized below).
+                        // reports the key as deleted.
+                        deleted_objects.push(DeletedObject {
+                            key: Some(obj.key.clone()),
+                            version_id: vid.clone(),
+                            ..Default::default()
+                        });
                     }
                     Err(e) if *e.code() == S3ErrorCode::NoSuchKey => {
                         // Permanent delete of a non-existent version is
-                        // idempotent: report as deleted (synthesized below).
+                        // idempotent: report as deleted.
+                        deleted_objects.push(DeletedObject {
+                            key: Some(obj.key.clone()),
+                            version_id: vid.clone(),
+                            ..Default::default()
+                        });
                     }
                     Err(e) => {
-                        errored.insert((obj.key.clone(), vid.clone()));
                         errors.push(delete_key_error(obj.key.clone(), vid.clone(), &e));
                     }
                 }
@@ -617,16 +628,29 @@ impl<B: Backend> TeleS3<B> {
                         if let Ok(md) = serde_json::from_value::<Metadata>(m.content.clone()) {
                             all_blob_ids.extend(md.item.into_iter().map(|v| v.id));
                         }
-                        deleted_models.push(m);
+                        deleted_objects.push(DeletedObject {
+                            key: Some(m.id.clone()),
+                            version_id: None,
+                            ..Default::default()
+                        });
                     }
                     Ok((None, _)) => {
-                        // Idempotent delete of non-existent key (synthesized below).
+                        // Idempotent delete of non-existent key.
+                        deleted_objects.push(DeletedObject {
+                            key: Some(obj.key.clone()),
+                            version_id: obj.version_id.clone(),
+                            ..Default::default()
+                        });
                     }
                     Err(e) if *e.code() == S3ErrorCode::NoSuchKey => {
-                        // Idempotent (synthesized below).
+                        // Idempotent.
+                        deleted_objects.push(DeletedObject {
+                            key: Some(obj.key.clone()),
+                            version_id: obj.version_id.clone(),
+                            ..Default::default()
+                        });
                     }
                     Err(e) => {
-                        errored.insert((obj.key.clone(), vid.clone()));
                         errors.push(delete_key_error(obj.key.clone(), vid.clone(), &e));
                     }
                 }
@@ -643,35 +667,6 @@ impl<B: Backend> TeleS3<B> {
         let deleted = if quiet {
             None
         } else {
-            // Build DeletedObject list from deleted_models
-            let mut deleted_objects: Vec<DeletedObject> = Vec::new();
-            for m in &deleted_models {
-                deleted_objects.push(DeletedObject {
-                    key: Some(m.id.clone()),
-                    version_id: if is_versioned {
-                        Some(m.version_id.clone())
-                    } else {
-                        None
-                    },
-                    ..Default::default()
-                });
-            }
-            // For keys that were requested but not in deleted_models (e.g., non-existent keys with no version),
-            // S3 still returns them as deleted in the response. So we need to include those keys,
-            // unless they failed with a per-key error (reported in `errors` instead).
-            let existing_keys: std::collections::HashSet<String> =
-                deleted_models.iter().map(|m| m.id.clone()).collect();
-            for obj in &req.input.delete.objects {
-                if !existing_keys.contains(&obj.key)
-                    && !errored.contains(&(obj.key.clone(), obj.version_id.clone()))
-                {
-                    deleted_objects.push(DeletedObject {
-                        key: Some(obj.key.clone()),
-                        version_id: obj.version_id.clone(),
-                        ..Default::default()
-                    });
-                }
-            }
             Some(deleted_objects)
         };
 
