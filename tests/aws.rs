@@ -4,9 +4,8 @@ use aws_sdk_s3::{
     error::ProvideErrorMetadata,
     primitives::ByteStream,
     types::{
-        BucketLocationConstraint, BucketVersioningStatus, CompletedMultipartUpload,
-        CompletedPart, CreateBucketConfiguration, Delete, ObjectIdentifier, Tag, Tagging,
-        VersioningConfiguration,
+        BucketLocationConstraint, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+        CreateBucketConfiguration, Delete, ObjectIdentifier, Tag, Tagging, VersioningConfiguration,
     },
 };
 use config::{REGION, config};
@@ -1389,10 +1388,7 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
                 .expect("shared slice should report a computed ETag")
         };
 
-        let completed_part = CompletedPart::builder()
-            .e_tag(e_tag)
-            .part_number(1)
-            .build();
+        let completed_part = CompletedPart::builder().e_tag(e_tag).part_number(1).build();
 
         let completed = CompletedMultipartUpload::builder()
             .parts(completed_part)
@@ -2062,7 +2058,11 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
     );
 
     let err = {
-        let res = client.get_bucket_acl().bucket("no-such-bucket").send().await;
+        let res = client
+            .get_bucket_acl()
+            .bucket("no-such-bucket")
+            .send()
+            .await;
         res.err()
     };
     assert_eq!(
@@ -2207,7 +2207,12 @@ async fn test_object_metadata() -> anyhow::Result<()> {
         .context("get completed multipart object")?;
 
     assert_eq!(
-        mpu_out.metadata.clone().unwrap_or_default().get("origin").map(String::as_str),
+        mpu_out
+            .metadata
+            .clone()
+            .unwrap_or_default()
+            .get("origin")
+            .map(String::as_str),
         Some("mpu"),
         "multipart metadata not replayed"
     );
@@ -2708,10 +2713,7 @@ async fn test_versioned_delete_marker_read_is_method_not_allowed() -> anyhow::Re
         .await;
     assert!(res.is_err(), "GET on delete marker version should fail");
     if let Err(e) = res {
-        let code = e
-            .as_service_error()
-            .and_then(|se| se.code())
-            .unwrap_or("");
+        let code = e.as_service_error().and_then(|se| se.code()).unwrap_or("");
         assert!(
             code.contains("MethodNotAllowed"),
             "expected MethodNotAllowed, got {code}"
@@ -2727,10 +2729,7 @@ async fn test_versioned_delete_marker_read_is_method_not_allowed() -> anyhow::Re
         .await;
     assert!(res.is_err(), "HEAD on delete marker version should fail");
     if let Err(e) = res {
-        let code = e
-            .as_service_error()
-            .and_then(|se| se.code())
-            .unwrap_or("");
+        let code = e.as_service_error().and_then(|se| se.code()).unwrap_or("");
         assert!(
             code.contains("MethodNotAllowed"),
             "expected MethodNotAllowed, got {code}"

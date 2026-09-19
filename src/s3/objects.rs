@@ -695,11 +695,7 @@ impl<B: Backend> TeleS3<B> {
         }
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
-        let deleted = if quiet {
-            None
-        } else {
-            Some(deleted_objects)
-        };
+        let deleted = if quiet { None } else { Some(deleted_objects) };
 
         let res = S3Response::new(DeleteObjectsOutput {
             deleted,
@@ -1141,9 +1137,7 @@ impl<B: Backend> TeleS3<B> {
                 }
             }
         };
-        Ok(S3Response::new(PutObjectTaggingOutput {
-            version_id,
-        }))
+        Ok(S3Response::new(PutObjectTaggingOutput { version_id }))
     }
 
     #[instrument(skip(self), err)]
@@ -1180,9 +1174,7 @@ impl<B: Backend> TeleS3<B> {
                 }
             }
         };
-        Ok(S3Response::new(DeleteObjectTaggingOutput {
-            version_id,
-        }))
+        Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }))
     }
 }
 
