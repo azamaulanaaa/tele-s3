@@ -85,7 +85,10 @@ impl Repository {
             .await
             .map_err(S3Error::internal_error)?;
 
+        // Only collect rows for the ids this call released; other
+        // zero-ref rows (if any) belong to other callers.
         let released = entity::blob::Entity::find()
+            .filter(entity::blob::Column::Id.is_in(ids.to_vec()))
             .filter(entity::blob::Column::Refs.lte(0))
             .all(&self.db)
             .await
@@ -96,6 +99,7 @@ impl Repository {
         }
 
         entity::blob::Entity::delete_many()
+            .filter(entity::blob::Column::Id.is_in(ids.to_vec()))
             .filter(entity::blob::Column::Refs.lte(0))
             .exec(&self.db)
             .await
