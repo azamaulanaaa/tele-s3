@@ -791,6 +791,11 @@ impl<B: Backend> TeleS3<B> {
             )
             .await?;
 
+        let is_truncated = models.len() as u64 > limit;
+        if is_truncated {
+            models.pop();
+        }
+
         let (contents, common_prefix) = models.iter().fold(
             (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
             |mut result, model| {
@@ -826,8 +831,7 @@ impl<B: Backend> TeleS3<B> {
             },
         );
 
-        let next_marker = if models.len() as u64 > limit {
-            models.pop();
+        let next_marker = if is_truncated {
             models.last().map(|model| model.id.clone())
         } else {
             None
