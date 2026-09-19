@@ -434,7 +434,11 @@ impl Repository {
                     .one(&self.db)
                     .await
                     .map_err(S3Error::internal_error)?
-                    .unwrap();
+                    .ok_or_else(|| {
+                        S3Error::internal_error(std::io::Error::other(
+                            "delete marker vanished immediately after insert",
+                        ))
+                    })?;
 
                 Ok((Some(marker_model), true))
             }
