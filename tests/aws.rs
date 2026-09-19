@@ -5,7 +5,8 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{
         BucketLocationConstraint, BucketVersioningStatus, CompletedMultipartUpload,
-        CompletedPart, CreateBucketConfiguration, Tag, Tagging, VersioningConfiguration,
+        CompletedPart, CreateBucketConfiguration, Delete, ObjectIdentifier, Tag, Tagging,
+        VersioningConfiguration,
     },
 };
 use config::{REGION, config};
@@ -2613,6 +2614,44 @@ async fn test_versioned_delete_marker_read_is_method_not_allowed() -> anyhow::Re
             "expected MethodNotAllowed, got {code}"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_objects_reports_per_key_errors() -> anyhow::Result<()> {
+    let config = config::<4, 1024>().await?;
+    let client = Client::new(&config);
+
+    // Bulk delete against a bucket that does not exist must report per-key
+    // errors instead of misreporting the keys as deleted (error swallowing).
+    let res = client
+        .delete_objects()
+        .bucket("delete-objects-no-such-bucket")
+        .delete(
+            Delete::builder()
+                .objects(ObjectIdentifier::builder().key("k").build()?)
+                .build()?,
+        )
+        .send()
+        .await
+        .context("delete objects")?;
+
+    assert!(
+        !res.errors().is_empty(),
+        "expected per-key errors, got none"
+    );
+    assert!(
+        res.errors()
+            .iter()
+            .any(|e| e.code() == Some("NoSuchBucket")),
+        "expected NoSuchBucket error, got {:?}",
+        res.errors().iter().map(|e| e.code()).collect::<Vec<_>>()
+    );
+    assert!(
+        res.deleted().is_empty(),
+        "failed keys must not be reported as deleted"
+    );
 
     Ok(())
 }
