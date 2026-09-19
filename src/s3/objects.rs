@@ -690,16 +690,23 @@ impl<B: Backend> TeleS3<B> {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
 
-        let models = self
+        // Fetch one extra row to detect truncation without a false
+        // positive when exactly `limit` items remain.
+        let mut models = self
             .repo
             .list_objects(
                 &req.input.bucket,
                 req.input.prefix.clone(),
                 req.input.delimiter.clone(),
                 req.input.marker.clone(),
-                limit,
+                limit.saturating_add(1),
             )
             .await?;
+
+        let is_truncated = models.len() as u64 > limit;
+        if is_truncated {
+            models.pop();
+        }
 
         let (contents, common_prefix) = models.iter().fold(
             (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
@@ -736,7 +743,7 @@ impl<B: Backend> TeleS3<B> {
             },
         );
 
-        let next_marker = if models.len() as u64 == limit {
+        let next_marker = if is_truncated {
             models.last().map(|model| model.id.clone())
         } else {
             None
@@ -766,7 +773,9 @@ impl<B: Backend> TeleS3<B> {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let limit = req.input.max_keys.unwrap_or(1000) as u64;
 
-        let models = self
+        // Fetch one extra row to detect truncation without a false
+        // positive when exactly `limit` items remain.
+        let mut models = self
             .repo
             .list_objects(
                 &req.input.bucket,
@@ -778,7 +787,7 @@ impl<B: Backend> TeleS3<B> {
                     .continuation_token
                     .clone()
                     .or(req.input.start_after.clone()),
-                limit,
+                limit.saturating_add(1),
             )
             .await?;
 
@@ -817,7 +826,8 @@ impl<B: Backend> TeleS3<B> {
             },
         );
 
-        let next_marker = if models.len() as u64 == limit {
+        let next_marker = if models.len() as u64 > limit {
+            models.pop();
             models.last().map(|model| model.id.clone())
         } else {
             None
@@ -847,6 +857,9 @@ impl<B: Backend> TeleS3<B> {
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         self.repo.get_bucket(&req.input.bucket).await?;
         let max_keys = req.input.max_keys.unwrap_or(1000);
+        // Fetch one extra row so truncation is detected from actual
+        // remaining data instead of guessing from a full page.
+        let fetch_max = max_keys.saturating_add(1);
         let (versions, delete_markers) = self
             .repo
             .list_object_versions(
@@ -855,9 +868,44 @@ impl<B: Backend> TeleS3<B> {
                 req.input.delimiter.clone(),
                 req.input.key_marker.clone(),
                 req.input.version_id_marker.clone(),
-                Some(max_keys),
+                Some(fetch_max),
             )
             .await?;
+
+        // Recombine in global order (key asc, last-modified desc) so the
+        // truncation cursor points at the true last returned entry,
+        // regardless of how versions and delete markers interleave.
+        let mut combined: Vec<super::repo::entity::object::Model> = versions
+            .into_iter()
+            .chain(delete_markers.into_iter())
+            .collect();
+        combined.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| b.last_modified.cmp(&a.last_modified))
+        });
+
+        let is_truncated = combined.len() as i32 > max_keys && max_keys > 0;
+        if is_truncated {
+            combined.pop();
+        }
+        let (next_key_marker, next_version_id_marker) = if is_truncated {
+            match combined.last() {
+                Some(last) => (Some(last.id.clone()), Some(last.version_id.clone())),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut versions: Vec<super::repo::entity::object::Model> = Vec::new();
+        let mut delete_markers: Vec<super::repo::entity::object::Model> = Vec::new();
+        for m in combined {
+            if m.is_delete_marker {
+                delete_markers.push(m);
+            } else {
+                versions.push(m);
+            }
+        }
 
         // Build common prefixes if delimiter present - similar to list_objects but for versions we need to deduplicate prefixes from all keys
         let delimiter = req.input.delimiter.clone();
@@ -930,43 +978,13 @@ impl<B: Backend> TeleS3<B> {
             })
             .collect();
 
-        // Determine truncation - we truncated in repo to max_keys, but need to know if there are more.
-        // For simplicity, if we returned exactly max_keys items total, mark truncated if repo had more? Our repo already truncated to limit, so we can't know.
-        // We'll check: if versions_out.len() + delete_markers_out.len() == max_keys as usize, and there were more in DB, we would have truncated.
-        // For correctness, we need to know if total remaining > limit. Our repo returns truncated slice; we can infer truncated if we got limit items and there might be more.
-        // Simplest: if we got limit items, consider truncated true and provide next markers as last item's key/version.
-        let total = versions_out.len() + delete_markers_out.len();
-        let is_truncated = Some(total as i32 == max_keys && total > 0);
-        let (next_key_marker, next_version_id_marker) = if is_truncated.unwrap_or(false) {
-            // Last item in combined sorted order is last version or delete marker with highest key/last_modified
-            let last = if let Some(last_dm) = delete_markers_out.last() {
-                Some((
-                    last_dm.key.clone().unwrap_or_default(),
-                    last_dm.version_id.clone().unwrap_or_default(),
-                ))
-            } else {
-                versions_out.last().map(|last_v| {
-                    (
-                        last_v.key.clone().unwrap_or_default(),
-                        last_v.version_id.clone().unwrap_or_default(),
-                    )
-                })
-            };
-            match last {
-                Some((k, v)) => (Some(k), Some(v)),
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-
         Ok(S3Response::new(ListObjectVersionsOutput {
             name: Some(req.input.bucket.clone()),
             prefix: req.input.prefix.clone(),
             key_marker: req.input.key_marker.clone(),
             version_id_marker: req.input.version_id_marker.clone(),
             max_keys: Some(max_keys),
-            is_truncated,
+            is_truncated: Some(is_truncated),
             next_key_marker,
             next_version_id_marker,
             versions: if versions_out.is_empty() {
