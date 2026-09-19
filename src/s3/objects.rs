@@ -10,7 +10,7 @@ use s3s::{
     dto::{
         CommonPrefix, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
         DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput,
-        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, Error,
         GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput,
         GetObjectTaggingInput, GetObjectTaggingOutput, HeadObjectInput, HeadObjectOutput,
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
@@ -557,9 +557,16 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        // Version-aware bulk delete: each object may carry a versionId
+        // Version-aware bulk delete: each object may carry a versionId.
+        // Per-key failures are reported in the `errors` list (S3 semantics);
+        // only whole-request failures (e.g. blob GC) abort with Err.
         let mut deleted_models: Vec<super::repo::entity::object::Model> = Vec::new();
         let mut all_blob_ids: Vec<String> = Vec::new();
+        let mut errors: Vec<Error> = Vec::new();
+        // (key, version_id) pairs that failed, so the idempotent Deleted
+        // synthesis below does not misreport them as deleted.
+        let mut errored: std::collections::HashSet<(String, Option<String>)> =
+            std::collections::HashSet::new();
         let bucket_versioning = self
             .repo
             .get_bucket_versioning(&req.input.bucket)
@@ -585,45 +592,49 @@ impl<B: Backend> TeleS3<B> {
                         deleted_models.push(m);
                     }
                     Ok((None, _)) => {
-                        // Idempotent delete of non-existent: still count as deleted for quiet=false?
-                        // Push a placeholder so response includes key
-                        // Create a dummy model for response
-                        // We'll skip placeholder and just not add; S3 still returns deleted entry even if key didn't exist
-                        // For versioned, a delete marker was created; the previous match would have returned Some(marker).
-                        // If None, key didn't exist and bucket is not versioned? That's handled via that branch as (None,false) for non-versioned.
-                        // To mimic S3, we still want to report key as deleted.
-                        // We'll synthesize a deleted entry without model.
+                        // Idempotent delete of non-existent key: S3 still
+                        // reports the key as deleted (synthesized below).
                     }
-                    Err(_) => {
-                        // For versioned permanent delete of non-existent version, report error? But S3 is tolerant.
-                        continue;
+                    Err(e) if *e.code() == S3ErrorCode::NoSuchKey => {
+                        // Permanent delete of a non-existent version is
+                        // idempotent: report as deleted (synthesized below).
+                    }
+                    Err(e) => {
+                        errored.insert((obj.key.clone(), vid.clone()));
+                        errors.push(delete_key_error(obj.key.clone(), vid.clone(), &e));
                     }
                 }
             } else {
-                // Non-versioned: treat as before, but we need to collect per key
-                // Use repo.delete_objects for simplicity if no versionId
-                if vid.is_some() {
-                    // versionId on non-versioned bucket is ignored -> treat as not found? Just delete null version if key matches?
-                    continue;
-                }
-                // Will be handled in bulk below, but to keep simplicity we handle per-key here too
-                if let Ok((Some(m), _)) = self
+                // Non-versioned: pass a versionId through to the repo, where it
+                // addresses the "null" version on match and is an idempotent
+                // NoSuchKey otherwise. Never silently skip the delete.
+                match self
                     .repo
-                    .delete_object_versioned(&req.input.bucket, &obj.key, None)
+                    .delete_object_versioned(&req.input.bucket, &obj.key, vid.as_deref())
                     .await
                 {
-                    if let Ok(md) = serde_json::from_value::<Metadata>(m.content.clone()) {
-                        all_blob_ids.extend(md.item.into_iter().map(|v| v.id));
+                    Ok((Some(m), _)) => {
+                        if let Ok(md) = serde_json::from_value::<Metadata>(m.content.clone()) {
+                            all_blob_ids.extend(md.item.into_iter().map(|v| v.id));
+                        }
+                        deleted_models.push(m);
                     }
-                    deleted_models.push(m);
+                    Ok((None, _)) => {
+                        // Idempotent delete of non-existent key (synthesized below).
+                    }
+                    Err(e) if *e.code() == S3ErrorCode::NoSuchKey => {
+                        // Idempotent (synthesized below).
+                    }
+                    Err(e) => {
+                        errored.insert((obj.key.clone(), vid.clone()));
+                        errors.push(delete_key_error(obj.key.clone(), vid.clone(), &e));
+                    }
                 }
             }
         }
 
-        // For non-versioned bulk without per-object versionId, the above per-key handling already covered.
-        // But to ensure backward compat for non-versioned bulk where we didn't handle per-key correctly for missing keys,
-        // we also fallback to original bulk path if deleted_models is empty and is_versioned==false?
-        // Actually per-key loop already handles, so we can just release blobs and build response.
+        // Release blobs of permanently deleted data versions (best-effort
+        // GC of shared blobs is scoped to these ids by release_blobs).
         if !all_blob_ids.is_empty() {
             self.release_blobs(all_blob_ids).await?;
         }
@@ -646,11 +657,14 @@ impl<B: Backend> TeleS3<B> {
                 });
             }
             // For keys that were requested but not in deleted_models (e.g., non-existent keys with no version),
-            // S3 still returns them as deleted in the response. So we need to include those keys.
+            // S3 still returns them as deleted in the response. So we need to include those keys,
+            // unless they failed with a per-key error (reported in `errors` instead).
             let existing_keys: std::collections::HashSet<String> =
                 deleted_models.iter().map(|m| m.id.clone()).collect();
             for obj in &req.input.delete.objects {
-                if !existing_keys.contains(&obj.key) {
+                if !existing_keys.contains(&obj.key)
+                    && !errored.contains(&(obj.key.clone(), obj.version_id.clone()))
+                {
                     deleted_objects.push(DeletedObject {
                         key: Some(obj.key.clone()),
                         version_id: obj.version_id.clone(),
@@ -663,7 +677,11 @@ impl<B: Backend> TeleS3<B> {
 
         let res = S3Response::new(DeleteObjectsOutput {
             deleted,
-            errors: None,
+            errors: if errors.is_empty() {
+                None
+            } else {
+                Some(errors)
+            },
             ..Default::default()
         });
 
@@ -1085,5 +1103,15 @@ impl<B: Backend> TeleS3<B> {
             version_id: vid,
             ..Default::default()
         }))
+    }
+}
+
+/// Map a per-key bulk-delete failure to an S3 `DeleteObjects` error entry.
+fn delete_key_error(key: String, version_id: Option<String>, err: &S3Error) -> Error {
+    Error {
+        code: Some(err.code().as_str().to_owned()),
+        key: Some(key),
+        message: err.message().map(str::to_owned),
+        version_id,
     }
 }
