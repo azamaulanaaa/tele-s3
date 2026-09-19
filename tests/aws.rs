@@ -4,8 +4,8 @@ use aws_sdk_s3::{
     error::ProvideErrorMetadata,
     primitives::ByteStream,
     types::{
-        BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
-        CreateBucketConfiguration, Tag, Tagging,
+        BucketLocationConstraint, BucketVersioningStatus, CompletedMultipartUpload,
+        CompletedPart, CreateBucketConfiguration, Tag, Tagging, VersioningConfiguration,
     },
 };
 use config::{REGION, config};
@@ -2515,6 +2515,104 @@ async fn test_metadata_replaced_on_overwrite() -> anyhow::Result<()> {
         !metadata.contains_key("old"),
         "stale metadata from the previous version must not survive"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_versioned_delete_marker_read_is_method_not_allowed() -> anyhow::Result<()> {
+    let config = config::<4, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "delete-marker-read";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+
+        let versioning = VersioningConfiguration::builder()
+            .status(BucketVersioningStatus::Enabled)
+            .build();
+
+        client
+            .put_bucket_versioning()
+            .bucket(bucket_name)
+            .versioning_configuration(versioning)
+            .send()
+            .await
+            .context("enable versioning")?;
+    }
+
+    client
+        .put_object()
+        .bucket(bucket_name)
+        .key("k")
+        .body(ByteStream::from_static(b"v1".as_slice()))
+        .send()
+        .await
+        .context("put v1")?;
+
+    // Deleting without a version id creates a delete marker.
+    let marker_version_id = {
+        let res = client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("k")
+            .send()
+            .await
+            .context("delete")?;
+        res.version_id.context("missing delete marker version id")?
+    };
+
+    // Addressing the delete marker by version must be 405, not a 200
+    // serving the marker's empty content.
+    let res = client
+        .get_object()
+        .bucket(bucket_name)
+        .key("k")
+        .version_id(marker_version_id.clone())
+        .send()
+        .await;
+    assert!(res.is_err(), "GET on delete marker version should fail");
+    if let Err(e) = res {
+        let code = e
+            .as_service_error()
+            .and_then(|se| se.code())
+            .unwrap_or("");
+        assert!(
+            code.contains("MethodNotAllowed"),
+            "expected MethodNotAllowed, got {code}"
+        );
+    }
+
+    let res = client
+        .head_object()
+        .bucket(bucket_name)
+        .key("k")
+        .version_id(marker_version_id)
+        .send()
+        .await;
+    assert!(res.is_err(), "HEAD on delete marker version should fail");
+    if let Err(e) = res {
+        let code = e
+            .as_service_error()
+            .and_then(|se| se.code())
+            .unwrap_or("");
+        assert!(
+            code.contains("MethodNotAllowed"),
+            "expected MethodNotAllowed, got {code}"
+        );
+    }
 
     Ok(())
 }
