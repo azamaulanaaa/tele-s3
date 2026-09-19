@@ -122,16 +122,36 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         {
             let reminder_len = object.len % M;
             let last_idx = object.chunks.len().saturating_sub(1);
+            let mut failure: Option<std::io::Error> = None;
             for idx in 0..object.chunks.len() {
                 let is_last = idx == last_idx;
 
-                let _ = if is_last && reminder_len != 0 {
+                let res = if is_last && reminder_len != 0 {
                     reader.read_exact(&mut object.chunks[idx][..reminder_len])
                 } else {
                     reader.read_exact(&mut object.chunks[idx])
                 }
-                .await
-                .map_err(|e| BackendError::Other(e.into()))?;
+                .await;
+
+                if let Err(e) = res {
+                    failure = Some(e);
+                    break;
+                }
+            }
+
+            if let Some(e) = failure {
+                // The body ended early: the chunks taken from storage were
+                // never published to the table, so hand them back instead
+                // of leaking capacity on every short write.
+                let mut storage = self.storage.lock().await;
+                for chunk in object.chunks {
+                    match storage.iter_mut().find(|slot| slot.is_none()) {
+                        Some(slot) => *slot = Some(chunk),
+                        None => break,
+                    }
+                }
+
+                return Err(BackendError::Other(e.into()));
             }
         }
 
