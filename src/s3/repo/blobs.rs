@@ -13,7 +13,7 @@ impl Repository {
     pub async fn register_new_blob(&self, id: String, size: u64) -> S3Result<()> {
         let active_model = entity::blob::ActiveModel {
             id: Set(id),
-            size: Set(size as u32),
+            size: Set(Self::checked_size(size)?),
             refs: Set(1),
             created_at: Set(chrono::Local::now().to_utc()),
         };
@@ -48,7 +48,7 @@ impl Repository {
             } else {
                 let active_model = entity::blob::ActiveModel {
                     id: Set(id.clone()),
-                    size: Set(*size as u32),
+                    size: Set(Self::checked_size(*size)?),
                     refs: Set(2),
                     created_at: Set(chrono::Local::now().to_utc()),
                 };
