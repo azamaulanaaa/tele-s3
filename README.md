@@ -4,7 +4,7 @@ S3-compatible gateway backed by Telegram — store S3 objects as Telegram messag
 
 Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](https://github.com/Lonami/grammers) (Telegram client), [`sea-orm`](https://github.com/SeaQL/sea-orm) (SQLite metadata), and `tokio`/`hyper`.
 
-> **Telegram as S3:** Each `PutObject`/`UploadPart` is written to a Telegram channel via the bot API; metadata (buckets, objects, versions, multipart state, blob ref-counts) lives in SQLite. The `Memory` backend is available for tests and local dev.
+> **Telegram as S3:** Each `PutObject`/`UploadPart` is written to Telegram via the `grammers` MTProto client (bot-token login, objects stored as message media); metadata (buckets, objects, versions, multipart state, blob ref-counts) lives in SQLite. The `Memory` backend is available for tests and local dev.
 
 ## Features
 
@@ -13,14 +13,14 @@ Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](htt
 - **Multipart** — `CreateMultipartUpload`/`UploadPart`/`UploadPartCopy`/`CompleteMultipartUpload`/`AbortMultipartUpload`/`ListParts`/`ListMultipartUploads`
 - **Versioning** — `Enabled` / `Suspended` per bucket, `versionId` on every `Put`/`Copy`/`Complete`, delete markers, `ListObjectVersions`, `GET ?versionId`
 - **Presigned URLs** — Standard AWS SigV4 `X-Amz-Signature` query auth (`s3s` `v4_check_presigned_url`); generate client-side and share publicly, no custom `/share` endpoint required
-- **Other** — `If-Match`/`If-None-Match` (CAS), `Content-MD5` validation, checksums (`crc32`/`crc32c`/`sha1`/`sha256` echo), user metadata (`x-amz-meta-*`), tagging (`Get/Put/DeleteObjectTagging`), ACL stubs, blob ref-counting for shared slices
+- **Other** — conditional reads (`If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` with `412`/`304`), conditional writes (`PutObject` `If-Match`/`If-None-Match` incl. `*`, `CompleteMultipartUpload` `If-Match`), `Content-MD5` validation, checksums (`crc32`/`crc32c`/`sha1`/`sha256` verified, `BadDigest`/`InvalidRequest` on mismatch, echoed on `Put`/`Get`/`Head`/`Copy`/`UploadPart`), user metadata (`x-amz-meta-*`), tagging (`Get/Put/DeleteObjectTagging`), ACL stubs, blob ref-counting for shared slices
 
 ## Quick Start
 
 ### Prerequisites
 
-- Rust stable (see `mise.toml`)
-- Telegram `api_id`, `api_hash`, `bot_token` from https://my.telegram.org
+- Rust stable (see `mise.toml`; CI uses `cargo test --locked --all-targets`)
+- Telegram `api_id`, `api_hash`, `bot_token` from https://my.telegram.org, plus a `username` destination (chat/channel) where objects will be stored
 
 ### Configure
 
@@ -33,7 +33,8 @@ cp config.example.toml config.toml
 api_id = 1234567
 api_hash = "344583e45741c457fe1862106095a5eb"
 bot_token = "1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0"
-username = "your_bot_username"
+# Destination chat/channel/peer objects are sent to (resolved via `resolve_username`, `send_message` to this peer).
+username = "your_storage_channel_username"
 database_uri = "sqlite://storage.db?mode=rwc"
 listen_port = 8000
 auth_access_key = "YOUR_ACCESS_KEY"
@@ -48,6 +49,10 @@ cargo run -- --config config.toml
 ```
 
 ### Docker
+
+Prebuilt multi-arch images are published to `ghcr.io/azamaulanaaa/tele-s3` on each release (see `.github/workflows/release-container-image.yaml`, tags `<version>` and `latest`).
+
+Local build:
 
 ```bash
 cargo build --profile dist
@@ -99,7 +104,9 @@ let presigned = client.get_object()
     .presigned(PresigningConfig::expires_in(Duration::from_secs(3600))?)
     .await?;
 println!("{}", presigned.uri()); // share this
-// -> http://my-bucket.localhost:9000/hello.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Expires=3600&X-Amz-Signature=...
+// -> http://localhost:8000/my-bucket/hello.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Expires=3600&X-Amz-Signature=...
+// (path-style; the `localhost:9000` + `SingleDomain` virtual-host form
+// `http://my-bucket.localhost:9000/...` is test-harness only in `tests/config.rs`.)
 // Anyone with the URL can GET without Authorization until expiry.
 // For versioned objects, `versionId` is automatically signed:
 // client.get_object().bucket(b).key(k).version_id(vid).presigned(cfg).await?;
@@ -111,7 +118,7 @@ println!("{}", presigned.uri()); // share this
 ```bash
 aws --endpoint-url $AWS_ENDPOINT_URL s3 presign s3://my-bucket/hello.txt --expires-in 3600
 # share the returned URL
-curl "http://my-bucket.localhost:9000/hello.txt?X-Amz-Algorithm=..."
+curl "http://localhost:8000/my-bucket/hello.txt?X-Amz-Algorithm=..."
 ```
 
 Tampered signatures and expired links are rejected with `403`. `HeadObject` can also be presigned.
@@ -135,7 +142,8 @@ aws --endpoint-url $AWS_ENDPOINT_URL s3api delete-object --bucket my-bucket --ke
 
 | Key | Description |
 |-----|-------------|
-| `api_id` / `api_hash` / `bot_token` / `username` | Telegram bot credentials |
+| `api_id` / `api_hash` / `bot_token` | Telegram bot credentials (MTProto login) |
+| `username` | Storage destination: chat/channel/peer username objects are sent to |
 | `database_uri` | SeaORM URI, e.g. `sqlite://storage.db?mode=rwc` or `sqlite::memory:` for tests |
 | `listen_port` | HTTP listen port |
 | `auth_access_key` / `auth_secret_key` | S3 `SimpleAuth` credentials (used for both header and presigned URL verification) |
@@ -143,22 +151,24 @@ aws --endpoint-url $AWS_ENDPOINT_URL s3api delete-object --bucket my-bucket --ke
 ## Architecture
 
 ```
-Client (aws-cli/sdk, curl) -> hyper -> S3ServiceBuilder{ TeleS3<Grammers>, SimpleAuth, SingleDomain } -> TeleS3 (S3 trait)
-                                                                                    |
-                                                                                    v
-                                                                          Repository (sea-orm, SQLite)
-                                                                    s3_bucket / s3_object (versioned) / s3_blob (ref-count) / s3_multipart_upload_state
-                                                                                    |
-                                                                                    v
-                                                                              Backend (Grammers -> Telegram, Memory -> HashMap)
+Client (aws-cli/sdk, curl) -> hyper -> S3ServiceBuilder{ TeleS3<Grammers>, SimpleAuth } -> TeleS3 (S3 trait)
+                                                                                     |
+                                                                                     v
+                                                                           Repository (sea-orm, SQLite)
+                                                                     s3_bucket / s3_object (versioned) / s3_blob (ref-count) / s3_multipart_upload_state
+                                                                                     |
+                                                                                     v
+                                                                               Backend (Grammers -> Telegram MTProto, Memory -> HashMap)
 ```
+
+(`tests/config.rs` additionally sets `SingleDomain("localhost:9000")` for virtual-hosted-style test URLs; the production server in `src/main.rs` is path-style.)
 
 Blob ref-counting keeps shared slices (e.g. `UploadPartCopy` ranges, `CopyObject`) alive until all referencing versions are deleted.
 
 ## Development
 
 ```bash
-cargo test          # 11 lib + 28 aws + 3 presigned
+cargo test --locked --all-targets # 11 lib + 31 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yaml`)
 cargo test --test presigned -- --nocapture # presigned generation only (no endpoint)
 ```
 
@@ -166,4 +176,4 @@ cargo test --test presigned -- --nocapture # presigned generation only (no endpo
 
 ## License
 
-`LICENSE` (MIT/Apache-2.0 as per original).
+`LICENSE` (GPL-2.0 — the file in this repo is the GPLv2 text, and `Cargo.toml` uses `license-file = "LICENSE"`).
