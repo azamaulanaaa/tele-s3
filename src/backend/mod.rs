@@ -6,7 +6,7 @@ use futures::io::AsyncRead;
 pub use chain_readers::ChainReaders;
 pub use grammers::{Grammers, GrammersConfig};
 pub use memory::Memory;
-pub use reader_with_hasher::ReaderWithHasher;
+pub use reader_with_hasher::{IntegrityDigests, IntegrityReader, ReaderWithHasher};
 
 mod chain_readers;
 mod grammers;
