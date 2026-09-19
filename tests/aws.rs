@@ -1607,7 +1607,7 @@ async fn test_copied_object_survives_sibling_deletion() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.map(|e| e.code().map(|e| e.to_owned())).flatten(),
+            err.and_then(|e| e.code().map(|e| e.to_owned())),
             Some("NoSuchKey".to_string()),
             "deleted source should be gone"
         );
@@ -1846,7 +1846,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            err.and_then(|e| e.code().map(|c| c.to_owned())),
             Some("PreconditionFailed".to_string())
         );
     }
@@ -1876,7 +1876,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            err.and_then(|e| e.code().map(|c| c.to_owned())),
             Some("PreconditionFailed".to_string())
         );
     }
@@ -1896,7 +1896,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            err.and_then(|e| e.code().map(|c| c.to_owned())),
             Some("NoSuchKey".to_string())
         );
     }
@@ -1945,7 +1945,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+            err.and_then(|e| e.code().map(|c| c.to_owned())),
             Some("PreconditionFailed".to_string()),
             "stale If-Match must reject completion"
         );
@@ -2057,7 +2057,7 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -2066,7 +2066,7 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchBucket".to_string())
     );
 
@@ -2308,7 +2308,7 @@ async fn test_object_tagging() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -2426,7 +2426,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("InvalidRequest".to_string())
     );
 
@@ -2444,7 +2444,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("InvalidRequest".to_string())
     );
 
@@ -2462,7 +2462,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("BadDigest".to_string())
     );
 
@@ -2474,9 +2474,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         .await
         .err();
     assert_eq!(
-        head_missing
-            .map(|e| e.code().map(|c| c.to_owned()))
-            .flatten(),
+        head_missing.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
