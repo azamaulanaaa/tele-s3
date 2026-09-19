@@ -84,7 +84,7 @@ impl Grammers {
         let peer = client
             .resolve_username(&config.username)
             .await?
-            .ok_or(anyhow!("Username {} not found", &config.username))?;
+            .ok_or(anyhow!("Username {} not found", config.username))?;
 
         Ok(Self {
             sender_pool_handle,

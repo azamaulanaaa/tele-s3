@@ -1009,7 +1009,6 @@ impl<B: Backend> TeleS3<B> {
                 is_latest: Some(m.is_latest),
                 last_modified: Some(chrono_to_timestamp(m.last_modified)),
                 owner: Some(canned_owner()),
-                ..Default::default()
             })
             .collect();
 
@@ -1105,7 +1104,6 @@ impl<B: Backend> TeleS3<B> {
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set: json_to_tag_set(&model.tags),
             version_id,
-            ..Default::default()
         }))
     }
 
@@ -1145,7 +1143,6 @@ impl<B: Backend> TeleS3<B> {
         };
         Ok(S3Response::new(PutObjectTaggingOutput {
             version_id,
-            ..Default::default()
         }))
     }
 
@@ -1185,7 +1182,6 @@ impl<B: Backend> TeleS3<B> {
         };
         Ok(S3Response::new(DeleteObjectTaggingOutput {
             version_id,
-            ..Default::default()
         }))
     }
 }
