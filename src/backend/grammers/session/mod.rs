@@ -219,11 +219,23 @@ impl Session for SessionStorage {
                 }
             };
 
+            let auth_key = match v.auth_key {
+                None => None,
+                Some(bytes) => match bytes.try_into() {
+                    Ok(key) => Some(key),
+                    Err(_) => {
+                        error!(dc_id, "Corrupted auth key in database. Ignoring row.");
+
+                        return None;
+                    }
+                },
+            };
+
             Some(DcOption {
                 id: v.dc_id,
                 ipv4,
                 ipv6,
-                auth_key: v.auth_key.map(|v| v.try_into().unwrap()),
+                auth_key,
             })
         });
 
