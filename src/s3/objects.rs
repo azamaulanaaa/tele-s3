@@ -1088,10 +1088,26 @@ impl<B: Backend> TeleS3<B> {
                 tags_to_json(req.input.tagging),
             )
             .await?;
-        let version_id = vid.or({
-            // For versioned buckets without explicit versionId, the tagging applies to latest; return its versionId
-            None
-        });
+        // Without an explicit versionId the tagging applies to latest;
+        // report its version on versioned buckets.
+        let version_id = match vid {
+            Some(v) => Some(v),
+            None => {
+                let versioned = self
+                    .repo
+                    .get_bucket_versioning(&req.input.bucket)
+                    .await
+                    .unwrap_or(None)
+                    .is_some();
+                if versioned {
+                    self.repo
+                        .latest_version_id(&req.input.bucket, &req.input.key)
+                        .await?
+                } else {
+                    None
+                }
+            }
+        };
         Ok(S3Response::new(PutObjectTaggingOutput {
             version_id,
             ..Default::default()
@@ -1112,8 +1128,28 @@ impl<B: Backend> TeleS3<B> {
                 serde_json::json!([]),
             )
             .await?;
+        // Without an explicit versionId the delete applies to latest;
+        // report its version on versioned buckets.
+        let version_id = match vid {
+            Some(v) => Some(v),
+            None => {
+                let versioned = self
+                    .repo
+                    .get_bucket_versioning(&req.input.bucket)
+                    .await
+                    .unwrap_or(None)
+                    .is_some();
+                if versioned {
+                    self.repo
+                        .latest_version_id(&req.input.bucket, &req.input.key)
+                        .await?
+                } else {
+                    None
+                }
+            }
+        };
         Ok(S3Response::new(DeleteObjectTaggingOutput {
-            version_id: vid,
+            version_id,
             ..Default::default()
         }))
     }

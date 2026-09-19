@@ -274,6 +274,18 @@ impl Repository {
         Ok(())
     }
 
+    /// Version id of the current latest entry for a key, if any.
+    pub async fn latest_version_id(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<Option<String>> {
+        Ok(self
+            .get_latest_model(bucket, key)
+            .await?
+            .map(|m| m.version_id))
+    }
+
     #[instrument(skip(self, data), level = "debug", err)]
     pub async fn upsert_object(
         &self,
