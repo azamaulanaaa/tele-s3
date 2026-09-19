@@ -2317,7 +2317,9 @@ async fn test_object_tagging() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_checksum_echo() -> anyhow::Result<()> {
-    let config = config::<1, 1024>().await?;
+    // Two slots: the good object plus one spare for the rejected BadDigest
+    // write (its backend blob is allocated before verification fails).
+    let config = config::<2, 1024>().await?;
     let client = Client::new(&config);
 
     let bucket_name = "checksum-echo";
@@ -2446,9 +2448,131 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         Some("InvalidRequest".to_string())
     );
 
+    // Correct length but wrong digest is BadDigest and must not store.
+    let err = {
+        let res = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("bad-digest")
+            .body(ByteStream::from_static(b"data".as_slice()))
+            .content_length(4)
+            .checksum_sha256("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.map(|e| e.code().map(|c| c.to_owned())).flatten(),
+        Some("BadDigest".to_string())
+    );
+
+    let head_missing = client
+        .head_object()
+        .bucket(bucket_name)
+        .key("bad-digest")
+        .send()
+        .await
+        .err();
+    assert_eq!(
+        head_missing
+            .map(|e| e.code().map(|c| c.to_owned()))
+            .flatten(),
+        Some("NoSuchKey".to_string())
+    );
+
     Ok(())
 }
 
+#[tokio::test]
+async fn test_upload_part_checksum_verification() -> anyhow::Result<()> {
+    // Three slots: the good part plus one spare for the rejected BadDigest
+    // part (its backend blob is allocated before verification fails).
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "upload-part-checksum";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let object_name = "test";
+
+    let upload_id = {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key(object_name)
+            .send()
+            .await
+            .context("create multipart upload")?;
+
+        res.upload_id.context("missing upload id")?
+    };
+
+    // sha256("part1"), standard base64.
+    const SHA256_PART1: &str = "WeCjzHoMRflnNb8fBjJduQtLt0LyV98StrGN89ISZJk=";
+
+    // Correct checksum is echoed back.
+    let part_out = client
+        .upload_part()
+        .bucket(bucket_name)
+        .key(object_name)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"part1".as_slice()))
+        .checksum_sha256(SHA256_PART1)
+        .send()
+        .await
+        .context("upload part with checksum")?;
+
+    assert_eq!(part_out.checksum_sha256(), Some(SHA256_PART1));
+
+    // Correct length but wrong digest is BadDigest and must not store.
+    let err = {
+        let res = client
+            .upload_part()
+            .bucket(bucket_name)
+            .key(object_name)
+            .upload_id(&upload_id)
+            .part_number(2)
+            .body(ByteStream::from_static(b"part1".as_slice()))
+            .checksum_sha256("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        Some("BadDigest".to_string())
+    );
+
+    // Only the good part is listed.
+    let listed = client
+        .list_parts()
+        .bucket(bucket_name)
+        .key(object_name)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .context("list parts")?;
+
+    assert_eq!(listed.parts().len(), 1);
+    assert_eq!(listed.parts()[0].part_number(), Some(1));
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_metadata_replaced_on_overwrite() -> anyhow::Result<()> {
