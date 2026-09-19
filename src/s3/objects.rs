@@ -346,17 +346,15 @@ impl<B: Backend> TeleS3<B> {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let model = if let Some(vid) = req.input.version_id.as_deref() {
-            self.repo
+            let model = self
+                .repo
                 .get_object_version(&req.input.bucket, &req.input.key, vid)
-                .await
-                .map_err(|e| {
-                    // If version is delete marker, S3 returns MethodNotAllowed (405)
-                    if format!("{e:?}").contains("MethodNotAllowed") {
-                        S3Error::new(S3ErrorCode::MethodNotAllowed)
-                    } else {
-                        e
-                    }
-                })?
+                .await?;
+            // Addressing a delete marker by version is MethodNotAllowed (405).
+            if model.is_delete_marker {
+                return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+            }
+            model
         } else {
             self.repo
                 .get_object(&req.input.bucket, &req.input.key)
@@ -462,9 +460,15 @@ impl<B: Backend> TeleS3<B> {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let model = if let Some(vid) = req.input.version_id.as_deref() {
-            self.repo
+            let model = self
+                .repo
                 .get_object_version(&req.input.bucket, &req.input.key, vid)
-                .await?
+                .await?;
+            // Addressing a delete marker by version is MethodNotAllowed (405).
+            if model.is_delete_marker {
+                return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+            }
+            model
         } else {
             self.repo
                 .get_object(&req.input.bucket, &req.input.key)
