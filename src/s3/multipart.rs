@@ -447,14 +447,31 @@ impl<B: Backend> TeleS3<B> {
             .await?;
 
         // Access-point sources are not supported.
-        let (src_bucket, src_key) = match &req.input.copy_source {
-            CopySource::Bucket { bucket, key, .. } => (&**bucket, &**key),
+        let (src_bucket, src_key, src_version_id) = match &req.input.copy_source {
+            CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+                ..
+            } => (&**bucket, &**key, version_id.as_deref()),
             CopySource::AccessPoint { .. } => {
                 return Err(S3Error::new(S3ErrorCode::NotImplemented));
             }
         };
 
-        let model = self.repo.get_object(src_bucket, src_key).await?;
+        let model = if let Some(vid) = src_version_id {
+            self.repo
+                .get_object_version(src_bucket, src_key, vid)
+                .await?
+        } else {
+            self.repo.get_object(src_bucket, src_key).await?
+        };
+
+        // A versioned source may address a delete marker; there are no
+        // bytes to copy from it.
+        if model.is_delete_marker {
+            return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+        }
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
