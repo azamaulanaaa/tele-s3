@@ -4,14 +4,13 @@ use std::{
 };
 
 use base64::Engine;
-use digest::Digest;
 use s3s::{
     S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{
         CommonPrefix, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource,
         DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, DeleteObjectTaggingInput,
-        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag, Error,
-        GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput,
+        DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+        Error, GetObjectAclInput, GetObjectAclOutput, GetObjectInput, GetObjectOutput,
         GetObjectTaggingInput, GetObjectTaggingOutput, HeadObjectInput, HeadObjectOutput,
         ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
         ListObjectsV2Input, ListObjectsV2Output, Object, ObjectVersion, PutObjectAclInput,
@@ -25,11 +24,11 @@ use super::TeleS3;
 use super::helpers::{
     StreamingBlobExt, build_put_condition, canned_owner, check_conditional_get, checksums_to_json,
     chrono_to_timestamp, full_control_grant, json_to_checksum_fields, json_to_metadata,
-    json_to_tag_set, metadata_to_json, tags_to_json,
+    json_to_tag_set, metadata_to_json, tags_to_json, verify_checksums,
 };
 use super::repo::ObjectWrite;
 use super::types::{Metadata, MetadataItem};
-use crate::backend::{Backend, ChainReaders, ReaderWithHasher};
+use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader};
 
 impl<B: Backend> TeleS3<B> {
     #[instrument(skip(self), err)]
@@ -53,11 +52,16 @@ impl<B: Backend> TeleS3<B> {
             .await?;
 
         let checksums = checksums_to_json(
-            req.input.checksum_crc32.take(),
-            req.input.checksum_crc32c.take(),
-            req.input.checksum_sha1.take(),
-            req.input.checksum_sha256.take(),
+            req.input.checksum_crc32.clone(),
+            req.input.checksum_crc32c.clone(),
+            req.input.checksum_sha1.clone(),
+            req.input.checksum_sha256.clone(),
         )?;
+
+        let expected_crc32 = req.input.checksum_crc32.clone();
+        let expected_crc32c = req.input.checksum_crc32c.clone();
+        let expected_sha1 = req.input.checksum_sha1.clone();
+        let expected_sha256 = req.input.checksum_sha256.clone();
 
         let reader = {
             let body_stream = req
@@ -69,12 +73,11 @@ impl<B: Backend> TeleS3<B> {
             body_stream.into_boxed_reader()
         };
 
-        let (id, hash_md5) = {
-            let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
+        let (id, hash_md5, computed_crc32, computed_crc32c, computed_sha1, computed_sha256) = {
+            let state = Arc::new(Mutex::new(IntegrityDigests::default()));
 
             let id = if size > 0 {
-                let reader_with_hasher =
-                    Box::pin(ReaderWithHasher::new(reader, hasher_md5.clone()));
+                let reader_with_hasher = Box::pin(IntegrityReader::new(reader, state.clone()));
 
                 let id = self
                     .backend
@@ -86,18 +89,46 @@ impl<B: Backend> TeleS3<B> {
                 None
             };
 
-            let hash_md5 = hasher_md5
+            let mut guard = state
                 .lock()
-                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
-                .finalize_reset();
+                .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
+            let hash_md5 = guard.finalize_md5_reset();
+            let computed = (
+                guard.finalize_crc32(),
+                guard.finalize_crc32c(),
+                guard.finalize_sha1(),
+                guard.finalize_sha256(),
+            );
+            drop(guard);
 
-            (id, hash_md5)
+            (id, hash_md5, computed.0, computed.1, computed.2, computed.3)
         };
 
-        // The backend blob now exists and is owned solely by the incoming
-        // object until it replaces a previous version.
+        // The backend blob now exists; register it before any fallible
+        // validation so a BadDigest cleanup can release it (mirrors the
+        // Content-MD5 path below). Until cas_put_object links it, this
+        // reference is owned solely by the incoming write.
         if let Some(ref id) = id {
             self.repo.register_new_blob(id.clone(), size).await?;
+        }
+
+        // Verify streaming checksums before the blob is linked. A mismatch
+        // means corrupt transport: drop the backend blob and fail fast so
+        // archives never store bad bytes under a good checksum.
+        if let Err(e) = verify_checksums(
+            computed_crc32,
+            computed_crc32c,
+            &computed_sha1,
+            &computed_sha256,
+            expected_crc32.as_deref(),
+            expected_crc32c.as_deref(),
+            expected_sha1.as_deref(),
+            expected_sha256.as_deref(),
+        ) {
+            if let Some(id) = id {
+                self.release_blobs(vec![id]).await?;
+            }
+            return Err(e);
         }
 
         if let Some(expected) = req.input.content_md5 {
