@@ -174,7 +174,7 @@ impl Backend for Grammers {
             let now = std::time::SystemTime::now();
             let duration = now
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("Time went backwards");
+                .map_err(|e| BackendError::Other(e.into()))?;
             duration.as_millis() as i64
         };
 
