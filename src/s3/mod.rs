@@ -116,6 +116,11 @@ impl From<BackendError> for S3Error {
             // SDK clients retry automatically instead of treating it as a
             // hard failure.
             BackendError::SlowDown => S3Error::new(s3s::S3ErrorCode::SlowDown),
+            BackendError::ExceedLimitSize { max, actual } => S3Error::with_message(
+                s3s::S3ErrorCode::EntityTooLarge,
+                format!("Size {actual} exceeds limit {max}"),
+            ),
+            BackendError::OutOfRange => S3Error::new(s3s::S3ErrorCode::InvalidRange),
             other => S3Error::internal_error(other),
         }
     }
