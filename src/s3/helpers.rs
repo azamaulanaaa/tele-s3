@@ -182,6 +182,65 @@ pub(crate) fn json_to_tag_set(value: &serde_json::Value) -> Vec<s3s::dto::Tag> {
         .unwrap_or_default()
 }
 
+/// Percent-decode a `x-amz-tagging` query-param string (`Key1=Value1&...`).
+fn percent_decode(input: &str) -> S3Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &input[i + 1..i + 3];
+                let byte = u8::from_str_radix(hex, 16)
+                    .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+                out.push(byte as char);
+                i += 3;
+            }
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `x-amz-tagging` header (`TaggingHeader`) into the JSON tag-set
+/// storage format (`[{"key":..,"value":..}]`). `None`/empty → `[]`.
+/// Enforces S3 limits: max 10 tags.
+pub(crate) fn tagging_header_to_json(tagging: Option<&str>) -> S3Result<serde_json::Value> {
+    let header = tagging.map(str::trim).unwrap_or_default();
+    if header.is_empty() {
+        return Ok(serde_json::json!([]));
+    }
+
+    let mut list = Vec::new();
+    for pair in header.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidArgument))?;
+        let key = percent_decode(k.trim())?;
+        let value = percent_decode(v.trim())?;
+        if key.is_empty() || key.len() > 128 || value.len() > 256 {
+            return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+        }
+        list.push(serde_json::json!({"key": key, "value": value}));
+    }
+
+    if list.len() > 10 {
+        return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+    }
+
+    Ok(serde_json::Value::Array(list))
+}
+
 /// Translate If-Match / If-None-Match headers into a write precondition.
 pub(crate) fn build_put_condition(
     if_match: Option<&ETagCondition>,

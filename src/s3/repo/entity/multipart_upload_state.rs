@@ -14,6 +14,10 @@ pub struct Model {
     /// x-amz-meta-* headers captured at CreateMultipartUpload, replayed
     /// onto the completed object.
     pub user_metadata: serde_json::Value,
+    /// Tag-set captured at CreateMultipartUpload (`[]` when none),
+    /// replayed onto the completed object. Nullable so databases created
+    /// before this column existed still sync (missing values read as `[]`).
+    pub tags: Option<serde_json::Value>,
     pub content: serde_json::Value,
     #[sea_orm(belongs_to, from = "bucket_id", to = "id")]
     pub bucket: HasOne<super::bucket::Entity>,

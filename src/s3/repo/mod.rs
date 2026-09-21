@@ -41,6 +41,8 @@ pub struct ObjectWrite {
     /// Client-provided checksums as a JSON object keyed by algorithm;
     /// empty object when none.
     pub checksums: serde_json::Value,
+    /// Object tag-set as JSON array of {key, value}; empty array when none.
+    pub tags: serde_json::Value,
 }
 
 impl Repository {
@@ -97,6 +99,7 @@ mod tests {
                     content: serde_json::json!({}),
                     user_metadata: serde_json::json!({}),
                     checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
                 },
                 PutCondition::IfNoneMatchAny,
             )
@@ -117,6 +120,7 @@ mod tests {
                     content: serde_json::json!({}),
                     user_metadata: serde_json::json!({}),
                     checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
                 },
                 PutCondition::IfNoneMatchAny,
             )
