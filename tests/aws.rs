@@ -2134,8 +2134,114 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
     };
     assert_eq!(
         err.and_then(|e| e.code().map(|c| c.to_owned())),
-        Some("NoSuchBucket".to_string())
+        Some("NoSuchKey".to_string())
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_recreate_bucket_is_idempotent() -> anyhow::Result<()> {
+    let config = config::<0, 0>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "recreate-bucket-idempotent";
+
+    let location = BucketLocationConstraint::from(REGION);
+    let cfg = || {
+        CreateBucketConfiguration::builder()
+            .location_constraint(location.clone())
+            .build()
+    };
+
+    let _ = client
+        .create_bucket()
+        .create_bucket_configuration(cfg())
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("first create bucket")?;
+
+    // Recreating an owned bucket succeeds (S3 200), no duplicate row.
+    let _ = client
+        .create_bucket()
+        .create_bucket_configuration(cfg())
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("second create bucket")?;
+
+    let count = {
+        let res = client.list_buckets().send().await.context("list bucket")?;
+        res.buckets()
+            .iter()
+            .filter(|bucket| bucket.name().is_some_and(|name| name == bucket_name))
+            .count()
+    };
+    assert_eq!(count, 1, "bucket should appear exactly once");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_bucket_blocked_by_inflight_upload() -> anyhow::Result<()> {
+    let config = config::<1, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "delete-bucket-with-upload";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let upload_id = {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key("obj")
+            .send()
+            .await
+            .context("create multipart upload")?;
+        res.upload_id.context("missing upload id")?
+    };
+
+    // In-flight uploads block deletion like pending objects do.
+    let err = {
+        let res = client.delete_bucket().bucket(bucket_name).send().await;
+        res.err()
+    };
+    assert_eq!(
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        Some("BucketNotEmpty".to_string())
+    );
+
+    // After aborting, deletion succeeds.
+    let _ = client
+        .abort_multipart_upload()
+        .bucket(bucket_name)
+        .key("obj")
+        .upload_id(upload_id)
+        .send()
+        .await
+        .context("abort multipart upload")?;
+
+    let _ = client
+        .delete_bucket()
+        .bucket(bucket_name)
+        .send()
+        .await
+        .context("delete bucket")?;
 
     Ok(())
 }

@@ -1,6 +1,6 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::prelude::Expr;
-use sea_orm::{ColumnTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter, Set, SqlErr};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, SqlErr};
 use tracing::instrument;
 
 use super::Repository;
@@ -50,19 +50,17 @@ impl Repository {
         entity::bucket::Entity::insert(active_model)
             .exec(&self.db)
             .await
-            .map_err(|e| match e {
-                DbErr::Exec(e) => {
-                    let err = DbErr::Exec(e);
+            .map_err(|e| {
+                // Constraint failures surface as either Exec or Query
+                // depending on the driver path; check both.
+                let conflict =
+                    matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
 
-                    match err.sql_err() {
-                        Some(SqlErr::UniqueConstraintViolation(_)) => {
-                            S3Error::new(S3ErrorCode::BucketAlreadyExists)
-                        }
-                        _ => S3Error::internal_error(err),
-                    }
+                if conflict {
+                    S3Error::new(S3ErrorCode::BucketAlreadyExists)
+                } else {
+                    S3Error::internal_error(e)
                 }
-
-                e => S3Error::internal_error(e),
             })?;
 
         Ok(())

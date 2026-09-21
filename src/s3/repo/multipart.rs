@@ -1,7 +1,7 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::prelude::Expr;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set};
 use tracing::instrument;
 
 use super::Repository;
@@ -99,6 +99,17 @@ impl Repository {
         }
 
         Ok((models, is_truncated))
+    }
+
+    #[instrument(skip(self), level = "debug", err)]
+    pub async fn get_bucket_upload_count(&self, bucket: &str) -> S3Result<u64> {
+        let count = entity::multipart_upload_state::Entity::find()
+            .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
+            .count(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(count)
     }
 
     pub async fn get_multipart_upload_state(
