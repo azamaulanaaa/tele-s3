@@ -265,6 +265,28 @@ pub(crate) fn build_put_condition(
     })
 }
 
+/// Build an error for requests addressing a delete marker.
+///
+/// S3 answers GET/HEAD on a delete-marker latest (or version-addressed
+/// marker reads) with the usual error code but carries
+/// `x-amz-delete-marker: true` and `x-amz-version-id` headers so clients
+/// can tell a versioned delete from a missing key.
+pub(crate) fn delete_marker_error(version_id: &str, code: S3ErrorCode) -> S3Error {
+    let mut err = S3Error::new(code);
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        s3s::header::X_AMZ_DELETE_MARKER,
+        http::HeaderValue::from_static("true"),
+    );
+    if let Ok(value) = http::HeaderValue::from_str(version_id) {
+        headers.insert(s3s::header::X_AMZ_VERSION_ID, value);
+    }
+    err.set_headers(headers);
+
+    err
+}
+
 /// Check conditional GET/HEAD headers. Returns Err with appropriate S3ErrorCode if condition fails.
 /// For `If-Match` / `If-Unmodified-Since` failures -> PreconditionFailed (412)
 /// For `If-None-Match` / `If-Modified-Since` not modified -> NotModified (304)
