@@ -4010,6 +4010,7 @@ dependencies = [
  "grammers-client",
  "grammers-mtsender",
  "hex",
+ "http 1.4.0",
  "hyper-util",
  "md-5 0.10.6",
  "ran",

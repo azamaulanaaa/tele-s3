@@ -23,8 +23,9 @@ use tracing::instrument;
 use super::TeleS3;
 use super::helpers::{
     StreamingBlobExt, build_put_condition, canned_owner, check_conditional_get, checksums_to_json,
-    chrono_to_timestamp, full_control_grant, json_to_checksum_fields, json_to_metadata,
-    json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json, verify_checksums,
+    chrono_to_timestamp, delete_marker_error, full_control_grant, json_to_checksum_fields,
+    json_to_metadata, json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json,
+    verify_checksums,
 };
 use super::repo::ObjectWrite;
 use super::types::{Metadata, MetadataItem};
@@ -399,13 +400,33 @@ impl<B: Backend> TeleS3<B> {
                 .await?;
             // Addressing a delete marker by version is MethodNotAllowed (405).
             if model.is_delete_marker {
-                return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+                return Err(delete_marker_error(
+                    &model.version_id,
+                    S3ErrorCode::MethodNotAllowed,
+                ));
             }
             model
         } else {
-            self.repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await?
+            match self.repo.get_object(&req.input.bucket, &req.input.key).await {
+                Ok(model) => model,
+                Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
+                    // A delete-marker latest reads as NoSuchKey, but S3 still
+                    // reports which marker hides the key.
+                    if let Some(marker) = self
+                        .repo
+                        .get_latest_raw(&req.input.bucket, &req.input.key)
+                        .await?
+                        && marker.is_delete_marker
+                    {
+                        return Err(delete_marker_error(
+                            &marker.version_id,
+                            S3ErrorCode::NoSuchKey,
+                        ));
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
         };
 
         // Conditional GET checks (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since)
@@ -513,13 +534,33 @@ impl<B: Backend> TeleS3<B> {
                 .await?;
             // Addressing a delete marker by version is MethodNotAllowed (405).
             if model.is_delete_marker {
-                return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+                return Err(delete_marker_error(
+                    &model.version_id,
+                    S3ErrorCode::MethodNotAllowed,
+                ));
             }
             model
         } else {
-            self.repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await?
+            match self.repo.get_object(&req.input.bucket, &req.input.key).await {
+                Ok(model) => model,
+                Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
+                    // A delete-marker latest reads as NoSuchKey, but S3 still
+                    // reports which marker hides the key.
+                    if let Some(marker) = self
+                        .repo
+                        .get_latest_raw(&req.input.bucket, &req.input.key)
+                        .await?
+                        && marker.is_delete_marker
+                    {
+                        return Err(delete_marker_error(
+                            &marker.version_id,
+                            S3ErrorCode::NoSuchKey,
+                        ));
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
         };
 
         check_conditional_get(
@@ -1201,5 +1242,182 @@ fn delete_key_error(key: String, version_id: Option<String>, err: &S3Error) -> E
         key: Some(key),
         message: err.message().map(str::to_owned),
         version_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Memory;
+    use crate::s3::TeleS3;
+
+    async fn test_service() -> TeleS3<Memory<1, 1>> {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        TeleS3::init(Memory::default(), db).await.expect("init")
+    }
+
+    fn get_req(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<GetObjectInput> {
+        S3Request {
+            input: GetObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn head_req(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
+        S3Request {
+            input: HeadObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id,
+                ..Default::default()
+            },
+            method: http::Method::HEAD,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn versioned_bucket_with_marker(svc: &TeleS3<Memory<1, 1>>) -> String {
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.repo
+            .put_bucket_versioning("b", Some("Enabled".into()))
+            .await
+            .expect("enable versioning");
+        svc.repo
+            .cas_put_object(
+                "b".into(),
+                "k".into(),
+                ObjectWrite {
+                    size: 0,
+                    content_type: None,
+                    etag: Some("e1".into()),
+                    content: serde_json::json!({"item": []}),
+                    user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                },
+                super::super::repo::PutCondition::None,
+            )
+            .await
+            .expect("put object");
+
+        let (marker, is_marker) = svc
+            .repo
+            .delete_object_versioned("b", "k", None)
+            .await
+            .expect("delete object");
+        assert!(is_marker, "delete should create a marker");
+        marker.expect("marker model").version_id
+    }
+
+    #[tokio::test]
+    async fn get_on_delete_marker_reports_marker_headers() {
+        let svc = test_service().await;
+        let marker_vid = versioned_bucket_with_marker(&svc).await;
+
+        let err = svc
+            .get_object_inner(get_req("b", "k", None))
+            .await
+            .expect_err("get on marker should fail");
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchKey);
+
+        // s3s renders S3Error headers on the wire; take_headers is
+        // crate-private to s3s, so assert through the Debug rendering.
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("x-amz-delete-marker"),
+            "missing delete-marker header: {debug}"
+        );
+        assert!(
+            debug.contains(&marker_vid),
+            "missing marker version id: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_on_delete_marker_reports_marker_headers() {
+        let svc = test_service().await;
+        let marker_vid = versioned_bucket_with_marker(&svc).await;
+
+        let err = svc
+            .head_object_inner(head_req("b", "k", None))
+            .await
+            .expect_err("head on marker should fail");
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchKey);
+
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("x-amz-delete-marker"),
+            "missing delete-marker header: {debug}"
+        );
+        assert!(
+            debug.contains(&marker_vid),
+            "missing marker version id: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_addressed_marker_read_reports_marker_headers() {
+        let svc = test_service().await;
+        let marker_vid = versioned_bucket_with_marker(&svc).await;
+
+        let err = svc
+            .get_object_inner(get_req("b", "k", Some(marker_vid.clone())))
+            .await
+            .expect_err("versioned marker read should fail");
+        assert_eq!(*err.code(), S3ErrorCode::MethodNotAllowed);
+
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("x-amz-delete-marker"),
+            "missing delete-marker header: {debug}"
+        );
+        assert!(
+            debug.contains(&marker_vid),
+            "missing marker version id: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_key_has_no_delete_marker_headers() {
+        let svc = test_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let err = svc
+            .get_object_inner(get_req("b", "missing", None))
+            .await
+            .expect_err("get on missing key should fail");
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchKey);
+
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("x-amz-delete-marker"),
+            "plain missing key must not claim a marker: {debug}"
+        );
     }
 }

@@ -284,6 +284,18 @@ impl Repository {
             .map(|m| m.version_id))
     }
 
+    /// Latest version row even if it is a delete marker (`None` when the
+    /// key has no versions at all). Used to attach delete-marker headers
+    /// to GET/HEAD errors.
+    #[instrument(skip(self), level = "debug", err)]
+    pub async fn get_latest_raw(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<Option<entity::object::Model>> {
+        self.get_latest_model(bucket, key).await
+    }
+
     #[instrument(skip(self, data), level = "debug", err)]
     pub async fn upsert_object(
         &self,
