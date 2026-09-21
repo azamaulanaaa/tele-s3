@@ -125,7 +125,7 @@ impl Repository {
                 content_type: Set(data.content_type),
                 etag: Set(data.etag),
                 user_metadata: Set(data.user_metadata),
-                tags: Set(serde_json::json!([])),
+                tags: Set(data.tags),
                 checksums: Set(data.checksums),
                 content: Set(data.content),
             };
@@ -144,6 +144,7 @@ impl Repository {
                         entity::object::Column::Etag,
                         entity::object::Column::Content,
                         entity::object::Column::UserMetadata,
+                        entity::object::Column::Tags,
                         entity::object::Column::Checksums,
                         entity::object::Column::IsLatest,
                         entity::object::Column::IsDeleteMarker,
@@ -180,7 +181,7 @@ impl Repository {
                 content_type: Set(data.content_type),
                 etag: Set(data.etag),
                 user_metadata: Set(data.user_metadata),
-                tags: Set(serde_json::json!([])),
+                tags: Set(data.tags),
                 checksums: Set(data.checksums),
                 content: Set(data.content),
             };
@@ -215,7 +216,7 @@ impl Repository {
                 content_type: Set(data.content_type),
                 etag: Set(data.etag),
                 user_metadata: Set(data.user_metadata),
-                tags: Set(serde_json::json!([])),
+                tags: Set(data.tags),
                 checksums: Set(data.checksums),
                 content: Set(data.content),
             };
@@ -234,6 +235,7 @@ impl Repository {
                         entity::object::Column::Etag,
                         entity::object::Column::Content,
                         entity::object::Column::UserMetadata,
+                        entity::object::Column::Tags,
                         entity::object::Column::Checksums,
                         entity::object::Column::IsLatest,
                         entity::object::Column::IsDeleteMarker,

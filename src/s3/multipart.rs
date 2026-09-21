@@ -20,7 +20,8 @@ use tracing::instrument;
 
 use super::TeleS3;
 use super::helpers::{
-    StreamingBlobExt, build_put_condition, chrono_to_timestamp, metadata_to_json, verify_checksums,
+    StreamingBlobExt, build_put_condition, chrono_to_timestamp, metadata_to_json,
+    tagging_header_to_json, verify_checksums,
 };
 use super::repo::ObjectWrite;
 use super::types::{Metadata, MetadataItem, MultipartUploadPart};
@@ -38,6 +39,7 @@ impl<B: Backend> TeleS3<B> {
 
         let content = BTreeMap::<i32, MultipartUploadPart>::new();
         let content_json = serde_json::to_value(&content).map_err(S3Error::internal_error)?;
+        let tags = tagging_header_to_json(req.input.tagging.as_deref())?;
 
         self.repo
             .upsert_multipart_upload_state(
@@ -46,6 +48,7 @@ impl<B: Backend> TeleS3<B> {
                 upload_id.clone(),
                 req.input.content_type,
                 metadata_to_json(req.input.metadata.clone()),
+                tags,
                 content_json,
             )
             .await?;
@@ -304,6 +307,8 @@ impl<B: Backend> TeleS3<B> {
             content: metadata_json,
             user_metadata: model.user_metadata,
             checksums: serde_json::json!({}),
+            // Pre-tag uploads store NULL; they had no tag support.
+            tags: model.tags.clone().unwrap_or(serde_json::json!([])),
         };
 
         let version_id = self

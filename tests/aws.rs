@@ -2776,3 +2776,97 @@ async fn test_delete_objects_reports_per_key_errors() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_put_object_tagging_header_preserved() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "put-tagging-header";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    // Tags sent on PutObject must stick without a separate tagging call.
+    let _ = client
+        .put_object()
+        .bucket(bucket_name)
+        .key("tagged")
+        .body(ByteStream::from_static(b"data".as_slice()))
+        .tagging("env=prod&team=infra")
+        .send()
+        .await
+        .context("put object with tagging")?;
+
+    let tags = client
+        .get_object_tagging()
+        .bucket(bucket_name)
+        .key("tagged")
+        .send()
+        .await
+        .context("get object tagging")?
+        .tag_set;
+
+    assert_eq!(tags.len(), 2, "expected two tags, got {tags:?}");
+    assert_eq!(tags[0].key, "env");
+    assert_eq!(tags[0].value, "prod");
+    assert_eq!(tags[1].key, "team");
+    assert_eq!(tags[1].value, "infra");
+
+    // CopyObject defaults to TaggingDirective COPY.
+    let _ = client
+        .copy_object()
+        .bucket(bucket_name)
+        .key("copied")
+        .copy_source(format!("{bucket_name}/tagged"))
+        .send()
+        .await
+        .context("copy object")?;
+
+    let tags = client
+        .get_object_tagging()
+        .bucket(bucket_name)
+        .key("copied")
+        .send()
+        .await
+        .context("get copied tagging")?
+        .tag_set;
+    assert_eq!(tags.len(), 2, "copy should carry tags, got {tags:?}");
+
+    // REPLACE swaps the set.
+    let _ = client
+        .copy_object()
+        .bucket(bucket_name)
+        .key("replaced")
+        .copy_source(format!("{bucket_name}/tagged"))
+        .tagging_directive("REPLACE".into())
+        .tagging("solo=yes")
+        .send()
+        .await
+        .context("copy with replace")?;
+
+    let tags = client
+        .get_object_tagging()
+        .bucket(bucket_name)
+        .key("replaced")
+        .send()
+        .await
+        .context("get replaced tagging")?
+        .tag_set;
+    assert_eq!(tags.len(), 1, "replace should swap tags, got {tags:?}");
+    assert_eq!(tags[0].key, "solo");
+
+    Ok(())
+}

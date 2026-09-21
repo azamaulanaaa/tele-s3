@@ -9,6 +9,7 @@ use super::entity;
 
 impl Repository {
     #[instrument(skip(self), level = "debug", err)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_multipart_upload_state(
         &self,
         bucket: String,
@@ -16,6 +17,7 @@ impl Repository {
         upload_id: String,
         content_type: Option<String>,
         user_metadata: serde_json::Value,
+        tags: serde_json::Value,
         content: serde_json::Value,
     ) -> S3Result<()> {
         let active_model = entity::multipart_upload_state::ActiveModel {
@@ -24,6 +26,7 @@ impl Repository {
             upload_id: Set(upload_id),
             content_type: Set(content_type),
             user_metadata: Set(user_metadata),
+            tags: Set(Some(tags)),
             content: Set(content),
         };
 
@@ -36,6 +39,7 @@ impl Repository {
                 ])
                 .update_columns([
                     entity::multipart_upload_state::Column::ContentType,
+                    entity::multipart_upload_state::Column::Tags,
                     entity::multipart_upload_state::Column::Content,
                 ])
                 .to_owned(),

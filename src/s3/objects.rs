@@ -24,7 +24,7 @@ use super::TeleS3;
 use super::helpers::{
     StreamingBlobExt, build_put_condition, canned_owner, check_conditional_get, checksums_to_json,
     chrono_to_timestamp, full_control_grant, json_to_checksum_fields, json_to_metadata,
-    json_to_tag_set, metadata_to_json, tags_to_json, verify_checksums,
+    json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json, verify_checksums,
 };
 use super::repo::ObjectWrite;
 use super::types::{Metadata, MetadataItem};
@@ -191,6 +191,8 @@ impl<B: Backend> TeleS3<B> {
             }
         };
 
+        let tags = tagging_header_to_json(req.input.tagging.as_deref())?;
+
         let data = ObjectWrite {
             size,
             content_type: req.input.content_type.take(),
@@ -198,6 +200,7 @@ impl<B: Backend> TeleS3<B> {
             content: content_json,
             user_metadata: metadata_to_json(req.input.metadata.take()),
             checksums: checksums.clone(),
+            tags,
         };
 
         let version_id = {
@@ -338,6 +341,18 @@ impl<B: Backend> TeleS3<B> {
             model.checksums.clone()
         };
 
+        // TaggingDirective defaults to COPY; REPLACE takes x-amz-tagging.
+        let is_tag_replace = req
+            .input
+            .tagging_directive
+            .as_ref()
+            .is_some_and(|d| d.as_str() == "REPLACE");
+        let tags = if is_tag_replace {
+            tagging_header_to_json(req.input.tagging.as_deref())?
+        } else {
+            model.tags.clone()
+        };
+
         let data = ObjectWrite {
             size,
             content_type,
@@ -345,6 +360,7 @@ impl<B: Backend> TeleS3<B> {
             content: content_json,
             user_metadata,
             checksums,
+            tags,
         };
 
         let version_id = self
