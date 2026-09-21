@@ -12,7 +12,7 @@ use s3s::{
 use tracing::instrument;
 
 use super::TeleS3;
-use super::helpers::{canned_owner, chrono_to_timestamp, full_control_grant};
+use super::helpers::{canned_owner, chrono_to_timestamp, full_control_grant, validate_bucket_name};
 use crate::backend::Backend;
 
 impl<B: Backend> TeleS3<B> {
@@ -21,9 +21,20 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        self.repo
+        validate_bucket_name(&req.input.bucket)?;
+
+        match self
+            .repo
             .create_bucket(req.input.bucket, req.region.clone().map(|v| v.to_string()))
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            // Single-tenant gateway: every existing bucket is owned by the
+            // requester, so recreating one is idempotent success (S3 200),
+            // including races between concurrent creates.
+            Err(err) if *err.code() == S3ErrorCode::BucketAlreadyExists => {}
+            Err(err) => return Err(err),
+        }
 
         let res = S3Response::new(CreateBucketOutput {
             location: req.region.map(|v| v.to_string()),
@@ -82,6 +93,12 @@ impl<B: Backend> TeleS3<B> {
 
         let object_count = self.repo.get_bucket_object_count(&req.input.bucket).await?;
         if object_count > 0 {
+            return Err(S3Error::new(S3ErrorCode::BucketNotEmpty));
+        }
+
+        // In-flight multipart uploads also block deletion, like S3.
+        let upload_count = self.repo.get_bucket_upload_count(&req.input.bucket).await?;
+        if upload_count > 0 {
             return Err(S3Error::new(S3ErrorCode::BucketNotEmpty));
         }
 
@@ -164,5 +181,106 @@ impl<B: Backend> TeleS3<B> {
             .put_bucket_versioning(&req.input.bucket, status_str)
             .await?;
         Ok(S3Response::new(PutBucketVersioningOutput::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Memory;
+    use crate::s3::TeleS3;
+
+    fn create_req(bucket: &str) -> S3Request<CreateBucketInput> {
+        S3Request {
+            input: CreateBucketInput {
+                bucket: bucket.to_string(),
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: format!("/{bucket}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn test_service() -> TeleS3<Memory<1, 1>> {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        TeleS3::init(Memory::default(), db).await.expect("init")
+    }
+
+    #[tokio::test]
+    async fn recreate_own_bucket_is_idempotent() {
+        let svc = test_service().await;
+
+        svc.create_bucket_inner(create_req("my-bucket"))
+            .await
+            .expect("first create");
+        svc.create_bucket_inner(create_req("my-bucket"))
+            .await
+            .expect("second create should succeed idempotently");
+
+        let buckets = svc.repo.list_buckets().await.expect("list");
+        assert_eq!(
+            buckets.iter().filter(|b| b.id == "my-bucket").count(),
+            1,
+            "duplicate bucket row created"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_bucket_name_rejected() {
+        let svc = test_service().await;
+
+        let err = svc
+            .create_bucket_inner(create_req("Invalid_Name"))
+            .await
+            .expect_err("should fail");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidBucketName);
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_blocked_by_inflight_upload() {
+        let svc = test_service().await;
+
+        svc.create_bucket_inner(create_req("mpu-bucket"))
+            .await
+            .expect("create");
+        svc.repo
+            .upsert_multipart_upload_state(
+                "mpu-bucket".into(),
+                "k".into(),
+                "upload-1".into(),
+                None,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create upload");
+
+        let err = svc
+            .delete_bucket_inner(S3Request {
+                input: DeleteBucketInput {
+                    bucket: "mpu-bucket".to_string(),
+                    ..Default::default()
+                },
+                method: http::Method::DELETE,
+                uri: "/mpu-bucket".parse().expect("uri"),
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::default(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            })
+            .await
+            .expect_err("should fail");
+        assert_eq!(*err.code(), S3ErrorCode::BucketNotEmpty);
     }
 }
