@@ -56,23 +56,49 @@ impl Repository {
         &self,
         bucket: &str,
         prefix: Option<&str>,
-    ) -> S3Result<Vec<entity::multipart_upload_state::Model>> {
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: Option<i32>,
+    ) -> S3Result<(Vec<entity::multipart_upload_state::Model>, bool)> {
         let mut query = entity::multipart_upload_state::Entity::find()
             .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket));
 
         if let Some(prefix) = prefix {
-            query = query
-                .filter(entity::multipart_upload_state::Column::ObjectId.starts_with(prefix))
-                .order_by_asc(entity::multipart_upload_state::Column::ObjectId);
+            query = query.filter(
+                entity::multipart_upload_state::Column::ObjectId.starts_with(prefix),
+            );
         }
 
-        let models = query
+        let mut models = query
             .order_by_asc(entity::multipart_upload_state::Column::ObjectId)
+            .order_by_asc(entity::multipart_upload_state::Column::UploadId)
             .all(&self.db)
             .await
             .map_err(S3Error::internal_error)?;
 
-        Ok(models)
+        // S3 key-marker semantics: start after (key_marker, upload_id_marker).
+        if let Some(km) = key_marker {
+            models.retain(|m| {
+                if m.object_id.as_str() > km {
+                    true
+                } else if m.object_id.as_str() == km {
+                    match upload_id_marker {
+                        Some(uid) => m.upload_id.as_str() > uid,
+                        None => false,
+                    }
+                } else {
+                    false
+                }
+            });
+        }
+
+        let limit = std::cmp::max(max_uploads.unwrap_or(1000), 0) as usize;
+        let is_truncated = models.len() > limit;
+        if is_truncated {
+            models.truncate(limit);
+        }
+
+        Ok((models, is_truncated))
     }
 
     pub async fn get_multipart_upload_state(

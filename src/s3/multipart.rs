@@ -446,33 +446,42 @@ impl<B: Backend> TeleS3<B> {
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
         self.repo.get_bucket(&req.input.bucket).await?;
 
-        let models = self
+        let (models, is_truncated) = self
             .repo
-            .list_multipart_uploads(&req.input.bucket, req.input.prefix.as_deref())
+            .list_multipart_uploads(
+                &req.input.bucket,
+                req.input.prefix.as_deref(),
+                req.input.key_marker.as_deref(),
+                req.input.upload_id_marker.as_deref(),
+                req.input.max_uploads,
+            )
             .await?;
 
-        // Ordered by key ascending (repo query).
-        let mut uploads: Vec<MultipartUpload> = models
-            .into_iter()
+        // Ordered by (key, upload_id) ascending (repo query).
+        let uploads: Vec<MultipartUpload> = models
+            .iter()
             .map(|model| MultipartUpload {
-                key: Some(model.object_id),
-                upload_id: Some(model.upload_id),
+                key: Some(model.object_id.clone()),
+                upload_id: Some(model.upload_id.clone()),
                 ..Default::default()
             })
             .collect();
 
-        let mut is_truncated = false;
-
-        if let Some(max_uploads) = req.input.max_uploads
-            && uploads.len() > max_uploads as usize
-        {
-            uploads.truncate(max_uploads as usize);
-            is_truncated = true;
+        let (next_key_marker, next_upload_id_marker) = if is_truncated {
+            models.last().map(|m| (m.object_id.clone(), m.upload_id.clone()))
+        } else {
+            None
         }
+        .map(|(k, u)| (Some(k), Some(u)))
+        .unwrap_or((None, None));
 
         let res = S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(req.input.bucket),
             uploads: Some(uploads),
+            key_marker: req.input.key_marker,
+            upload_id_marker: req.input.upload_id_marker,
+            next_key_marker,
+            next_upload_id_marker,
             max_uploads: req.input.max_uploads,
             is_truncated: Some(is_truncated),
             prefix: req.input.prefix,
