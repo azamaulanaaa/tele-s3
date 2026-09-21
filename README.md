@@ -10,10 +10,11 @@ Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](htt
 
 - **S3 API** — `CreateBucket`/`DeleteBucket`/`HeadBucket`/`ListBuckets`/`GetBucketLocation`/`GetBucketVersioning`/`PutBucketVersioning`
 - **Objects** — `PutObject`/`GetObject`/`HeadObject`/`DeleteObject`/`DeleteObjects`/`CopyObject`/`ListObjects`/`ListObjectsV2`/`ListObjectVersions`
-- **Multipart** — `CreateMultipartUpload`/`UploadPart`/`UploadPartCopy`/`CompleteMultipartUpload`/`AbortMultipartUpload`/`ListParts`/`ListMultipartUploads`
+- **Multipart** — `CreateMultipartUpload`/`UploadPart`/`UploadPartCopy`/`CompleteMultipartUpload`/`AbortMultipartUpload`/`ListParts`/`ListMultipartUploads` (with `key-marker`/`upload-id-marker` pagination)
 - **Versioning** — `Enabled` / `Suspended` per bucket, `versionId` on every `Put`/`Copy`/`Complete`, delete markers, `ListObjectVersions`, `GET ?versionId`
 - **Presigned URLs** — Standard AWS SigV4 `X-Amz-Signature` query auth (`s3s` `v4_check_presigned_url`); generate client-side and share publicly, no custom `/share` endpoint required
-- **Other** — conditional reads (`If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` with `412`/`304`), conditional writes (`PutObject` `If-Match`/`If-None-Match` incl. `*`, `CompleteMultipartUpload` `If-Match`), `Content-MD5` validation, checksums (`crc32`/`crc32c`/`sha1`/`sha256` verified, `BadDigest`/`InvalidRequest` on mismatch, echoed on `Put`/`Get`/`Head`/`Copy`/`UploadPart`), user metadata (`x-amz-meta-*`), tagging (`Get/Put/DeleteObjectTagging`), ACL stubs, blob ref-counting for shared slices
+- **Buckets** — DNS-compliant name validation (`InvalidBucketName`), idempotent recreate of an owned bucket (200, no duplicate row), `DeleteBucket` rejected with `BucketNotEmpty` while multipart uploads are in flight
+- **Other** — conditional reads (`If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` with `412`/`304`), conditional writes (`PutObject` `If-Match`/`If-None-Match` incl. `*`, `CompleteMultipartUpload` `If-Match`, transactional CAS so concurrent versioned puts leave a single latest), `Content-MD5` validation, checksums (`crc32`/`crc32c`/`sha1`/`sha256` verified, `BadDigest`/`InvalidRequest` on mismatch, echoed on `Put`/`Get`/`Head`/`Copy`/`UploadPart`), user metadata (`x-amz-meta-*`), tagging (`Get/Put/DeleteObjectTagging`, plus `x-amz-tagging` header preserved on `Put`/`Copy`/`CreateMultipartUpload`/`Complete` with `TaggingDirective COPY`/`REPLACE`), delete-marker headers (`x-amz-delete-marker: true` on `GET`/`HEAD` of a marker), backend error mapping (`EntityTooLarge` on over-capacity writes, `InvalidRange` on out-of-range reads), ACL stubs, blob ref-counting for shared slices
 
 ## Quick Start
 
@@ -168,7 +169,7 @@ Blob ref-counting keeps shared slices (e.g. `UploadPartCopy` ranges, `CopyObject
 ## Development
 
 ```bash
-cargo test --locked --all-targets # 11 lib + 31 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yaml`)
+cargo test --locked --all-targets # 21 lib + 36 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yaml`)
 cargo test --test presigned -- --nocapture # presigned generation only (no endpoint)
 ```
 
