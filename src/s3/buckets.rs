@@ -38,6 +38,7 @@ impl<B: Backend> TeleS3<B> {
 
         let res = S3Response::new(CreateBucketOutput {
             location: req.region.map(|v| v.to_string()),
+            bucket_arn: None,
         });
 
         Ok(res)
@@ -70,6 +71,7 @@ impl<B: Backend> TeleS3<B> {
                 name: Some(model.id),
                 creation_date: Some(chrono_to_timestamp(model.created_at)),
                 bucket_region: model.region,
+                bucket_arn: None,
             })
             .collect();
 

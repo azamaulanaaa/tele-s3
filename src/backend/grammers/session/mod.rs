@@ -1,11 +1,10 @@
 use std::{
-    default::Default,
     net::{Ipv4Addr, SocketAddrV4, SocketAddrV6},
     ops::Deref,
 };
 
-use grammers_client::session::{
-    Session,
+use grammers_session::{
+    BoxFuture, Session,
     types::{
         ChannelKind, ChannelState, DcOption, PeerAuth, PeerId, PeerInfo, PeerKind, UpdateState,
         UpdatesState,
@@ -137,8 +136,10 @@ const KNOWN_DC_OPTIONS: [DcOption; 5] = [
 ];
 
 impl Session for SessionStorage {
+    type Error = SessionStorageError;
+
     #[instrument(skip(self), level = "debug", ret)]
-    fn home_dc_id(&self) -> i32 {
+    fn home_dc_id(&self) -> Result<i32, Self::Error> {
         let result = self.run_blocking(async {
             entity::dc_home::Entity::find()
                 .one(&self.inner)
@@ -147,19 +148,19 @@ impl Session for SessionStorage {
         });
 
         match result {
-            Ok(Some(v)) => v,
-            Ok(None) => DEFAULT_DC,
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(DEFAULT_DC),
             Err(e) => {
                 error!(error = ?e, "Failed to query Home DC");
 
-                DEFAULT_DC
+                Err(e.into())
             }
         }
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn set_home_dc_id(&self, dc_id: i32) {
-        let result: Result<(), DbErr> = self.run_blocking(async {
+    fn set_home_dc_id(&self, dc_id: i32) -> BoxFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
             let txn = self.begin().await?;
 
             let _ = entity::dc_home::Entity::delete_many().exec(&txn).await?;
@@ -170,43 +171,19 @@ impl Session for SessionStorage {
             txn.commit().await?;
 
             Ok(())
-        });
-
-        if let Err(e) = result {
-            error!(
-                error = ?e,
-                dc_id = dc_id,
-                "Failed to set Home DC"
-            );
-        }
+        })
     }
 
     #[instrument(skip(self), level = "debug", ret)]
-    fn dc_option(&self, dc_id: i32) -> Option<grammers_client::session::types::DcOption> {
-        let result: Result<Option<_>, DbErr> = self.run_blocking(async {
-            let dc_option = entity::dc_option::Entity::find()
+    fn dc_option(&self, dc_id: i32) -> Result<Option<DcOption>, Self::Error> {
+        let row: Option<entity::dc_option::Model> = self.run_blocking(async {
+            entity::dc_option::Entity::find()
                 .filter(entity::dc_option::Column::DcId.eq(dc_id))
                 .one(&self.inner)
-                .await?;
+                .await
+        })?;
 
-            Ok(dc_option)
-        });
-
-        let dc_option = match result {
-            Ok(Some(v)) => Some(v),
-            Ok(None) => None,
-            Err(e) => {
-                error!(
-                    error = ?e,
-                    dc_id = dc_id,
-                    "Failed to query DC Option. find from default list."
-                );
-
-                None
-            }
-        };
-
-        let dc_option = dc_option.and_then(|v| {
+        let dc_option = row.and_then(|v| {
             let ipv4 = v.ipv4.parse();
             let ipv6 = v.ipv6.parse();
 
@@ -245,15 +222,16 @@ impl Session for SessionStorage {
                 .find(|dc_option| dc_option.id == dc_id)
                 .cloned();
 
-            return fallback;
+            return Ok(fallback);
         }
 
-        dc_option
+        Ok(dc_option)
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn set_dc_option(&self, dc_option: &DcOption) {
-        let result: Result<(), DbErr> = self.run_blocking(async {
+    fn set_dc_option(&self, dc_option: &DcOption) -> BoxFuture<'_, Result<(), Self::Error>> {
+        let dc_option = dc_option.clone();
+        Box::pin(async move {
             let txn = self.begin().await?;
 
             entity::dc_option::Entity::delete_many()
@@ -272,126 +250,104 @@ impl Session for SessionStorage {
             txn.commit().await?;
 
             Ok(())
-        });
-
-        if let Err(e) = result {
-            error!(
-                error = ?e,
-                "Failed to set DC Option"
-            );
-        }
+        })
     }
 
     #[instrument(skip(self), level = "debug", ret)]
-    fn peer(&self, peer: PeerId) -> Option<PeerInfo> {
-        let peer_info: Result<Option<_>, DbErr> = self.run_blocking(async {
-            let peer_info = match peer.kind() {
-                PeerKind::UserSelf => {
-                    entity::peer_info::Entity::find()
-                        .filter(
-                            entity::peer_info::Column::Subtype
-                                .into_expr()
-                                .bit_and(PeerSubtype::UserSelf as i32),
-                        )
-                        .one(&self.inner)
-                        .await?
-                }
-                _ => {
-                    entity::peer_info::Entity::find()
-                        .filter(entity::peer_info::Column::PeerId.eq(peer.bot_api_dialog_id()))
-                        .one(&self.inner)
-                        .await?
-                }
+    fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, Self::Error>> {
+        Box::pin(async move {
+            let row = if let Some(dialog_id) = peer.bot_api_dialog_id() {
+                entity::peer_info::Entity::find()
+                    .filter(entity::peer_info::Column::PeerId.eq(dialog_id))
+                    .one(&self.inner)
+                    .await?
+            } else {
+                // Sentinel self-user id without a known identifier: find the
+                // cached self user via its subtype bit instead.
+                entity::peer_info::Entity::find()
+                    .filter(
+                        entity::peer_info::Column::Subtype
+                            .into_expr()
+                            .bit_and(PeerSubtype::UserSelf as i32),
+                    )
+                    .one(&self.inner)
+                    .await?
             };
 
-            Ok(peer_info)
-        });
+            let Some(row) = row else {
+                return Ok(None);
+            };
 
-        let peer_info = match peer_info {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                return None;
-            }
-            Err(e) => {
-                error!(
-                    error = ?e,
-                    "Failed to query Peer Info"
-                );
-
-                return None;
-            }
-        };
-
-        let peer_info = match peer.kind() {
-            PeerKind::User | PeerKind::UserSelf => PeerInfo::User {
-                id: PeerId::user(peer_info.peer_id).bare_id(),
-                auth: peer_info.hash.map(PeerAuth::from_hash),
-                bot: peer_info
-                    .subtype
-                    .map(|v| v & PeerSubtype::UserBot as u8 != 0),
-                is_self: peer_info
-                    .subtype
-                    .map(|v| v & PeerSubtype::UserSelf as u8 != 0),
-            },
-            PeerKind::Chat => PeerInfo::Chat { id: peer.bare_id() },
-            PeerKind::Channel => PeerInfo::Channel {
-                id: peer.bare_id(),
-                auth: peer_info.hash.map(PeerAuth::from_hash),
-                kind: peer_info.subtype.and_then(|s| {
-                    if (s & PeerSubtype::Gigagroup as u8) == PeerSubtype::Gigagroup as u8 {
-                        Some(ChannelKind::Gigagroup)
-                    } else if s & PeerSubtype::Broadcast as u8 != 0 {
-                        Some(ChannelKind::Broadcast)
-                    } else if s & PeerSubtype::Megagroup as u8 != 0 {
-                        Some(ChannelKind::Megagroup)
-                    } else {
-                        None
-                    }
-                }),
-            },
-        };
-
-        Some(peer_info)
+            Ok(Some(match peer.kind() {
+                PeerKind::User => PeerInfo::User {
+                    id: PeerId::user_unchecked(row.peer_id).bare_id_unchecked(),
+                    auth: row.hash.map(PeerAuth::from_hash),
+                    bot: row.subtype.map(|v| v & PeerSubtype::UserBot as u8 != 0),
+                    is_self: row.subtype.map(|v| v & PeerSubtype::UserSelf as u8 != 0),
+                },
+                PeerKind::Chat => PeerInfo::Chat {
+                    id: peer.bare_id_unchecked(),
+                },
+                PeerKind::Channel => PeerInfo::Channel {
+                    id: peer.bare_id_unchecked(),
+                    auth: row.hash.map(PeerAuth::from_hash),
+                    kind: row.subtype.and_then(|s| {
+                        if (s & PeerSubtype::Gigagroup as u8) == PeerSubtype::Gigagroup as u8 {
+                            Some(ChannelKind::Gigagroup)
+                        } else if s & PeerSubtype::Broadcast as u8 != 0 {
+                            Some(ChannelKind::Broadcast)
+                        } else if s & PeerSubtype::Megagroup as u8 != 0 {
+                            Some(ChannelKind::Megagroup)
+                        } else {
+                            None
+                        }
+                    }),
+                },
+            }))
+        })
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn cache_peer(&self, peer: &PeerInfo) {
-        let subtype = match peer {
-            PeerInfo::User { bot, is_self, .. } => {
-                match (bot.unwrap_or_default(), is_self.unwrap_or_default()) {
-                    (true, true) => Some(PeerSubtype::UserSelfBot),
-                    (true, false) => Some(PeerSubtype::UserBot),
-                    (false, true) => Some(PeerSubtype::UserSelf),
-                    (false, false) => None,
+    fn cache_peer(&self, peer: &PeerInfo) -> BoxFuture<'_, Result<(), Self::Error>> {
+        let peer = peer.clone();
+        Box::pin(async move {
+            // Merge with any previously-cached info, like upstream does.
+            let peer = if let Some(mut existing) = self.peer(peer.id()).await? {
+                existing.extend_info(&peer);
+                existing
+            } else {
+                peer
+            };
+
+            let subtype = match &peer {
+                PeerInfo::User { bot, is_self, .. } => {
+                    match (bot.unwrap_or_default(), is_self.unwrap_or_default()) {
+                        (true, true) => Some(PeerSubtype::UserSelfBot),
+                        (true, false) => Some(PeerSubtype::UserBot),
+                        (false, true) => Some(PeerSubtype::UserSelf),
+                        (false, false) => None,
+                    }
                 }
-            }
-            PeerInfo::Chat { .. } => None,
-            PeerInfo::Channel { kind, .. } => kind.map(|kind| match kind {
-                ChannelKind::Megagroup => PeerSubtype::Megagroup,
-                ChannelKind::Broadcast => PeerSubtype::Broadcast,
-                ChannelKind::Gigagroup => PeerSubtype::Gigagroup,
-            }),
-        };
+                PeerInfo::Chat { .. } => None,
+                PeerInfo::Channel { kind, .. } => kind.map(|kind| match kind {
+                    ChannelKind::Megagroup => PeerSubtype::Megagroup,
+                    ChannelKind::Broadcast => PeerSubtype::Broadcast,
+                    ChannelKind::Gigagroup => PeerSubtype::Gigagroup,
+                }),
+            };
 
-        let hash = {
-            let mut hash = None;
+            let hash = peer.auth().map(|auth| auth.hash());
 
-            if peer.auth() != PeerAuth::default() {
-                hash = Some(peer.auth().hash())
-            }
-
-            hash
-        };
-
-        let result: Result<(), DbErr> = self.run_blocking(async {
             let txn = self.begin().await?;
 
             entity::peer_info::Entity::delete_many()
-                .filter(entity::peer_info::Column::PeerId.eq(peer.id().bot_api_dialog_id()))
+                .filter(
+                    entity::peer_info::Column::PeerId.eq(peer.id().bot_api_dialog_id_unchecked()),
+                )
                 .exec(&txn)
                 .await?;
             entity::peer_info::ActiveModel {
-                peer_id: Set(peer.id().bot_api_dialog_id()),
+                peer_id: Set(peer.id().bot_api_dialog_id_unchecked()),
                 subtype: Set(subtype.map(|v| v as u8)),
                 hash: Set(hash),
             }
@@ -401,19 +357,12 @@ impl Session for SessionStorage {
             txn.commit().await?;
 
             Ok(())
-        });
-
-        if let Err(e) = result {
-            error!(
-                error = ?e,
-                "Failed to set Cache Peer"
-            );
-        }
+        })
     }
 
     #[instrument(skip(self), level = "debug", ret)]
-    fn updates_state(&self) -> UpdatesState {
-        let result: Result<_, DbErr> = self.run_blocking(async {
+    fn updates_state(&self) -> BoxFuture<'_, Result<UpdatesState, Self::Error>> {
+        Box::pin(async move {
             let txn = self.begin().await?;
 
             let update_state = entity::update_state::Entity::find().one(&txn).await?;
@@ -421,44 +370,33 @@ impl Session for SessionStorage {
 
             txn.commit().await?;
 
-            Ok((update_state, channels))
-        });
+            let mut update_state = update_state
+                .map(|v| UpdatesState {
+                    pts: v.pts,
+                    qts: v.qts,
+                    date: v.date,
+                    seq: v.seq,
+                    channels: Vec::new(),
+                })
+                .unwrap_or_default();
+            update_state.channels = channels
+                .into_iter()
+                .map(|v| ChannelState {
+                    id: v.peer_id,
+                    pts: v.pts,
+                })
+                .collect();
 
-        let (update_state, channels) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    error = ?e,
-                    "Failed to query Update State"
-                );
-
-                return Default::default();
-            }
-        };
-
-        let mut update_state = update_state
-            .map(|v| UpdatesState {
-                pts: v.pts,
-                qts: v.qts,
-                date: v.date,
-                seq: v.seq,
-                channels: Vec::new(),
-            })
-            .unwrap_or_default();
-        update_state.channels = channels
-            .into_iter()
-            .map(|v| ChannelState {
-                id: v.peer_id,
-                pts: v.pts,
-            })
-            .collect();
-
-        update_state
+            Ok(update_state)
+        })
     }
 
     #[instrument(skip(self, update_state), level = "debug")]
-    fn set_update_state(&self, update_state: UpdateState) {
-        let result: Result<(), DbErr> = self.run_blocking(async {
+    fn set_update_state(
+        &self,
+        update_state: UpdateState,
+    ) -> BoxFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
             let txn = self.begin().await?;
 
             match update_state {
@@ -558,13 +496,6 @@ impl Session for SessionStorage {
             txn.commit().await?;
 
             Ok(())
-        });
-
-        if let Err(e) = result {
-            error!(
-                error = ?e,
-                "Failed to set Update State"
-            );
-        }
+        })
     }
 }

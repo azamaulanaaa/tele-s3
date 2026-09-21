@@ -8,8 +8,9 @@ license-file = "LICENSE"
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
 thiserror = "2.0.17"
-grammers-client = "0.8.1"
-grammers-mtsender = "0.8.1"
+grammers-client = { version = "0.10.0", default-features = false }
+grammers-mtsender = { version = "0.10.0", default-features = false }
+grammers-session = { version = "0.10.0", default-features = false }
 futures = "0.3.31"
 tokio = { version = "1.48.0", features = ["io-util", "rt-multi-thread", "signal"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -19,7 +20,7 @@ sea-orm = { version = "2.0.0-rc", features = ["sqlx-all", "runtime-tokio-rustls"
 async-trait = "0.1.89"
 chrono = "0.4.42"
 serde_json = "1.0.145"
-s3s = "0.13"
+s3s = "0.16"
 tokio-util = { version = "0.7.17", features = ["compat", "io"] }
 bytes = "1.11.0"
 hyper-util = { version = "0.1.19", features = ["server", "server-auto", "tokio"] }
@@ -38,11 +39,6 @@ hex = "0.4.3"
 base64 = "0.22.1"
 ran = "2.0.1"
 
-[patch.crates-io]
-grammers-client = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-client" }
-grammers-mtsender = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-mtsender" }
-grammers-session = { git = "https://github.com/azamaulanaaa/grammers", branch = "sqlite-storage", package = "grammers-session" }
-
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
@@ -52,4 +48,4 @@ lto = "thin"
 aws-config = { version = "1.8.15", default-features = false }
 aws-credential-types = "1.2.14"
 aws-sdk-s3 = { version = "1.129.0", default-features = false, features = ["behavior-version-latest"] }
-s3s-aws = "0.13.0"
+s3s-aws = "0.16.0"
