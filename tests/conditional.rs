@@ -78,11 +78,18 @@ async fn test_conditional_get_etag() -> anyhow::Result<()> {
     assert!(res.is_err(), "If-None-Match matching should be 304");
     if let Err(e) = res {
         let code = e.as_service_error().and_then(|se| se.code()).unwrap_or("");
-        println!("If-None-Match matching code: {}", code);
+        // s3s 0.16+ returns bodyless 304 (RFC 9110), so the SDK has no
+        // XML code to parse; fall back to the raw HTTP status.
+        let status = e.raw_response().map(|r| r.status().as_u16());
+        println!(
+            "If-None-Match matching code: {}, status: {:?}",
+            code, status
+        );
         assert!(
-            code.contains("NotModified") || code.contains("304"),
-            "expected NotModified, got {}",
-            code
+            code.contains("NotModified") || code.contains("304") || status == Some(304),
+            "expected NotModified, got {} ({:?})",
+            code,
+            status
         );
     }
 
@@ -172,11 +179,18 @@ async fn test_conditional_get_modified_since() -> anyhow::Result<()> {
     assert!(res.is_err(), "If-Modified-Since future should be 304");
     if let Err(e) = res {
         let code = e.as_service_error().and_then(|se| se.code()).unwrap_or("");
-        println!("If-Modified-Since future code: {}", code);
+        // s3s 0.16+ returns bodyless 304 (RFC 9110), so the SDK has no
+        // XML code to parse; fall back to the raw HTTP status.
+        let status = e.raw_response().map(|r| r.status().as_u16());
+        println!(
+            "If-Modified-Since future code: {}, status: {:?}",
+            code, status
+        );
         assert!(
-            code.contains("NotModified") || code.contains("304"),
-            "expected NotModified, got {}",
-            code
+            code.contains("NotModified") || code.contains("304") || status == Some(304),
+            "expected NotModified, got {} ({:?})",
+            code,
+            status
         );
     }
 

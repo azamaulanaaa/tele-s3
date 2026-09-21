@@ -256,7 +256,7 @@ impl<B: Backend> TeleS3<B> {
                 version_id,
                 ..
             } => (&**bucket, &**key, version_id.as_deref()),
-            CopySource::AccessPoint { .. } => {
+            CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => {
                 return Err(S3Error::new(S3ErrorCode::NotImplemented));
             }
         };

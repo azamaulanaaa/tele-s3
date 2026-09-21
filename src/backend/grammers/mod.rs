@@ -7,12 +7,13 @@ use anyhow::anyhow;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use grammers_client::{
-    Client, InputMessage,
-    client::files::MAX_CHUNK_SIZE,
-    grammers_tl_types::{functions::upload::SaveBigFilePart, types::InputFileBig},
-    types::{Peer, media::Uploaded},
+    Client,
+    media::Uploaded,
+    message::InputMessage,
+    tl::{functions::upload::SaveBigFilePart, types::InputFileBig},
 };
-use grammers_mtsender::{InvocationError, SenderPool, SenderPoolHandle};
+use grammers_mtsender::{InvocationError, SenderPool, SenderPoolFatHandle};
+use grammers_session::types::PeerRef;
 use sea_orm::DatabaseConnection;
 use tokio::io::AsyncReadExt;
 use tokio_util::{
@@ -27,6 +28,9 @@ mod session;
 
 const PART_SIZE: usize = 512 * 1024;
 const MAX_PARTS: i32 = 4000;
+// Telegram file chunk size used for downloads (mirrors grammers'
+/// `client::files::MAX_CHUNK_SIZE`, which is private in 0.10).
+const MAX_CHUNK_SIZE: i32 = 512 * 1024;
 
 type BoxedStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
@@ -42,8 +46,8 @@ pub struct GrammersConfig {
 #[derive(Clone)]
 pub struct Grammers {
     client: Client,
-    sender_pool_handle: SenderPoolHandle,
-    peer: Peer,
+    sender_pool_handle: SenderPoolFatHandle,
+    peer: PeerRef,
     flood_guard: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -56,7 +60,7 @@ impl Grammers {
             Arc::new(session)
         };
         let pool = SenderPool::new(session.clone(), config.app_id);
-        let client = Client::new(&pool);
+        let client = Client::new(pool.handle.clone());
 
         let sender_pool_handle = {
             let SenderPool {
@@ -66,7 +70,7 @@ impl Grammers {
             } = pool;
             // Dropping the JoinHandle detaches the task; it keeps running.
             tokio::spawn(runner.run());
-            let _ = client.stream_updates(updates, Default::default());
+            let _ = client.stream_updates(updates, Default::default()).await;
 
             handle
         };
@@ -85,6 +89,14 @@ impl Grammers {
             .resolve_username(&config.username)
             .await?
             .ok_or(anyhow!("Username {} not found", config.username))?;
+        let peer = peer
+            .to_ref()
+            .await
+            .map_err(|e| anyhow!("Failed to resolve peer ref: {e}"))?
+            .ok_or(anyhow!(
+                "Username {} has no usable peer ref",
+                config.username
+            ))?;
 
         Ok(Self {
             sender_pool_handle,
@@ -248,7 +260,7 @@ impl Backend for Grammers {
 
             match self
                 .client
-                .send_message(self.peer.clone(), draft_message.clone())
+                .send_message(self.peer, draft_message.clone())
                 .await
             {
                 Ok(msg) => break msg,
@@ -296,7 +308,7 @@ impl Backend for Grammers {
 
             match self
                 .client
-                .get_messages_by_id(self.peer.clone(), &[message_id])
+                .get_messages_by_id(self.peer, &[message_id])
                 .await
             {
                 Ok(mut messages) => {
@@ -416,11 +428,7 @@ impl Backend for Grammers {
         loop {
             self.check_flood_wait().await?;
 
-            match self
-                .client
-                .delete_messages(self.peer.clone(), &[message_id])
-                .await
-            {
+            match self.client.delete_messages(self.peer, &[message_id]).await {
                 Ok(_) => {
                     return Ok(());
                 }
