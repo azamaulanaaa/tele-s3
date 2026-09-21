@@ -2870,3 +2870,60 @@ async fn test_put_object_tagging_header_preserved() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_put_object_over_backend_capacity_rejected() -> anyhow::Result<()> {
+    // One 1-byte slot: a 2-byte object cannot fit.
+    let config = config::<1, 1>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "over-capacity";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    // Backend capacity errors surface as EntityTooLarge, not 500.
+    let err = {
+        let res = client
+            .put_object()
+            .bucket(bucket_name)
+            .key("too-big")
+            .body(ByteStream::from_static(b"12"))
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        Some("EntityTooLarge".to_string())
+    );
+
+    // Nothing was stored.
+    let err = {
+        let res = client
+            .get_object()
+            .bucket(bucket_name)
+            .key("too-big")
+            .send()
+            .await;
+        res.err()
+    };
+    assert_eq!(
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        Some("NoSuchKey".to_string())
+    );
+
+    Ok(())
+}
