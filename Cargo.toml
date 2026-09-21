@@ -6,32 +6,32 @@ repository = "https://github.com/azamaulanaaa/tele-s3"
 license-file = "LICENSE"
 
 [dependencies]
-clap = { version = "4.5.53", features = ["derive"] }
-thiserror = "2.0.17"
+clap = { version = "4.6.7", features = ["derive"] }
+thiserror = "2.0.20"
 grammers-client = { version = "0.10.0", default-features = false }
 grammers-mtsender = { version = "0.10.0", default-features = false }
 grammers-session = { version = "0.10.0", default-features = false }
-futures = "0.3.31"
-tokio = { version = "1.48.0", features = ["io-util", "rt-multi-thread", "signal"] }
-serde = { version = "1.0.228", features = ["derive"] }
-toml = "0.9.8"
-anyhow = "1.0.100"
-sea-orm = { version = "2.0.0-rc", features = ["sqlx-all", "runtime-tokio-rustls", "with-chrono", "with-json", "schema-sync", "entity-registry"] }
-async-trait = "0.1.89"
-chrono = "0.4.42"
-serde_json = "1.0.145"
+futures = "0.3.34"
+tokio = { version = "1.53.1", features = ["io-util", "rt-multi-thread", "signal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1"
+anyhow = "1.0.104"
+sea-orm = { version = "2.0.3", features = ["sqlx-all", "runtime-tokio-rustls", "with-chrono", "with-json", "schema-sync", "entity-registry"] }
+async-trait = "0.1.92"
+chrono = "0.4.45"
+serde_json = "1.0.151"
 s3s = "0.16"
-tokio-util = { version = "0.7.17", features = ["compat", "io"] }
-bytes = "1.11.0"
-hyper-util = { version = "0.1.19", features = ["server", "server-auto", "tokio"] }
-uuid = { version = "1.19.0", features = ["v4"] }
+tokio-util = { version = "0.7.19", features = ["compat", "io"] }
+bytes = "1.12.1"
+hyper-util = { version = "0.1.20", features = ["server", "server-auto", "tokio"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 async-stream = "0.3.6"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 md-5 = "0.10.6"
-sha1 = "0.10.6"
+sha1 = "0.10.7"
 sha2 = "0.10.9"
-crc32fast = "1.5.0"
+crc32fast = "1.5.2"
 crc32c = "0.6.8"
 digest = "0.10.7"
 http = "1"
@@ -45,7 +45,7 @@ inherits = "release"
 lto = "thin"
 
 [dev-dependencies]
-aws-config = { version = "1.8.15", default-features = false }
-aws-credential-types = "1.2.14"
-aws-sdk-s3 = { version = "1.129.0", default-features = false, features = ["behavior-version-latest"] }
+aws-config = { version = "1.12.0", default-features = false }
+aws-credential-types = "1.3.0"
+aws-sdk-s3 = { version = "1.148.0", default-features = false, features = ["behavior-version-latest"] }
 s3s-aws = "0.16.0"
