@@ -1,6 +1,7 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::{
-    ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, DatabaseTransaction, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
     prelude::Expr,
     sea_query::{OnConflict, Query},
 };
@@ -44,6 +45,12 @@ impl Repository {
 
     // ---- Compare-and-swap object write with versioning ----
 
+    /// Atomic compare-and-swap object write.
+    ///
+    /// The condition check and the demote+insert run inside one database
+    /// transaction: concurrent writers serialize on the write lock instead
+    /// of interleaving into zero (or two) `is_latest` rows, and a crash
+    /// between demote and insert can no longer orphan the key.
     #[instrument(skip(self, data, condition), level = "debug", err)]
     pub async fn cas_put_object(
         &self,
@@ -52,14 +59,40 @@ impl Repository {
         data: ObjectWrite,
         condition: PutCondition,
     ) -> S3Result<String> {
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result = self
+            .cas_put_object_txn(&txn, bucket, key, data, condition)
+            .await;
+
+        match result {
+            Ok(version_id) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(version_id)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
+    }
+
+    async fn cas_put_object_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        bucket: String,
+        key: String,
+        data: ObjectWrite,
+        condition: PutCondition,
+    ) -> S3Result<String> {
         // Check bucket versioning
-        let bucket_model = self.get_bucket(&bucket).await?;
+        let bucket_model = Self::get_bucket_txn(txn, &bucket).await?;
         let versioning = bucket_model.versioning_status.clone();
 
         let now = chrono::Local::now().to_utc();
 
         // Helper to evaluate condition against latest
-        let latest_opt = self.get_latest_model(&bucket, &key).await?;
+        let latest_opt = Self::get_latest_model_txn(txn, &bucket, &key).await?;
         // Existence for condition means latest exists and is not delete marker
         let exists_not_deleted = latest_opt.as_ref().is_some_and(|m| !m.is_delete_marker);
         let current_etag = if exists_not_deleted {
@@ -98,13 +131,39 @@ impl Repository {
 
         // Now perform write
         let version_id = self
-            .put_object_internal(bucket, key, data, versioning, now)
+            .put_object_internal(txn, bucket, key, data, versioning, now)
             .await?;
         Ok(version_id)
     }
 
+    async fn get_bucket_txn(txn: &DatabaseTransaction, name: &str) -> S3Result<entity::bucket::Model> {
+        let bucket = entity::bucket::Entity::find_by_id(name)
+            .one(txn)
+            .await
+            .map_err(S3Error::internal_error)?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?;
+
+        Ok(bucket)
+    }
+
+    async fn get_latest_model_txn(
+        txn: &DatabaseTransaction,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<Option<entity::object::Model>> {
+        let m = entity::object::Entity::find()
+            .filter(entity::object::Column::BucketId.eq(bucket))
+            .filter(entity::object::Column::Id.eq(key))
+            .filter(entity::object::Column::IsLatest.eq(true))
+            .one(txn)
+            .await
+            .map_err(S3Error::internal_error)?;
+        Ok(m)
+    }
+
     async fn put_object_internal(
         &self,
+        txn: &DatabaseTransaction,
         bucket: String,
         key: String,
         data: ObjectWrite,
@@ -151,7 +210,7 @@ impl Repository {
                     ])
                     .to_owned(),
                 )
-                .exec(&self.db)
+                .exec(txn)
                 .await
                 .map_err(S3Error::internal_error)?;
 
@@ -166,7 +225,7 @@ impl Repository {
                 .filter(entity::object::Column::BucketId.eq(bucket.clone()))
                 .filter(entity::object::Column::Id.eq(key.clone()))
                 .filter(entity::object::Column::IsLatest.eq(true))
-                .exec(&self.db)
+                .exec(txn)
                 .await
                 .map_err(S3Error::internal_error)?;
 
@@ -187,7 +246,7 @@ impl Repository {
             };
 
             entity::object::Entity::insert(active_model)
-                .exec(&self.db)
+                .exec(txn)
                 .await
                 .map_err(S3Error::internal_error)?;
 
@@ -200,7 +259,7 @@ impl Repository {
                 .filter(entity::object::Column::BucketId.eq(bucket.clone()))
                 .filter(entity::object::Column::Id.eq(key.clone()))
                 .filter(entity::object::Column::IsLatest.eq(true))
-                .exec(&self.db)
+                .exec(txn)
                 .await
                 .map_err(S3Error::internal_error)?;
 
@@ -242,7 +301,7 @@ impl Repository {
                     ])
                     .to_owned(),
                 )
-                .exec(&self.db)
+                .exec(txn)
                 .await
                 .map_err(S3Error::internal_error)?;
 
@@ -303,11 +362,25 @@ impl Repository {
         key: String,
         data: ObjectWrite,
     ) -> S3Result<String> {
-        let bucket_model = self.get_bucket(&bucket).await?;
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let bucket_model = Self::get_bucket_txn(&txn, &bucket).await?;
         let versioning = bucket_model.versioning_status;
         let now = chrono::Local::now().to_utc();
-        self.put_object_internal(bucket, key, data, versioning, now)
-            .await
+        let result = self
+            .put_object_internal(&txn, bucket, key, data, versioning, now)
+            .await;
+
+        match result {
+            Ok(version_id) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(version_id)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
     }
 
     #[instrument(skip(self), level = "debug", err)]

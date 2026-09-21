@@ -137,4 +137,61 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn concurrent_versioned_puts_leave_single_latest() {
+        use futures::future::join_all;
+
+        let repo = std::sync::Arc::new(repo().await);
+
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        repo.put_bucket_versioning("b", Some("Enabled".into()))
+            .await
+            .expect("enable versioning");
+
+        let futs = (0..10).map(|i| {
+            let repo = repo.clone();
+            async move {
+                repo.cas_put_object(
+                    "b".into(),
+                    "k".into(),
+                    ObjectWrite {
+                        size: 1,
+                        content_type: None,
+                        etag: Some(format!("e{i}")),
+                        content: serde_json::json!({}),
+                        user_metadata: serde_json::json!({}),
+                        checksums: serde_json::json!({}),
+                        tags: serde_json::json!([]),
+                    },
+                    PutCondition::None,
+                )
+                .await
+            }
+        });
+        let results = join_all(futs).await;
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "all concurrent puts should succeed: {results:?}"
+        );
+
+        // Interleaved demote+insert must never leave zero or two latests
+        // (which would make every later read fail).
+        let (versions, markers) = repo
+            .list_object_versions("b", None, None, None, None, None)
+            .await
+            .expect("list versions");
+        assert!(markers.is_empty());
+        assert_eq!(versions.len(), 10, "each put creates one version");
+        assert_eq!(
+            versions.iter().filter(|m| m.is_latest).count(),
+            1,
+            "exactly one latest"
+        );
+
+        // Latest-key reads still work.
+        repo.get_object("b", "k").await.expect("get latest");
+    }
 }
