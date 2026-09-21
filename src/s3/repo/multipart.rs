@@ -64,9 +64,8 @@ impl Repository {
             .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket));
 
         if let Some(prefix) = prefix {
-            query = query.filter(
-                entity::multipart_upload_state::Column::ObjectId.starts_with(prefix),
-            );
+            query =
+                query.filter(entity::multipart_upload_state::Column::ObjectId.starts_with(prefix));
         }
 
         let mut models = query

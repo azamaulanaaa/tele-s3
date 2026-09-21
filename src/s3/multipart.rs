@@ -468,7 +468,9 @@ impl<B: Backend> TeleS3<B> {
             .collect();
 
         let (next_key_marker, next_upload_id_marker) = if is_truncated {
-            models.last().map(|m| (m.object_id.clone(), m.upload_id.clone()))
+            models
+                .last()
+                .map(|m| (m.object_id.clone(), m.upload_id.clone()))
         } else {
             None
         }

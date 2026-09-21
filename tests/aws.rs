@@ -454,7 +454,7 @@ async fn test_delete_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(|e| e.to_owned())),
         Some("NoSuchKey".to_string())
     );
 
@@ -2134,7 +2134,7 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
     };
     assert_eq!(
         err.and_then(|e| e.code().map(|c| c.to_owned())),
-        Some("NoSuchKey".to_string())
+        Some("NoSuchBucket".to_string())
     );
 
     Ok(())
