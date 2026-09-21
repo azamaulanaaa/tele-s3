@@ -136,7 +136,10 @@ impl Repository {
         Ok(version_id)
     }
 
-    async fn get_bucket_txn(txn: &DatabaseTransaction, name: &str) -> S3Result<entity::bucket::Model> {
+    async fn get_bucket_txn(
+        txn: &DatabaseTransaction,
+        name: &str,
+    ) -> S3Result<entity::bucket::Model> {
         let bucket = entity::bucket::Entity::find_by_id(name)
             .one(txn)
             .await

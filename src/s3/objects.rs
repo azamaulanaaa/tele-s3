@@ -407,7 +407,11 @@ impl<B: Backend> TeleS3<B> {
             }
             model
         } else {
-            match self.repo.get_object(&req.input.bucket, &req.input.key).await {
+            match self
+                .repo
+                .get_object(&req.input.bucket, &req.input.key)
+                .await
+            {
                 Ok(model) => model,
                 Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
                     // A delete-marker latest reads as NoSuchKey, but S3 still
@@ -541,7 +545,11 @@ impl<B: Backend> TeleS3<B> {
             }
             model
         } else {
-            match self.repo.get_object(&req.input.bucket, &req.input.key).await {
+            match self
+                .repo
+                .get_object(&req.input.bucket, &req.input.key)
+                .await
+            {
                 Ok(model) => model,
                 Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
                     // A delete-marker latest reads as NoSuchKey, but S3 still

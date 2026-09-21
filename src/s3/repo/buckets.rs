@@ -53,8 +53,7 @@ impl Repository {
             .map_err(|e| {
                 // Constraint failures surface as either Exec or Query
                 // depending on the driver path; check both.
-                let conflict =
-                    matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
+                let conflict = matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
 
                 if conflict {
                     S3Error::new(S3ErrorCode::BucketAlreadyExists)

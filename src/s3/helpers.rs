@@ -253,9 +253,10 @@ pub(crate) fn validate_bucket_name(name: &str) -> S3Result<()> {
         return Err(invalid());
     }
 
-    if !name.bytes().all(|b| {
-        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
-    }) {
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    {
         return Err(invalid());
     }
 
