@@ -454,8 +454,75 @@ async fn test_delete_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|e| e.to_owned())),
+        err.and_then(|e| e.code().map(|c| c.to_owned())),
         Some("NoSuchKey".to_string())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_multipart_uploads_with_markers() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "list-uploads-with-markers";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    for key in ["a", "b"] {
+        let _ = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key(key)
+            .send()
+            .await
+            .context("create multipart upload")?;
+    }
+
+    // First page of one.
+    let first = client
+        .list_multipart_uploads()
+        .bucket(bucket_name)
+        .max_uploads(1)
+        .send()
+        .await
+        .context("list first page")?;
+    assert_eq!(first.uploads().len(), 1);
+    assert_eq!(first.is_truncated(), Some(true));
+    let next_key = first.next_key_marker().context("missing next key marker")?;
+    let next_upload_id = first
+        .next_upload_id_marker()
+        .context("missing next upload id marker")?;
+
+    // Second page via markers.
+    let second = client
+        .list_multipart_uploads()
+        .bucket(bucket_name)
+        .key_marker(next_key)
+        .upload_id_marker(next_upload_id)
+        .send()
+        .await
+        .context("list second page")?;
+    assert_eq!(second.uploads().len(), 1);
+    assert_eq!(second.is_truncated(), Some(false));
+    assert_ne!(
+        first.uploads()[0].upload_id(),
+        second.uploads()[0].upload_id(),
+        "pages must advance"
     );
 
     Ok(())
