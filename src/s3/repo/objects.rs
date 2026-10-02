@@ -1111,13 +1111,19 @@ mod tests {
         let rows = rows_for_key(&repo).await;
         let latest: Vec<_> = rows.iter().filter(|m| m.is_latest).collect();
         assert_eq!(
-            latest.iter().map(|m| m.version_id.as_str()).collect::<Vec<_>>(),
+            latest
+                .iter()
+                .map(|m| m.version_id.as_str())
+                .collect::<Vec<_>>(),
             ["v2"],
             "the newest remaining version must be promoted"
         );
 
         // The promoted row is the one every later read resolves to.
-        let got = repo.get_object("b", "k").await.expect("get promoted object");
+        let got = repo
+            .get_object("b", "k")
+            .await
+            .expect("get promoted object");
         assert_eq!(got.version_id, "v2");
         assert_eq!(got.etag.as_deref(), Some("etag-v2"));
     }
@@ -1243,7 +1249,10 @@ mod tests {
                             .await
                             .map(|_| ())
                     } else {
-                        match repo.delete_object_versioned("b", "k", Some("missing")).await {
+                        match repo
+                            .delete_object_versioned("b", "k", Some("missing"))
+                            .await
+                        {
                             // An unknown version id is NoSuchKey by contract;
                             // the transaction rolls back and changes nothing.
                             Err(_) => Ok(()),
