@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{env, path::Path, time::Duration};
 
 use clap::Parser;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
@@ -10,7 +10,7 @@ use hyper_util::server::conn::auto::Builder;
 use tracing_subscriber::EnvFilter;
 
 use tele_s3::{
-    backend::{Grammers, GrammersConfig},
+    backend::{Grammers, GrammersConfig, GrammersLimits},
     s3::TeleS3,
 };
 
@@ -21,6 +21,39 @@ mod config;
 struct Args {
     #[arg(short, long)]
     config: String,
+}
+
+/// Outbound Telegram bounds, overridable from the environment so an operator
+/// can tune them without a rebuild. Unset or unparsable values keep the
+/// built-in default.
+fn telegram_limits() -> GrammersLimits {
+    let defaults = GrammersLimits::default();
+
+    fn env_or<T: std::str::FromStr>(name: &str, fallback: T) -> T {
+        match env::var(name) {
+            Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
+                tracing::warn!(value = %raw, "Ignoring {}", name);
+                fallback
+            }),
+            Err(_) => fallback,
+        }
+    }
+
+    let max_concurrent_requests = env_or(
+        "TELEGRAM_MAX_CONCURRENT_REQUESTS",
+        defaults.max_concurrent_requests,
+    );
+    let io_timeout = Duration::from_secs(env_or(
+        "TELEGRAM_IO_TIMEOUT_SECS",
+        defaults.io_timeout.as_secs(),
+    ));
+    let max_attempts = env_or("TELEGRAM_MAX_ATTEMPTS", defaults.max_attempts);
+
+    GrammersLimits {
+        max_concurrent_requests,
+        io_timeout,
+        max_attempts,
+    }
 }
 
 #[tokio::main]
@@ -53,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
             bot_token: config.bot_token,
             db: db.clone(),
             username: config.username,
+            limits: telegram_limits(),
         };
 
         Grammers::init(config).await?

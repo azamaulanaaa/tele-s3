@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::io::AsyncRead;
 
 pub use chain_readers::ChainReaders;
-pub use grammers::{Grammers, GrammersConfig};
+pub use grammers::{Grammers, GrammersConfig, GrammersLimits};
 pub use memory::Memory;
 pub use reader_with_hasher::{IntegrityDigests, IntegrityReader, ReaderWithHasher};
 
