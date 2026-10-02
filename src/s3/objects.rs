@@ -27,6 +27,7 @@ use super::helpers::{
     json_to_metadata, json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json,
     verify_checksums,
 };
+use super::repo::entity::object;
 use super::repo::{ObjectWrite, Repository};
 use super::types::{Metadata, MetadataItem};
 use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader};
@@ -61,6 +62,65 @@ pub(super) fn checked_max_uploads(max_uploads: Option<i32>) -> S3Result<i32> {
 pub(super) fn checked_content_length(content_length: Option<i64>) -> S3Result<u64> {
     let len = content_length.ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))?;
     u64::try_from(len).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+}
+
+/// The listing-row fields the rollup reads: key, size and last-modified.
+///
+/// `ObjectListRow` lives in the repository module, so callers map their rows
+/// into this tuple rather than naming the DTO.
+type ListRow<'a> = (&'a str, u32, chrono::DateTime<chrono::Utc>);
+
+/// The `CommonPrefix` a key rolls into, or `None` when it is listed whole.
+///
+/// The part of `key` after `prefix` is split at its first `delimiter`; the
+/// common prefix is `prefix` plus the segment before it. A key with no
+/// delimiter after the prefix is its own `Object`.
+fn common_prefix_for(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+    let without_prefix = key.strip_prefix(prefix).unwrap_or(key);
+
+    without_prefix
+        .split_once(delimiter)
+        .map(|(sub_key, _)| format!("{prefix}{sub_key}{delimiter}"))
+}
+
+/// Roll one page of listing rows into `Object`s and `CommonPrefix`es, and
+/// derive the cursor that resumes the page after it.
+///
+/// Both list shapes (v1 and v2) roll up identically, so the rule lives here
+/// once. `truncated` is the raw-row overflow flag; the cursor is the last
+/// row's key, and is present only when that flag is set.
+fn rollup_list_page<'a>(
+    rows: impl IntoIterator<Item = ListRow<'a>>,
+    prefix: &str,
+    delimiter: Option<&str>,
+    truncated: bool,
+) -> (Vec<Object>, Vec<CommonPrefix>, Option<String>) {
+    let mut last_key = None;
+
+    let (contents, common_prefixes) = rows.into_iter().fold(
+        (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
+        |mut result, (key, size, last_modified)| {
+            last_key = Some(key.to_owned());
+
+            match delimiter.and_then(|delimiter| common_prefix_for(key, prefix, delimiter)) {
+                Some(common_prefix) => result.1.push(CommonPrefix {
+                    prefix: Some(common_prefix),
+                }),
+                None => result.0.push(Object {
+                    key: Some(key.to_owned()),
+                    size: Some(size.into()),
+                    last_modified: Some(chrono_to_timestamp(last_modified)),
+                    ..Default::default()
+                }),
+            }
+
+            result
+        },
+    );
+
+    let next_marker = truncated.then_some(last_key).flatten();
+
+    (contents, common_prefixes, next_marker)
 }
 
 impl<B: Backend> TeleS3<B> {
@@ -428,50 +488,58 @@ impl<B: Backend> TeleS3<B> {
         Ok(res)
     }
 
-    #[instrument(skip(self), err)]
-    pub(crate) async fn get_object_inner(
+    /// Resolve the object a read (`GetObject` / `HeadObject`) addresses.
+    ///
+    /// Addressing a delete marker by version is MethodNotAllowed (405); a
+    /// latest-key read of one reads as NoSuchKey, but S3 still reports which
+    /// marker hides the key. Both operations answer from the same row, so the
+    /// rule lives here once.
+    async fn resolve_read_object(
         &self,
-        req: S3Request<GetObjectInput>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
-        let model = if let Some(vid) = req.input.version_id.as_deref() {
-            let model = self
-                .repo
-                .get_object_version(&req.input.bucket, &req.input.key, vid)
-                .await?;
-            // Addressing a delete marker by version is MethodNotAllowed (405).
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<object::Model> {
+        if let Some(vid) = version_id {
+            let model = self.repo.get_object_version(bucket, key, vid).await?;
             if model.is_delete_marker {
                 return Err(delete_marker_error(
                     &model.version_id,
                     S3ErrorCode::MethodNotAllowed,
                 ));
             }
-            model
-        } else {
-            match self
-                .repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await
-            {
-                Ok(model) => model,
-                Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
-                    // A delete-marker latest reads as NoSuchKey, but S3 still
-                    // reports which marker hides the key.
-                    if let Some(marker) = self
-                        .repo
-                        .get_latest_raw(&req.input.bucket, &req.input.key)
-                        .await?
-                        && marker.is_delete_marker
-                    {
-                        return Err(delete_marker_error(
-                            &marker.version_id,
-                            S3ErrorCode::NoSuchKey,
-                        ));
-                    }
-                    return Err(err);
+            return Ok(model);
+        }
+
+        match self.repo.get_object(bucket, key).await {
+            Ok(model) => Ok(model),
+            Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
+                if let Some(marker) = self.repo.get_latest_raw(bucket, key).await?
+                    && marker.is_delete_marker
+                {
+                    return Err(delete_marker_error(
+                        &marker.version_id,
+                        S3ErrorCode::NoSuchKey,
+                    ));
                 }
-                Err(err) => return Err(err),
+                Err(err)
             }
-        };
+            Err(err) => Err(err),
+        }
+    }
+
+    #[instrument(skip(self), err)]
+    pub(crate) async fn get_object_inner(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let model = self
+            .resolve_read_object(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await?;
 
         // Conditional GET checks (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since)
         check_conditional_get(
@@ -571,45 +639,13 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let model = if let Some(vid) = req.input.version_id.as_deref() {
-            let model = self
-                .repo
-                .get_object_version(&req.input.bucket, &req.input.key, vid)
-                .await?;
-            // Addressing a delete marker by version is MethodNotAllowed (405).
-            if model.is_delete_marker {
-                return Err(delete_marker_error(
-                    &model.version_id,
-                    S3ErrorCode::MethodNotAllowed,
-                ));
-            }
-            model
-        } else {
-            match self
-                .repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await
-            {
-                Ok(model) => model,
-                Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
-                    // A delete-marker latest reads as NoSuchKey, but S3 still
-                    // reports which marker hides the key.
-                    if let Some(marker) = self
-                        .repo
-                        .get_latest_raw(&req.input.bucket, &req.input.key)
-                        .await?
-                        && marker.is_delete_marker
-                    {
-                        return Err(delete_marker_error(
-                            &marker.version_id,
-                            S3ErrorCode::NoSuchKey,
-                        ));
-                    }
-                    return Err(err);
-                }
-                Err(err) => return Err(err),
-            }
-        };
+        let model = self
+            .resolve_read_object(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await?;
 
         check_conditional_get(
             &model,
@@ -842,52 +878,20 @@ impl<B: Backend> TeleS3<B> {
             models.pop();
         }
 
-        let (contents, common_prefix) = models.iter().fold(
-            (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
-            |mut result, model| {
-                let common_prefix = {
-                    let prefix = req.input.prefix.clone().unwrap_or_default();
-                    let id = model.id.clone();
-
-                    let id_without_prefix = id.strip_prefix(&prefix).unwrap_or(id.as_str());
-
-                    if let Some(ref delimiter) = req.input.delimiter {
-                        let sub_key = id_without_prefix.split_once(delimiter).map(|v| v.0);
-
-                        sub_key.map(|sub_key| format!("{}{}{}", prefix, sub_key, delimiter,))
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(common_prefix) = common_prefix {
-                    result.1.push(CommonPrefix {
-                        prefix: Some(common_prefix),
-                    });
-                } else {
-                    result.0.push(Object {
-                        key: Some(model.id.clone()),
-                        size: Some(model.size.into()),
-                        last_modified: Some(chrono_to_timestamp(model.last_modified)),
-                        ..Default::default()
-                    })
-                }
-
-                result
-            },
+        let (contents, common_prefixes, next_marker) = rollup_list_page(
+            models
+                .iter()
+                .map(|model| (model.id.as_str(), model.size, model.last_modified)),
+            req.input.prefix.as_deref().unwrap_or_default(),
+            req.input.delimiter.as_deref(),
+            is_truncated,
         );
-
-        let next_marker = if is_truncated {
-            models.last().map(|model| model.id.clone())
-        } else {
-            None
-        };
 
         let is_truncated = next_marker.is_some();
 
         let res = S3Response::new(ListObjectsOutput {
             contents: Some(contents),
-            common_prefixes: Some(common_prefix),
+            common_prefixes: Some(common_prefixes),
             is_truncated: Some(is_truncated),
             marker: req.input.marker,
             next_marker,
@@ -932,52 +936,20 @@ impl<B: Backend> TeleS3<B> {
             models.pop();
         }
 
-        let (contents, common_prefix) = models.iter().fold(
-            (Vec::<Object>::new(), Vec::<CommonPrefix>::new()),
-            |mut result, model| {
-                let common_prefix = {
-                    let prefix = req.input.prefix.clone().unwrap_or_default();
-                    let id = model.id.clone();
-
-                    let id_without_prefix = id.strip_prefix(&prefix).unwrap_or(id.as_str());
-
-                    if let Some(ref delimiter) = req.input.delimiter {
-                        let sub_key = id_without_prefix.split_once(delimiter).map(|v| v.0);
-
-                        sub_key.map(|sub_key| format!("{}{}{}", prefix, sub_key, delimiter,))
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(common_prefix) = common_prefix {
-                    result.1.push(CommonPrefix {
-                        prefix: Some(common_prefix),
-                    });
-                } else {
-                    result.0.push(Object {
-                        key: Some(model.id.clone()),
-                        size: Some(model.size.into()),
-                        last_modified: Some(chrono_to_timestamp(model.last_modified)),
-                        ..Default::default()
-                    })
-                }
-
-                result
-            },
+        let (contents, common_prefixes, next_marker) = rollup_list_page(
+            models
+                .iter()
+                .map(|model| (model.id.as_str(), model.size, model.last_modified)),
+            req.input.prefix.as_deref().unwrap_or_default(),
+            req.input.delimiter.as_deref(),
+            is_truncated,
         );
-
-        let next_marker = if is_truncated {
-            models.last().map(|model| model.id.clone())
-        } else {
-            None
-        };
 
         let is_truncated = next_marker.is_some();
 
         let res = S3Response::new(ListObjectsV2Output {
             contents: Some(contents),
-            common_prefixes: Some(common_prefix),
+            common_prefixes: Some(common_prefixes),
             is_truncated: Some(is_truncated),
             next_continuation_token: next_marker,
             key_count: Some(models.len() as i32),
@@ -1148,20 +1120,62 @@ impl<B: Backend> TeleS3<B> {
         }))
     }
 
+    /// Confirm the addressed object exists before answering an ACL request.
+    ///
+    /// Both ACL verbs answer from the same canned grant and differ only in
+    /// whether they are addressed to a specific version.
+    async fn ensure_object_exists(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<()> {
+        match version_id {
+            Some(vid) => self.repo.get_object_version(bucket, key, vid).await?,
+            None => self.repo.get_object(bucket, key).await?,
+        };
+        Ok(())
+    }
+
+    /// The version a tagging write reports back.
+    ///
+    /// Without an explicit `versionId` the write applies to the latest
+    /// version, which is only reported on a versioned bucket.
+    async fn tagging_write_version_id(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<Option<String>> {
+        if let Some(vid) = version_id {
+            return Ok(Some(vid.to_owned()));
+        }
+
+        let versioned = self
+            .repo
+            .get_bucket_versioning(bucket)
+            .await
+            .unwrap_or(None)
+            .is_some();
+
+        if versioned {
+            self.repo.latest_version_id(bucket, key).await
+        } else {
+            Ok(None)
+        }
+    }
+
     #[instrument(skip(self), err)]
     pub(crate) async fn get_object_acl_inner(
         &self,
         req: S3Request<GetObjectAclInput>,
     ) -> S3Result<S3Response<GetObjectAclOutput>> {
-        if let Some(vid) = req.input.version_id.as_deref() {
-            self.repo
-                .get_object_version(&req.input.bucket, &req.input.key, vid)
-                .await?;
-        } else {
-            self.repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await?;
-        }
+        self.ensure_object_exists(
+            &req.input.bucket,
+            &req.input.key,
+            req.input.version_id.as_deref(),
+        )
+        .await?;
         Ok(S3Response::new(GetObjectAclOutput {
             owner: Some(canned_owner()),
             grants: Some(vec![full_control_grant()]),
@@ -1174,15 +1188,12 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<PutObjectAclInput>,
     ) -> S3Result<S3Response<PutObjectAclOutput>> {
-        if let Some(vid) = req.input.version_id.as_deref() {
-            self.repo
-                .get_object_version(&req.input.bucket, &req.input.key, vid)
-                .await?;
-        } else {
-            self.repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await?;
-        }
+        self.ensure_object_exists(
+            &req.input.bucket,
+            &req.input.key,
+            req.input.version_id.as_deref(),
+        )
+        .await?;
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
 
@@ -1232,26 +1243,9 @@ impl<B: Backend> TeleS3<B> {
                 tags_to_json(req.input.tagging),
             )
             .await?;
-        // Without an explicit versionId the tagging applies to latest;
-        // report its version on versioned buckets.
-        let version_id = match vid {
-            Some(v) => Some(v),
-            None => {
-                let versioned = self
-                    .repo
-                    .get_bucket_versioning(&req.input.bucket)
-                    .await
-                    .unwrap_or(None)
-                    .is_some();
-                if versioned {
-                    self.repo
-                        .latest_version_id(&req.input.bucket, &req.input.key)
-                        .await?
-                } else {
-                    None
-                }
-            }
-        };
+        let version_id = self
+            .tagging_write_version_id(&req.input.bucket, &req.input.key, vid.as_deref())
+            .await?;
         Ok(S3Response::new(PutObjectTaggingOutput { version_id }))
     }
 
@@ -1269,26 +1263,9 @@ impl<B: Backend> TeleS3<B> {
                 serde_json::json!([]),
             )
             .await?;
-        // Without an explicit versionId the delete applies to latest;
-        // report its version on versioned buckets.
-        let version_id = match vid {
-            Some(v) => Some(v),
-            None => {
-                let versioned = self
-                    .repo
-                    .get_bucket_versioning(&req.input.bucket)
-                    .await
-                    .unwrap_or(None)
-                    .is_some();
-                if versioned {
-                    self.repo
-                        .latest_version_id(&req.input.bucket, &req.input.key)
-                        .await?
-                } else {
-                    None
-                }
-            }
-        };
+        let version_id = self
+            .tagging_write_version_id(&req.input.bucket, &req.input.key, vid.as_deref())
+            .await?;
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }))
     }
 }
@@ -1843,5 +1820,111 @@ mod tests {
             .await
             .expect_err("missing content-length must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::MissingContentLength);
+    }
+
+    fn rows<'a>(keys: &'a [&'a str]) -> Vec<ListRow<'a>> {
+        let stamp = chrono::Utc::now();
+        keys.iter()
+            .map(|key| (*key, key.len() as u32, stamp))
+            .collect()
+    }
+
+    fn listed_keys(objects: &[Object]) -> Vec<&str> {
+        objects
+            .iter()
+            .filter_map(|object| object.key.as_deref())
+            .collect()
+    }
+
+    fn listed_prefixes(prefixes: &[CommonPrefix]) -> Vec<&str> {
+        prefixes
+            .iter()
+            .filter_map(|common| common.prefix.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn common_prefix_splits_at_the_first_delimiter_after_the_prefix() {
+        assert_eq!(
+            common_prefix_for("p/a/1", "p/", "/").as_deref(),
+            Some("p/a/")
+        );
+        assert_eq!(common_prefix_for("p/b", "p/", "/"), None);
+    }
+
+    #[test]
+    fn common_prefix_splits_the_whole_key_when_the_prefix_does_not_match() {
+        // Rows reaching the rollup have already been filtered by the prefix,
+        // but the split falls back to the key itself while the listed prefix
+        // is still what the common prefix is rebuilt from.
+        assert_eq!(common_prefix_for("a/b", "p/", "/").as_deref(), Some("p/a/"));
+        assert_eq!(common_prefix_for("abc", "p/", "/"), None);
+    }
+
+    #[test]
+    fn rollup_without_delimiter_lists_every_row_as_an_object() {
+        let (contents, prefixes, next) = rollup_list_page(rows(&["a/1", "b"]), "", None, false);
+
+        assert_eq!(listed_keys(&contents), vec!["a/1", "b"]);
+        assert_eq!(contents[0].size, Some(3));
+        assert!(prefixes.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn rollup_with_delimiter_rolls_shared_prefixes_out_of_the_contents() {
+        let (contents, prefixes, _) = rollup_list_page(
+            rows(&["photos/1.jpg", "photos/2.jpg", "docs/readme"]),
+            "",
+            Some("/"),
+            false,
+        );
+
+        assert!(contents.is_empty());
+        // Known quirk, preserved as-is: the rollup is per row, so a prefix
+        // shared by several rows is emitted once per row.
+        assert_eq!(
+            listed_prefixes(&prefixes),
+            vec!["photos/", "photos/", "docs/"]
+        );
+    }
+
+    #[test]
+    fn rollup_treats_a_prefix_that_is_also_a_key_as_a_common_prefix() {
+        let (contents, prefixes, _) =
+            rollup_list_page(rows(&["a", "a/", "a/b"]), "", Some("/"), false);
+
+        assert_eq!(listed_keys(&contents), vec!["a"]);
+        assert_eq!(listed_prefixes(&prefixes), vec!["a/", "a/"]);
+    }
+
+    #[test]
+    fn rollup_applies_the_listed_prefix_before_the_delimiter() {
+        let (contents, prefixes, _) =
+            rollup_list_page(rows(&["p/a/1", "p/a/2", "p/b"]), "p/", Some("/"), false);
+
+        assert_eq!(listed_keys(&contents), vec!["p/b"]);
+        assert_eq!(listed_prefixes(&prefixes), vec!["p/a/", "p/a/"]);
+    }
+
+    #[test]
+    fn rollup_of_an_empty_page_is_empty_and_uncursored() {
+        let (contents, prefixes, next) = rollup_list_page(Vec::new(), "", Some("/"), false);
+
+        assert!(contents.is_empty());
+        assert!(prefixes.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn rollup_cursor_is_the_last_row_key_only_when_the_page_was_truncated() {
+        let (contents, prefixes, next) = rollup_list_page(rows(&["a", "b"]), "", None, true);
+
+        assert_eq!(listed_keys(&contents), vec!["a", "b"]);
+        assert!(prefixes.is_empty());
+        assert_eq!(next.as_deref(), Some("b"));
+
+        let (_, _, next) = rollup_list_page(rows(&["a", "b"]), "", None, false);
+        assert_eq!(next, None);
     }
 }
