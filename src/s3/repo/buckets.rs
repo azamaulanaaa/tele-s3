@@ -51,8 +51,9 @@ impl Repository {
             .exec(&self.db)
             .await
             .map_err(|e| {
-                // Constraint failures surface as either Exec or Query
-                // depending on the driver path; check both.
+                // `DbErr::sql_err` sees through both `Exec` and `Query`, so the
+                // unique-constraint failure reaches us as
+                // `UniqueConstraintViolation` whichever driver path raised it.
                 let conflict = matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
 
                 if conflict {

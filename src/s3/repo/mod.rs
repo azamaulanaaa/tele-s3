@@ -13,7 +13,6 @@ pub(crate) use multipart::MultipartUploadStateUpdate;
 
 /// Precondition for a compare-and-swap object write.
 pub enum PutCondition {
-    /// Unconditional upsert (no If-Match / If-None-Match header).
     None,
     /// If-Match with a specific ETag: write only if the object exists
     /// and its stored ETag matches. Missing object → NoSuchKey.
@@ -36,7 +35,6 @@ pub struct ObjectWrite {
     pub size: u64,
     pub content_type: Option<String>,
     pub etag: Option<String>,
-    /// Ordered blob-item list describing the object's content.
     pub content: serde_json::Value,
     /// x-amz-meta-* map as a JSON object; empty object when none.
     pub user_metadata: serde_json::Value,

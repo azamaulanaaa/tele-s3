@@ -57,7 +57,6 @@ pub(super) fn checked_max_uploads(max_uploads: Option<i32>) -> S3Result<i32> {
     checked_max_keys(max_uploads)
 }
 
-/// Narrow a client-supplied `Content-Length` to `u64`.
 pub(super) fn checked_content_length(content_length: Option<i64>) -> S3Result<u64> {
     let len = content_length.ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))?;
     u64::try_from(len).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
@@ -340,7 +339,6 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        // Access-point sources are not supported.
         let (src_bucket, src_key, src_version_id) = match &req.input.copy_source {
             CopySource::Bucket {
                 bucket,
@@ -533,7 +531,6 @@ impl<B: Backend> TeleS3<B> {
             )
             .await?;
 
-        // Conditional GET checks (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since)
         check_conditional_get(
             &model,
             req.input.if_match.as_ref(),
@@ -595,7 +592,6 @@ impl<B: Backend> TeleS3<B> {
         let object_metadata = json_to_metadata(&model.user_metadata);
         let stored_checksums = ExpectedChecksums::from_json(&model.checksums);
 
-        // VersionId header: return it if bucket is versioned
         let versioning = self
             .repo
             .get_bucket_versioning(&req.input.bucket)
@@ -693,7 +689,6 @@ impl<B: Backend> TeleS3<B> {
             && !model.is_delete_marker
             && !is_marker
         {
-            // Permanent delete of a data version: release its blobs
             let metadata: Metadata =
                 serde_json::from_value(model.content.clone()).map_err(S3Error::internal_error)?;
             let ids: Vec<String> = metadata.item.iter().map(|item| item.id.clone()).collect();
@@ -701,8 +696,6 @@ impl<B: Backend> TeleS3<B> {
         }
         // If we created a delete marker, `deleted_opt` is the marker; no blobs to release.
 
-        // For idempotent delete of non-existent key on non-versioned bucket, deleted_opt is None -> still return 204.
-        // For versioned bucket, delete without versionId always creates a delete marker and returns it.
         let response_version_id = deleted_opt.as_ref().map(|m| m.version_id.clone());
         let delete_marker = if is_marker { Some(true) } else { None };
 
@@ -797,7 +790,6 @@ impl<B: Backend> TeleS3<B> {
                         });
                     }
                     Ok((None, _)) => {
-                        // Idempotent delete of non-existent key.
                         deleted_objects.push(DeletedObject {
                             key: Some(obj.key.clone()),
                             version_id: obj.version_id.clone(),
@@ -805,7 +797,6 @@ impl<B: Backend> TeleS3<B> {
                         });
                     }
                     Err(e) if *e.code() == S3ErrorCode::NoSuchKey => {
-                        // Idempotent.
                         deleted_objects.push(DeletedObject {
                             key: Some(obj.key.clone()),
                             version_id: obj.version_id.clone(),

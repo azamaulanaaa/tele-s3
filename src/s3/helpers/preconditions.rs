@@ -8,7 +8,6 @@ use s3s::{
 
 use super::super::repo::PutCondition;
 
-/// Translate If-Match / If-None-Match headers into a write precondition.
 pub(crate) fn build_put_condition(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,

@@ -38,16 +38,12 @@ impl ExpectedChecksums {
         }
     }
 
-    /// Extract stored checksum values, e.g. a checksums document written
-    /// by [`Self::to_json`]. Missing or non-string entries read as `None`.
     pub(crate) fn from_json(value: &serde_json::Value) -> Self {
         let get = |key: &str| value.get(key).and_then(|v| v.as_str()).map(String::from);
 
         Self::new(get("crc32"), get("crc32c"), get("sha1"), get("sha256"))
     }
 
-    /// The supplied values paired with their storage key and expected
-    /// digest length.
     fn provided(&self) -> impl Iterator<Item = (&'static str, usize, Option<&str>)> {
         [
             ("crc32", 4usize, self.crc32.as_deref()),
@@ -58,7 +54,6 @@ impl ExpectedChecksums {
         .into_iter()
     }
 
-    /// Validate the supplied checksums and serialize them for storage.
     /// Each value must be standard base64 decoding to the algorithm's
     /// digest length.
     pub(crate) fn to_json(&self) -> S3Result<serde_json::Value> {

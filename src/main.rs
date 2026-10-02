@@ -63,9 +63,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .pretty()
-        // .with_target(true)
-        // .with_file(true)
-        // .with_line_number(true)
         .with_env_filter(env_filter)
         .init();
 

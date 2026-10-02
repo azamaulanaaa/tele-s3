@@ -2,7 +2,6 @@
 
 use s3s::dto::{Grant, Grantee, Owner};
 
-/// The single synthetic owner every resource is reported to belong to.
 pub(crate) fn canned_owner() -> Owner {
     Owner {
         display_name: Some("tele-s3".into()),
@@ -10,7 +9,6 @@ pub(crate) fn canned_owner() -> Owner {
     }
 }
 
-/// Full control granted to the synthetic owner.
 pub(crate) fn full_control_grant() -> Grant {
     Grant {
         grantee: Some(Grantee {

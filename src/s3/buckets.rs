@@ -172,7 +172,6 @@ impl<B: Backend> TeleS3<B> {
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let status = req.input.versioning_configuration.status.clone();
         let status_str = status.map(|s| s.as_str().to_string());
-        // Validate: only Enabled or Suspended allowed
         if let Some(ref s) = status_str
             && s != "Enabled"
             && s != "Suspended"

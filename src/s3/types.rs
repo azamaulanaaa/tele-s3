@@ -23,8 +23,9 @@ pub(crate) struct MetadataItem {
 /// One buffered multipart part: digest plus backing blob slices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MultipartUploadPart {
-    // Digest of the part's bytes; empty when unknown (parts created by
-    // UploadPartCopy share existing blobs and skip re-reading them).
+    // MD5 of the part's bytes, hex-encoded. Always present: `UploadPartCopy`
+    // points at the source's shared blobs but still reads the copied window
+    // back once to hash it, so every part carries a real digest.
     pub(crate) hash: String,
     pub(crate) metadata_items: Vec<MetadataItem>,
 }

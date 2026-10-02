@@ -95,8 +95,6 @@ impl Repository {
         Ok(m)
     }
 
-    // ---- Compare-and-swap object write with versioning ----
-
     /// Atomic compare-and-swap object write.
     ///
     /// The condition check and the demote+insert run inside one database
@@ -181,15 +179,12 @@ impl Repository {
         data: ObjectWrite,
         condition: PutCondition,
     ) -> S3Result<String> {
-        // Check bucket versioning
         let bucket_model = Self::get_bucket_txn(txn, &bucket).await?;
         let versioning = bucket_model.versioning_status.clone();
 
         let now = chrono::Local::now().to_utc();
 
-        // Helper to evaluate condition against latest
         let latest_opt = Self::get_latest_model_txn(txn, &bucket, &key).await?;
-        // Existence for condition means latest exists and is not delete marker
         let exists_not_deleted = latest_opt.as_ref().is_some_and(|m| !m.is_delete_marker);
         let current_etag = if exists_not_deleted {
             latest_opt.as_ref().and_then(|m| m.etag.clone())
@@ -197,7 +192,6 @@ impl Repository {
             None
         };
 
-        // Evaluate condition before write
         match &condition {
             PutCondition::IfMatch(expected) => {
                 if !exists_not_deleted {
@@ -225,7 +219,6 @@ impl Repository {
             PutCondition::None => {}
         }
 
-        // Now perform write
         let version_id = self
             .put_object_internal(txn, bucket, key, data, versioning, now)
             .await?;
@@ -270,7 +263,6 @@ impl Repository {
         now: chrono::DateTime<chrono::Utc>,
     ) -> S3Result<String> {
         if versioning.is_none() {
-            // Non-versioned bucket: single null version via upsert
             let version_id = "null".to_string();
             let active_model = entity::object::ActiveModel {
                 bucket_id: Set(bucket.clone()),
@@ -315,10 +307,8 @@ impl Repository {
 
             Ok(version_id)
         } else if versioning.as_deref() == Some("Enabled") {
-            // Versioned enabled: create new version with uuid
             let version_id = uuid::Uuid::new_v4().to_string();
 
-            // Demote old latest
             entity::object::Entity::update_many()
                 .col_expr(entity::object::Column::IsLatest, Expr::value(false))
                 .filter(entity::object::Column::BucketId.eq(bucket.clone()))
@@ -351,7 +341,6 @@ impl Repository {
 
             Ok(version_id)
         } else {
-            // Suspended: use null version id, demote old and upsert null
             // Demote old latest (including null if it was latest, we will re-enable it)
             entity::object::Entity::update_many()
                 .col_expr(entity::object::Column::IsLatest, Expr::value(false))
@@ -555,7 +544,6 @@ impl Repository {
         version_id: Option<&str>,
     ) -> S3Result<(Option<entity::object::Model>, bool)> {
         if let Some(vid) = version_id {
-            // Permanent delete of specific version
             let model_opt = entity::object::Entity::find()
                 .filter(entity::object::Column::BucketId.eq(bucket))
                 .filter(entity::object::Column::Id.eq(key))
@@ -571,7 +559,6 @@ impl Repository {
 
             let was_latest = model.is_latest;
 
-            // Delete that version row
             entity::object::Entity::delete_many()
                 .filter(entity::object::Column::BucketId.eq(bucket))
                 .filter(entity::object::Column::Id.eq(key))
@@ -580,9 +567,7 @@ impl Repository {
                 .await
                 .map_err(S3Error::internal_error)?;
 
-            // If it was latest, promote next latest (most recent)
             if was_latest {
-                // Find most recent remaining version
                 let next = entity::object::Entity::find()
                     .filter(entity::object::Column::BucketId.eq(bucket))
                     .filter(entity::object::Column::Id.eq(key))
@@ -604,11 +589,9 @@ impl Repository {
 
             Ok((Some(model), false))
         } else {
-            // No version_id: check bucket versioning status
             let bucket_model = Self::get_bucket_txn(txn, bucket).await?;
             let status = bucket_model.versioning_status;
             if status.is_none() {
-                // Non-versioned: permanent delete null
                 let m = entity::object::Entity::find()
                     .filter(entity::object::Column::BucketId.eq(bucket))
                     .filter(entity::object::Column::Id.eq(key))
@@ -630,11 +613,9 @@ impl Repository {
                     Ok((None, false))
                 }
             } else {
-                // Versioned: create delete marker
                 let version_id = uuid::Uuid::new_v4().to_string();
                 let now = chrono::Local::now().to_utc();
 
-                // Demote old latest
                 entity::object::Entity::update_many()
                     .col_expr(entity::object::Column::IsLatest, Expr::value(false))
                     .filter(entity::object::Column::BucketId.eq(bucket))
@@ -664,8 +645,7 @@ impl Repository {
                     .await
                     .map_err(S3Error::internal_error)?;
 
-                // Return marker info: caller can create response with version_id
-                // We need to fetch the marker to return? We'll synthesize.
+                // Read the marker back so the caller gets the row as stored.
                 let marker_model = entity::object::Entity::find()
                     .filter(entity::object::Column::BucketId.eq(bucket))
                     .filter(entity::object::Column::Id.eq(key))

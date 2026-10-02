@@ -2,8 +2,6 @@
 
 use s3s::{S3Error, S3ErrorCode, S3Result};
 
-/// Validate an S3 general-purpose bucket name.
-///
 /// Enforces the documented hard rules: 3-63 characters of lowercase
 /// letters, digits, dots and hyphens; starts and ends with a letter or
 /// digit; no `xn--` prefix; not formatted as an IPv4 address.

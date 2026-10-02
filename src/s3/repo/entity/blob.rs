@@ -6,7 +6,6 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    /// Size of the backend blob in bytes.
     pub size: u32,
     /// Number of metadata references pointing at this blob. A blob is
     /// eligible for backend deletion only when this reaches zero.

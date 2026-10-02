@@ -33,7 +33,7 @@ mod session;
 const PART_SIZE: usize = 512 * 1024;
 const MAX_PARTS: i32 = 4000;
 // Telegram file chunk size used for downloads (mirrors grammers'
-/// `client::files::MAX_CHUNK_SIZE`, which is private in 0.10).
+// `client::files::MAX_CHUNK_SIZE`, which is private in 0.10).
 const MAX_CHUNK_SIZE: i32 = 512 * 1024;
 
 // Error code Telegram uses for every timed rate-limit variant

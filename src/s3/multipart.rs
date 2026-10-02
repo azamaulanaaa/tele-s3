@@ -265,8 +265,12 @@ impl<B: Backend> TeleS3<B> {
         let etag = {
             let part_count = filtered_content.len();
 
-            // Parts created by UploadPartCopy carry no digest; they simply
-            // don't contribute bytes to the combined ETag.
+            // S3's combined ETag: the MD5 of the concatenated per-part
+            // digests. Every part carries a real MD5 (including one written by
+            // UploadPartCopy, which re-reads the copied bytes to hash them), so
+            // all of them contribute. The length/hex test below is defensive
+            // only: `MultipartUploadPart::hash` has no serde default, so a part
+            // stored without a digest fails deserialization earlier.
             let mut hashes_byte = Vec::new();
             for part in &filtered_content {
                 if part.hash.len() == 32
@@ -505,7 +509,6 @@ impl<B: Backend> TeleS3<B> {
             .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
             .await?;
 
-        // Access-point sources are not supported.
         let (src_bucket, src_key, src_version_id) = match &req.input.copy_source {
             CopySource::Bucket {
                 bucket,

@@ -311,7 +311,8 @@ impl Session for SessionStorage {
     fn cache_peer(&self, peer: &PeerInfo) -> BoxFuture<'_, Result<(), Self::Error>> {
         let peer = peer.clone();
         Box::pin(async move {
-            // Merge with any previously-cached info, like upstream does.
+            // Merge with any previously-cached info, as upstream's `PeerInfo::extend_info`
+            // does: cached fields win, so a sparse update never clears a known value.
             let peer = if let Some(mut existing) = self.peer(peer.id()).await? {
                 existing.extend_info(&peer);
                 existing

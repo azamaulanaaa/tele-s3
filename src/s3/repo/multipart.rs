@@ -26,7 +26,6 @@ pub(crate) struct MultipartUploadStateUpdate {
     pub(crate) user_metadata: serde_json::Value,
     /// Object tag-set as a JSON array of {key, value}; empty array when none.
     pub(crate) tags: serde_json::Value,
-    /// Ordered part list describing the upload's committed content.
     pub(crate) content: serde_json::Value,
 }
 
