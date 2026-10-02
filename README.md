@@ -149,6 +149,22 @@ aws --endpoint-url $AWS_ENDPOINT_URL s3api delete-object --bucket my-bucket --ke
 | `listen_port` | HTTP listen port |
 | `auth_access_key` / `auth_secret_key` | S3 `SimpleAuth` credentials (used for both header and presigned URL verification) |
 
+### Environment variables
+
+The bounds on outbound Telegram I/O are **environment variables, not TOML keys**, so they can be set per container without editing `config.toml`. All three are optional; an unset or unparsable value falls back to the default and logs a warning. They are read once at start-up, so changing one takes effect on the next restart.
+
+| Variable | Default | What it bounds |
+|----------|---------|----------------|
+| `TELEGRAM_MAX_CONCURRENT_REQUESTS` | `8` | Telegram operations in flight at once, process-wide. The S3 layer fans out one backend call per blob, so this is what keeps a `DeleteObjects` or a multi-part `GET` from opening a burst at a single chat and tripping Telegram's rate limit. |
+| `TELEGRAM_IO_TIMEOUT_SECS` | `120` | Deadline for a single Telegram request, counted from the moment it holds a concurrency permit — time spent queueing behind other callers is not charged to it. Generous enough for one 512 KiB part on a slow link. |
+| `TELEGRAM_MAX_ATTEMPTS` | `8` | Attempts per retry loop, the first try included. Only Telegram's timed rate limits (`FLOOD_WAIT` and friends) are retried, and only after sleeping the window the server asked for. |
+
+Out-of-range values are clamped rather than rejected, so a bad setting degrades instead of failing at start-up: `TELEGRAM_MAX_CONCURRENT_REQUESTS` and `TELEGRAM_MAX_ATTEMPTS` have a floor of `1`, and `TELEGRAM_IO_TIMEOUT_SECS` a floor of `1`. The effective values are logged at start-up as `Telegram backend limits`.
+
+```bash
+TELEGRAM_MAX_CONCURRENT_REQUESTS=2 TELEGRAM_IO_TIMEOUT_SECS=300 cargo run -- --config config.toml
+```
+
 ## Architecture
 
 ```

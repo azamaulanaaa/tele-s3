@@ -1,4 +1,8 @@
 //! Validation of S3 general-purpose bucket names.
+//!
+//! Owns the name grammar alone. Whether the name is free, and who owns it,
+//! is a repository question answered by the bucket handlers, which call in
+//! here only to reject a name that could never be valid.
 
 use s3s::{S3Error, S3ErrorCode, S3Result};
 

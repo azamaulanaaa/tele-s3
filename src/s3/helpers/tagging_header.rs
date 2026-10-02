@@ -1,5 +1,9 @@
 //! Parsing of the `x-amz-tagging` request header into the stored tag-set
 //! document, and the percent-decoding it needs.
+//!
+//! Wire format only: `Key1=Value1&Key2=Value2` as it arrives on a request.
+//! Once decoded, the tag set is an ordinary [`super::tags`] document, so
+//! nothing outside this file should be parsing the query-param form.
 
 use s3s::{S3Error, S3ErrorCode, S3Result};
 

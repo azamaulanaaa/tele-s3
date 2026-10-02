@@ -1,5 +1,11 @@
 //! The expected checksums of an object or object part, and how they are
 //! validated and verified against streamed digests.
+//!
+//! Owns both directions of the checksum concept: the *expected* side, built
+//! from request headers or read back from a stored document, and the
+//! comparison against digests computed while the body was being written.
+//! Computing those digests is not here — it happens in the backend read and
+//! write paths, which hand this module finished values.
 
 use base64::Engine;
 use s3s::{S3Error, S3ErrorCode, S3Result};

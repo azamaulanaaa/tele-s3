@@ -1,5 +1,11 @@
 //! Translation of write-side request conditions into repository
 //! preconditions, plus the error shape delete-marker reads need.
+//!
+//! Owns `If-Match`/`If-None-Match` on writes, which cannot be answered by
+//! inspecting a row the way reads are — they have to become a compare-and-set
+//! the publish transaction enforces atomically. Keep repository-side
+//! execution out of here: the translation ends at [`PutCondition`], and the
+//! SQL that acts on it belongs to the repository.
 
 use s3s::{
     S3Error, S3ErrorCode, S3Result,

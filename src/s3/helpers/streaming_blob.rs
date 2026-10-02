@@ -1,4 +1,8 @@
 //! Adapter turning a streamed request body into the crate's reader type.
+//!
+//! Bridges `s3s`' body type and [`BoxedAsyncReader`] so the S3 handlers never
+//! name a concrete reader. Digests are computed by wrapping what comes out of
+//! here, not by changing this adapter.
 
 use futures::TryStreamExt;
 use s3s::dto::StreamingBlob;

@@ -1,4 +1,9 @@
 //! Codec between the S3 user-metadata map and its stored JSON document.
+//!
+//! The `x-amz-meta-*` map only. Tags are a separate concern with a separate
+//! stored document ([`super::tags`]), and neither document carries the
+//! object body or its checksum expectations — those live in their own
+//! columns and codecs.
 
 pub(crate) fn metadata_to_json(metadata: Option<s3s::dto::Metadata>) -> serde_json::Value {
     match metadata {

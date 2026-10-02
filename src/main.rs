@@ -26,6 +26,18 @@ struct Args {
 /// Outbound Telegram bounds, overridable from the environment so an operator
 /// can tune them without a rebuild. Unset or unparsable values keep the
 /// built-in default.
+///
+/// `TELEGRAM_MAX_CONCURRENT_REQUESTS`, `TELEGRAM_IO_TIMEOUT_SECS` and
+/// `TELEGRAM_MAX_ATTEMPTS` are read from the environment rather than the
+/// config file, so an operator can set them on a container without touching
+/// `config.toml`. They are read once, here, before the backend is built.
+/// What they bound, and their defaults, are documented in the README's
+/// configuration reference; the defaults themselves live in
+/// [`GrammersLimits::default`].
+///
+/// Out-of-range values are not rejected here — they are clamped later, by
+/// [`GrammersLimits::sanitized`] — so an absurd setting degrades instead of
+/// wedging the backend at start-up.
 fn telegram_limits() -> GrammersLimits {
     let defaults = GrammersLimits::default();
 

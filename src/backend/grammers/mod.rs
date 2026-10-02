@@ -111,7 +111,19 @@ pub struct GrammersConfig {
     pub app_id: i32,
     pub app_hash: String,
     pub bot_token: String,
+    /// Where the MTProto session (auth keys and DC state) is persisted.
+    ///
+    /// Not the object metadata store, although `main` passes it the same
+    /// connection. The tables are created on first use, and losing this
+    /// database costs a re-login rather than data: the bytes are messages in
+    /// the peer, and only the keys naming them live in the metadata store.
     pub db: DatabaseConnection,
+    /// The chat every object is stored in, resolved once at
+    /// [`Grammers::init`].
+    ///
+    /// A key is a message id in *this* chat, so an instance built for a
+    /// different `username` cannot read objects written by another — the
+    /// message ids simply do not name the same messages.
     pub username: String,
     /// Outbound concurrency bound, per-request deadline and retry budget.
     pub limits: GrammersLimits,

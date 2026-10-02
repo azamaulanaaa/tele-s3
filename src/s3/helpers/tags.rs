@@ -1,4 +1,8 @@
 //! Codec between the S3 tag set and its stored JSON document.
+//!
+//! The in-memory tag set and its persisted form, with nothing about the wire:
+//! how a `x-amz-tagging` header becomes a tag set is
+//! [`super::tagging_header`]'s concern.
 
 pub(crate) fn tags_to_json(tagging: s3s::dto::Tagging) -> serde_json::Value {
     let list: Vec<serde_json::Value> = tagging

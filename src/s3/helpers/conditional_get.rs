@@ -1,4 +1,10 @@
 //! Evaluation of conditional GET/HEAD request headers.
+//!
+//! Read side only, and only against an already-loaded object row: it turns
+//! `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` into
+//! `412`/`304` or a pass. The write side has a different shape because it
+//! becomes a compare-and-set inside the publishing transaction, which is
+//! [`super::preconditions`]' job.
 
 use std::time::SystemTime;
 
