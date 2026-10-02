@@ -773,6 +773,87 @@ mod tests {
         }
     }
 
+    fn list_uploads_req(
+        max_uploads: Option<i32>,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+    ) -> S3Request<ListMultipartUploadsInput> {
+        S3Request {
+            input: ListMultipartUploadsInput {
+                bucket: "b".to_string(),
+                max_uploads,
+                key_marker,
+                upload_id_marker,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: "/b".parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_max_uploads_is_invalid_argument() {
+        let (svc, _upload_id) = test_service_with_upload().await;
+
+        let err = svc
+            .list_multipart_uploads_inner(list_uploads_req(Some(-1), None, None))
+            .await
+            .expect_err("negative max-uploads must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_uploads_paginates_and_reports_next_markers() {
+        let (svc, _upload_id) = test_service_with_upload().await;
+        svc.repo
+            .upsert_multipart_upload_state(
+                "b".into(),
+                "k".into(),
+                "u2".into(),
+                None,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create second upload state");
+
+        let page1 = svc
+            .list_multipart_uploads_inner(list_uploads_req(Some(1), None, None))
+            .await
+            .expect("page 1")
+            .output;
+        let uploads = page1.uploads.expect("uploads");
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].key.as_deref(), Some("k"));
+        assert_eq!(uploads[0].upload_id.as_deref(), Some("u1"));
+        assert_eq!(page1.is_truncated, Some(true));
+        assert_eq!(page1.next_key_marker.as_deref(), Some("k"));
+        assert_eq!(page1.next_upload_id_marker.as_deref(), Some("u1"));
+
+        let page2 = svc
+            .list_multipart_uploads_inner(list_uploads_req(
+                Some(1),
+                page1.next_key_marker,
+                page1.next_upload_id_marker,
+            ))
+            .await
+            .expect("page 2")
+            .output;
+        let uploads = page2.uploads.expect("uploads");
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].upload_id.as_deref(), Some("u2"));
+        assert_eq!(page2.is_truncated, Some(false));
+        assert_eq!(page2.next_key_marker, None);
+        assert_eq!(page2.next_upload_id_marker, None);
+    }
+
     #[tokio::test]
     async fn negative_max_parts_is_invalid_argument() {
         let (svc, upload_id) = test_service_with_upload().await;

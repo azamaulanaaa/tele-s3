@@ -1,11 +1,15 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::prelude::Expr;
-use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::sea_query::{IntoCondition, OnConflict};
+use sea_orm::{
+    ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    QueryTrait, Set,
+};
 use tracing::instrument;
 
 use super::Repository;
 use super::entity;
+use crate::s3::objects::checked_max_uploads;
 
 impl Repository {
     #[instrument(skip(self), level = "debug", err)]
@@ -51,6 +55,66 @@ impl Repository {
         Ok(())
     }
 
+    /// Build the bounded page query for [`Self::list_multipart_uploads`].
+    ///
+    /// `fetch_max` is the SQL `LIMIT` (the page size plus the truncation
+    /// sentinel). Split out so the rendered SQL — `LIMIT` and marker
+    /// predicate included — is assertable without a database.
+    fn multipart_uploads_page_query(
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        fetch_max: u64,
+    ) -> sea_orm::Select<entity::multipart_upload_state::Entity> {
+        entity::multipart_upload_state::Entity::find()
+            .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
+            // "Strictly after the cursor": rows past the marked key, plus the
+            // marked key's uploads after the marked upload. An `upload_id_marker`
+            // only narrows within the marked key; without a `key_marker` there
+            // is nothing to narrow and the marker is ignored, as S3 specifies.
+            .filter(match (key_marker, upload_id_marker) {
+                (Some(km), Some(uid)) => Condition::any()
+                    .add(entity::multipart_upload_state::Column::ObjectId.gt(km))
+                    .add(
+                        Condition::all()
+                            .add(entity::multipart_upload_state::Column::ObjectId.eq(km))
+                            .add(entity::multipart_upload_state::Column::UploadId.gt(uid)),
+                    )
+                    .into_condition(),
+                (km, _) => km
+                    .map(|km| {
+                        entity::multipart_upload_state::Column::ObjectId
+                            .gt(km)
+                            .into_condition()
+                    })
+                    .unwrap_or_else(|| Condition::all().into_condition()),
+            })
+            .order_by_asc(entity::multipart_upload_state::Column::ObjectId)
+            .order_by_asc(entity::multipart_upload_state::Column::UploadId)
+            .limit(fetch_max)
+            .apply_if(prefix, |query, p| {
+                query.filter(entity::multipart_upload_state::Column::ObjectId.starts_with(p))
+            })
+    }
+
+    /// List one page of the bucket's in-flight multipart uploads.
+    ///
+    /// Rows come back ordered `ObjectId ASC, UploadId ASC` and the page is
+    /// bounded by a SQL `LIMIT`, so a paginated walk never materialises the
+    /// whole table (with its `content` / `tags` / `user_metadata` JSON
+    /// columns) per page.
+    ///
+    /// The `(key_marker, upload_id_marker)` boundary is a SQL predicate rather
+    /// than a post-fetch filter: with a `key_marker` alone the cursor is the
+    /// key itself, and with an `upload_id_marker` it is that exact row.
+    ///
+    /// `max_uploads` is validated (negatives rejected, values above the S3
+    /// ceiling clamped) and the query fetches `max_uploads + 1` rows: the
+    /// returned bool is the truncation sentinel (true means one more row
+    /// existed beyond the page) and the returned vector holds at most
+    /// `max_uploads` rows, so the caller derives `next_key_marker` /
+    /// `next_upload_id_marker` from its last row.
     #[instrument(skip(self), level = "debug", err)]
     pub async fn list_multipart_uploads(
         &self,
@@ -60,38 +124,23 @@ impl Repository {
         upload_id_marker: Option<&str>,
         max_uploads: Option<i32>,
     ) -> S3Result<(Vec<entity::multipart_upload_state::Model>, bool)> {
-        let mut query = entity::multipart_upload_state::Entity::find()
-            .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket));
+        let max_uploads = checked_max_uploads(max_uploads)?;
+        let limit =
+            usize::try_from(max_uploads).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+        // Fetch-limit + 1: the sentinel row is dropped before returning, so
+        // `is_truncated` comes from real remaining data and not a second query.
+        let fetch_max = limit.saturating_add(1);
 
-        if let Some(prefix) = prefix {
-            query =
-                query.filter(entity::multipart_upload_state::Column::ObjectId.starts_with(prefix));
-        }
+        let query = Self::multipart_uploads_page_query(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            fetch_max as u64,
+        );
 
-        let mut models = query
-            .order_by_asc(entity::multipart_upload_state::Column::ObjectId)
-            .order_by_asc(entity::multipart_upload_state::Column::UploadId)
-            .all(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?;
+        let mut models = query.all(&self.db).await.map_err(S3Error::internal_error)?;
 
-        // S3 key-marker semantics: start after (key_marker, upload_id_marker).
-        if let Some(km) = key_marker {
-            models.retain(|m| {
-                if m.object_id.as_str() > km {
-                    true
-                } else if m.object_id.as_str() == km {
-                    match upload_id_marker {
-                        Some(uid) => m.upload_id.as_str() > uid,
-                        None => false,
-                    }
-                } else {
-                    false
-                }
-            });
-        }
-
-        let limit = std::cmp::max(max_uploads.unwrap_or(1000), 0) as usize;
         let is_truncated = models.len() > limit;
         if is_truncated {
             models.truncate(limit);
@@ -196,5 +245,209 @@ impl Repository {
             "multipart upload state changed concurrently {} times",
             MAX_ATTEMPTS
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn repo() -> Repository {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        Repository::init(db).await.expect("init")
+    }
+
+    /// Seed `keys`, each with `uploads_per_key` upload ids `u0..uN`.
+    async fn seed_uploads(repo: &Repository, keys: &[&str], uploads_per_key: usize) {
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        for key in keys {
+            for i in 0..uploads_per_key {
+                repo.upsert_multipart_upload_state(
+                    "b".into(),
+                    (*key).to_string(),
+                    format!("u{i}"),
+                    None,
+                    serde_json::json!({}),
+                    serde_json::json!([]),
+                    serde_json::json!({"part": i}),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seed {key}/u{i}: {e:?}"));
+            }
+        }
+    }
+
+    fn page_sql(
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        fetch_max: u64,
+    ) -> String {
+        Repository::multipart_uploads_page_query("b", None, key_marker, upload_id_marker, fetch_max)
+            .build(sea_orm::DbBackend::Sqlite)
+            .to_string()
+    }
+
+    fn ids(models: &[entity::multipart_upload_state::Model]) -> Vec<(String, String)> {
+        models
+            .iter()
+            .map(|m| (m.object_id.clone(), m.upload_id.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn upload_page_query_carries_sql_limit() {
+        let sql = page_sql(None, None, 4);
+        assert!(
+            sql.contains("LIMIT 4"),
+            "upload page query must bound rows in SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn upload_page_query_pushes_markers_into_sql() {
+        let sql = page_sql(Some("k1"), Some("u1"), 4);
+        assert!(sql.contains("LIMIT 4"), "missing limit: {sql}");
+        assert!(
+            sql.contains(r#""object_id" >"#),
+            "key marker must be a SQL predicate: {sql}"
+        );
+        assert!(
+            sql.contains(r#""upload_id" >"#),
+            "upload-id marker must be a SQL predicate: {sql}"
+        );
+
+        // Without a key marker an upload-id marker narrows nothing.
+        let sql = page_sql(None, Some("u1"), 4);
+        assert!(
+            !sql.contains(r#""upload_id" >"#),
+            "upload-id marker alone must not filter: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_bounds_rows_to_limit() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["a", "b", "c", "d", "e"], 1).await;
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, None, None, Some(2))
+            .await
+            .expect("page 1");
+        assert_eq!(
+            ids(&models),
+            [("a".into(), "u0".into()), ("b".into(), "u0".into())],
+            "SQL limit must cap the returned page"
+        );
+        assert!(is_truncated, "sentinel row must report truncation");
+
+        // Last page exactly fills: no truncation, no sentinel.
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, None, None, Some(5))
+            .await
+            .expect("full page");
+        assert_eq!(models.len(), 5);
+        assert!(!is_truncated);
+    }
+
+    #[tokio::test]
+    async fn upload_page_two_starts_after_both_markers() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["a", "b", "c", "d"], 2).await;
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, None, None, Some(3))
+            .await
+            .expect("page 1");
+        assert_eq!(
+            ids(&models),
+            [
+                ("a".into(), "u0".into()),
+                ("a".into(), "u1".into()),
+                ("b".into(), "u0".into()),
+            ]
+        );
+        assert!(is_truncated);
+
+        let last = models.last().expect("page 1").clone();
+        let last_key = last.object_id.clone();
+        let last_upload = last.upload_id.clone();
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, Some(&last_key), Some(&last_upload), Some(3))
+            .await
+            .expect("page 2");
+        assert_eq!(
+            ids(&models),
+            [
+                ("b".into(), "u1".into()),
+                ("c".into(), "u0".into()),
+                ("c".into(), "u1".into()),
+            ],
+            "continuation markers must resume at the next row, not repeat or skip"
+        );
+        assert!(is_truncated);
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, Some(&last_key), Some(&last_upload), None)
+            .await
+            .expect("tail");
+        assert_eq!(
+            ids(&models),
+            [
+                ("b".into(), "u1".into()),
+                ("c".into(), "u0".into()),
+                ("c".into(), "u1".into()),
+                ("d".into(), "u0".into()),
+                ("d".into(), "u1".into()),
+            ]
+        );
+        assert!(!is_truncated, "last page must not report truncation");
+    }
+
+    #[tokio::test]
+    async fn upload_key_marker_alone_skips_the_whole_marker_key() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["a", "b"], 2).await;
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, Some("a"), None, Some(10))
+            .await
+            .expect("list");
+        assert_eq!(
+            ids(&models),
+            [("b".into(), "u0".into()), ("b".into(), "u1".into())]
+        );
+        assert!(!is_truncated);
+    }
+
+    #[tokio::test]
+    async fn negative_max_uploads_is_invalid_argument() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["a"], 1).await;
+
+        let err = repo
+            .list_multipart_uploads("b", None, None, None, Some(-1))
+            .await
+            .expect_err("negative max-uploads must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn max_uploads_above_ceiling_is_clamped() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["a", "b"], 1).await;
+
+        // 5000 is above the S3 ceiling but not a rejection: every seeded row
+        // comes back, proving the query did not fail on the oversized value.
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", None, None, None, Some(5000))
+            .await
+            .expect("oversized max-uploads must be clamped, not rejected");
+        assert_eq!(models.len(), 2);
+        assert!(!is_truncated);
     }
 }

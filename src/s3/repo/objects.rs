@@ -1,9 +1,9 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::{
     ColumnTrait, Condition, DatabaseTransaction, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    QuerySelect, QueryTrait, Set, TransactionTrait,
     prelude::Expr,
-    sea_query::{OnConflict, Query},
+    sea_query::{IntoCondition, OnConflict, Query},
 };
 use tracing::instrument;
 
@@ -644,6 +644,76 @@ impl Repository {
         Ok(models)
     }
 
+    /// Build the bounded page query for [`Self::list_object_versions`].
+    ///
+    /// `limit` is the SQL `LIMIT` (the caller's fetch cap) and
+    /// `version_cursor` the resolved `(key_marker, last_modified)` position of
+    /// `version_id_marker`, when both markers were supplied and resolved.
+    /// Split out so the rendered SQL — `LIMIT` and marker predicate included —
+    /// is assertable without a database.
+    fn object_versions_page_query(
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_cursor: Option<(String, chrono::DateTime<chrono::Utc>)>,
+        limit: u64,
+    ) -> sea_orm::Select<entity::object::Entity> {
+        entity::object::Entity::find()
+            .filter(entity::object::Column::BucketId.eq(bucket))
+            // "Strictly after the cursor": rows past the marker key, plus the
+            // marker key's own versions older than the cursor version.
+            .filter(match version_cursor {
+                Some((km, marker_modified)) => Condition::any()
+                    .add(entity::object::Column::Id.gt(km.clone()))
+                    .add(
+                        Condition::all()
+                            .add(entity::object::Column::Id.eq(km))
+                            .add(entity::object::Column::LastModified.lt(marker_modified)),
+                    )
+                    .into_condition(),
+                None => key_marker
+                    .map(|km| entity::object::Column::Id.gt(km).into_condition())
+                    .unwrap_or_else(|| Condition::all().into_condition()),
+            })
+            .order_by_asc(entity::object::Column::Id)
+            .order_by_desc(entity::object::Column::LastModified)
+            // Final tiebreaker: makes the page order total, so the marker
+            // predicate above lands on the same boundary the walk starts from
+            // even when two versions share a `last_modified`.
+            .order_by_asc(entity::object::Column::VersionId)
+            .limit(limit)
+            .apply_if(prefix, |query, p| {
+                query.filter(entity::object::Column::Id.starts_with(p))
+            })
+    }
+
+    /// List one page of a bucket's object versions.
+    ///
+    /// Rows come back ordered `Id ASC, LastModified DESC, VersionId ASC` — the
+    /// S3 version-listing order — and the page is bounded by a SQL `LIMIT`: at
+    /// most `max_keys` rows are ever materialised, so a recursive
+    /// `ListObjectVersions` walk costs one indexed page per request instead of
+    /// a full-table materialisation (heavy `content` / `user_metadata` /
+    /// `tags` / `checksums` columns included) per page.
+    ///
+    /// Pagination is a SQL predicate, not a post-fetch filter, so rows at or
+    /// before the marker are never read. With only `key_marker` the cursor is
+    /// the key itself; with `key_marker` + `version_id_marker` it is that
+    /// exact row, and the rows after it are the ones with a greater key or a
+    /// smaller `last_modified`. An unknown `version_id_marker` degrades to the
+    /// key-only boundary.
+    ///
+    /// Callers pass `max_keys + 1` and use the extra row as the truncation
+    /// sentinel: `len() > max_keys` means another page exists, the sentinel
+    /// row is dropped, and the last returned row supplies the continuation
+    /// `(key_marker, version_id_marker)`.
+    ///
+    /// `delimiter` is intentionally ignored: the handler folds the returned
+    /// page into `CommonPrefix` entries, so the page boundary — not the bucket
+    /// — is what bounds that rollup, exactly as when this query was unbounded.
+    ///
+    /// Returns `(versions, delete_markers)`, both split out of the single
+    /// ordered page.
     pub async fn list_object_versions(
         &self,
         bucket: &str,
@@ -653,51 +723,35 @@ impl Repository {
         version_id_marker: Option<String>,
         max_keys: Option<i32>,
     ) -> S3Result<(Vec<entity::object::Model>, Vec<entity::object::Model>)> {
-        // Returns (versions, delete_markers) split
-        // Fetch all versions for bucket, ordered by key asc, last_modified desc
-        let mut query = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .order_by_asc(entity::object::Column::Id)
-            .order_by_desc(entity::object::Column::LastModified);
-
-        if let Some(prefix) = prefix.clone() {
-            query = query.filter(entity::object::Column::Id.starts_with(prefix));
-        }
-
-        let mut all = query.all(&self.db).await.map_err(S3Error::internal_error)?;
-
-        // Handle delimiter: if specified, we need to return common prefixes? That is handled in S3 layer, not here.
-        // We just return all versions; S3 layer will compute common prefixes.
-        // For delimiter case, S3 spec groups keys. Our repo returns all versions, handler will fold.
-        // But we need to apply key_marker/version_id_marker pagination:
-        if let Some(km) = key_marker {
-            if let Some(vid) = version_id_marker {
-                // Find position of (km, vid)
-                if let Some(pos) = all.iter().position(|m| m.id == km && m.version_id == vid) {
-                    all = all[pos + 1..].to_vec();
-                } else if let Some(pos) = all.iter().position(|m| m.id > km) {
-                    // If exact vid not found, start after key_marker
-                    all = all[pos..].to_vec();
-                } else {
-                    all.retain(|m| m.id > km);
-                }
-            } else {
-                all.retain(|m| m.id > km);
-            }
-        }
-
-        // Apply max_keys truncation in handler, but we can pre-truncate
         let limit = usize::try_from(max_keys.unwrap_or(MAX_KEYS_CEILING))
             .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
-        let truncated = all.len() > limit;
-        if truncated {
-            all.truncate(limit);
-        }
 
-        // Split into versions vs delete markers
+        // Resolve the version cursor to its sort position first: a primary-key
+        // probe, so the page query below never loads rows at/before the
+        // marker just to find where to cut.
+        let version_cursor = match (key_marker.as_deref(), version_id_marker.as_deref()) {
+            (Some(km), Some(vid)) => match self.get_object_version(bucket, km, vid).await {
+                Ok(model) => Some((km.to_owned(), model.last_modified)),
+                Err(e) if *e.code() == S3ErrorCode::NoSuchKey => None,
+                Err(e) => return Err(e),
+            },
+            _ => None,
+        };
+
+        let query = Self::object_versions_page_query(
+            bucket,
+            prefix.as_deref(),
+            key_marker.as_deref(),
+            version_cursor,
+            limit as u64,
+        );
+
+        let page = query.all(&self.db).await.map_err(S3Error::internal_error)?;
+
+        // Split into versions vs delete markers, preserving page order.
         let mut versions = Vec::new();
         let mut delete_markers = Vec::new();
-        for m in all {
+        for m in page {
             if m.is_delete_marker {
                 delete_markers.push(m);
             } else {
@@ -705,10 +759,197 @@ impl Repository {
             }
         }
 
-        // If delimiter provided, we need to filter versions to mimic list_objects delimiter behavior?
-        // For list_object_versions, delimiter grouping is similar but versions are still listed; common prefixes are separate.
-        // Our handler will compute common prefixes from versions list, so we just return.
-
         Ok((versions, delete_markers))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3::repo::PutCondition;
+
+    async fn repo() -> Repository {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        Repository::init(db).await.expect("init")
+    }
+
+    /// Seed a versioned bucket with `keys`, one version each.
+    async fn versioned_bucket_with_keys(repo: &Repository, keys: &[&str]) {
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        repo.put_bucket_versioning("b", Some("Enabled".into()))
+            .await
+            .expect("enable versioning");
+        for key in keys {
+            repo.cas_put_object(
+                "b".into(),
+                (*key).to_string(),
+                ObjectWrite {
+                    size: 1,
+                    content_type: None,
+                    etag: Some(format!("etag-{key}")),
+                    content: serde_json::json!({"item": []}),
+                    user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                },
+                PutCondition::None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("put {key}: {e:?}"));
+        }
+    }
+
+    fn page_sql(
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_cursor: Option<(String, chrono::DateTime<chrono::Utc>)>,
+        limit: u64,
+    ) -> String {
+        Repository::object_versions_page_query("b", prefix, key_marker, version_cursor, limit)
+            .build(sea_orm::DbBackend::Sqlite)
+            .to_string()
+    }
+
+    #[test]
+    fn version_page_query_carries_sql_limit() {
+        let sql = page_sql(None, None, None, 3);
+        assert!(
+            sql.contains("LIMIT 3"),
+            "version page query must bound rows in SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn version_page_query_pushes_markers_into_sql() {
+        let cursor_at = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let sql = page_sql(Some("a/"), Some("a/2"), Some(("a/2".into(), cursor_at)), 5);
+        assert!(sql.contains("LIMIT 5"), "missing limit: {sql}");
+        assert!(
+            sql.contains(r#""id" > $1"#) || sql.contains(r#""id" > "#),
+            "key marker must be a SQL predicate, not a post-fetch filter: {sql}"
+        );
+        assert!(
+            sql.contains(r#""last_modified" <"#),
+            "version marker must be a SQL predicate: {sql}"
+        );
+        assert!(
+            sql.contains(r#""id" LIKE"#) || sql.contains("LIKE"),
+            "prefix must stay in SQL: {sql}"
+        );
+
+        // The version cursor is only meaningful together with its key.
+        let sql = page_sql(None, Some("a/2"), None, 5);
+        assert!(
+            !sql.contains(r#""last_modified" <"#),
+            "key-only marker must not emit a last_modified bound: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_bounds_rows_to_limit() {
+        let repo = repo().await;
+        versioned_bucket_with_keys(&repo, &["a/1", "a/2", "a/3", "b/1", "b/2"]).await;
+
+        let (versions, markers) = repo
+            .list_object_versions("b", None, None, None, None, Some(2))
+            .await
+            .expect("page 1");
+        assert!(markers.is_empty());
+        assert_eq!(
+            versions.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a/1", "a/2"],
+            "SQL limit must cap the returned page"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_page_two_starts_after_both_markers() {
+        let repo = repo().await;
+        versioned_bucket_with_keys(&repo, &["a/1", "a/2", "a/3", "b/1", "b/2"]).await;
+
+        let (versions, page1_markers) = repo
+            .list_object_versions("b", None, None, None, None, Some(2))
+            .await
+            .expect("page 1");
+        assert!(page1_markers.is_empty());
+        let last = versions.last().expect("page 1 must be non-empty");
+
+        let (versions, markers) = repo
+            .list_object_versions(
+                "b",
+                None,
+                None,
+                Some(last.id.clone()),
+                Some(last.version_id.clone()),
+                Some(2),
+            )
+            .await
+            .expect("page 2");
+        assert!(markers.is_empty());
+        assert_eq!(
+            versions.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a/3", "b/1"],
+            "continuation markers must resume at the next row, not repeat or skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_key_marker_alone_skips_the_whole_marker_key() {
+        let repo = repo().await;
+        versioned_bucket_with_keys(&repo, &["a/1", "a/2", "b/1"]).await;
+
+        let (versions, markers) = repo
+            .list_object_versions("b", None, None, Some("a/1".into()), None, Some(10))
+            .await
+            .expect("list");
+        assert!(markers.is_empty());
+        assert_eq!(
+            versions.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a/2", "b/1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_version_marker_degrades_to_key_boundary() {
+        let repo = repo().await;
+        versioned_bucket_with_keys(&repo, &["a/1", "b/1"]).await;
+
+        let (versions, markers) = repo
+            .list_object_versions(
+                "b",
+                None,
+                None,
+                Some("a/1".into()),
+                Some("no-such-version".into()),
+                Some(10),
+            )
+            .await
+            .expect("list");
+        assert!(markers.is_empty());
+        assert_eq!(
+            versions.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["b/1"],
+            "an unresolvable version marker must not resurrect the marked key"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_pages_of_zero_limit_return_nothing() {
+        let repo = repo().await;
+        versioned_bucket_with_keys(&repo, &["a/1", "b/1"]).await;
+
+        let (versions, markers) = repo
+            .list_object_versions("b", None, None, None, None, Some(0))
+            .await
+            .expect("list");
+        assert!(versions.is_empty());
+        assert!(markers.is_empty());
     }
 }

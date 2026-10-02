@@ -48,6 +48,15 @@ pub(super) fn checked_max_keys(max_keys: Option<i32>) -> S3Result<i32> {
     Ok(raw.min(MAX_KEYS_CEILING))
 }
 
+/// Validate the `max-uploads` paging size of ListMultipartUploads.
+///
+/// `max-uploads` is bounded by the same S3 ceiling as `max-keys` and has the
+/// same unset default, so the rule lives in one place; this alias keeps the
+/// call site in the multipart listing readable.
+pub(super) fn checked_max_uploads(max_uploads: Option<i32>) -> S3Result<i32> {
+    checked_max_keys(max_uploads)
+}
+
 /// Narrow a client-supplied `Content-Length` to `u64`.
 pub(super) fn checked_content_length(content_length: Option<i64>) -> S3Result<u64> {
     let len = content_length.ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))?;
@@ -1510,6 +1519,206 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    fn list_versions_paged_req(
+        bucket: &str,
+        max_keys: i32,
+        delimiter: Option<&str>,
+        key_marker: Option<String>,
+        version_id_marker: Option<String>,
+    ) -> S3Request<ListObjectVersionsInput> {
+        S3Request {
+            input: ListObjectVersionsInput {
+                bucket: bucket.to_string(),
+                max_keys: Some(max_keys),
+                delimiter: delimiter.map(str::to_string),
+                key_marker,
+                version_id_marker,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/{bucket}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    /// Seed a versioned bucket with one version per key.
+    async fn seed_versions(svc: &TeleS3<Memory<1, 1>>, keys: &[&str]) {
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.repo
+            .put_bucket_versioning("b", Some("Enabled".into()))
+            .await
+            .expect("enable versioning");
+        for key in keys {
+            svc.repo
+                .cas_put_object(
+                    "b".into(),
+                    (*key).to_string(),
+                    super::super::repo::ObjectWrite {
+                        size: 1,
+                        content_type: None,
+                        etag: Some(format!("etag-{key}")),
+                        content: serde_json::json!({"item": []}),
+                        user_metadata: serde_json::json!({}),
+                        checksums: serde_json::json!({}),
+                        tags: serde_json::json!([]),
+                    },
+                    super::super::repo::PutCondition::None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("put {key}: {e:?}"));
+        }
+    }
+
+    /// One page of `list_object_versions_inner` reduced to the fields a
+    /// delimiter-aware client actually reads.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Page {
+        prefixes: Vec<String>,
+        keys: Vec<String>,
+        is_truncated: Option<bool>,
+        next_key_marker: Option<String>,
+        next_version_id_marker: Option<String>,
+    }
+
+    async fn versions_page(
+        svc: &TeleS3<Memory<1, 1>>,
+        max_keys: i32,
+        delimiter: Option<&str>,
+        key_marker: Option<String>,
+        version_id_marker: Option<String>,
+    ) -> Page {
+        let res = svc
+            .list_object_versions_inner(list_versions_paged_req(
+                "b",
+                max_keys,
+                delimiter,
+                key_marker,
+                version_id_marker,
+            ))
+            .await
+            .expect("list versions");
+        let out = res.output;
+        Page {
+            prefixes: out
+                .common_prefixes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.prefix.expect("prefix"))
+                .collect(),
+            keys: out
+                .versions
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.key.expect("key"))
+                .collect(),
+            is_truncated: out.is_truncated,
+            next_key_marker: out.next_key_marker,
+            next_version_id_marker: out.next_version_id_marker,
+        }
+    }
+
+    /// Walk every page of a listing, following the continuation markers.
+    async fn walk_versions(
+        svc: &TeleS3<Memory<1, 1>>,
+        max_keys: i32,
+        delimiter: Option<&str>,
+    ) -> Vec<Page> {
+        let mut pages = Vec::new();
+        let (mut km, mut vid) = (None, None);
+        loop {
+            let page = versions_page(svc, max_keys, delimiter, km.clone(), vid.clone()).await;
+            let truncated = page.is_truncated == Some(true);
+            pages.push(page);
+            if !truncated {
+                return pages;
+            }
+            assert!(
+                pages.len() < 10,
+                "continuation markers must advance; walk did not terminate"
+            );
+            km = pages.last().and_then(|p| p.next_key_marker.clone());
+            vid = pages.last().and_then(|p| p.next_version_id_marker.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn delimiter_rollup_is_unaffected_by_sql_page_limit() {
+        let svc = test_service().await;
+        seed_versions(&svc, &["a/1", "a/2", "b/1"]).await;
+
+        // The unbounded baseline: every key fits in one page.
+        let whole = versions_page(&svc, 1000, Some("/"), None, None).await;
+        assert_eq!(whole.prefixes, ["a/", "b/"]);
+        assert!(whole.keys.is_empty());
+        assert_eq!(whole.is_truncated, Some(false));
+
+        // Paged below the result set: same rollup, split across pages by the
+        // handler's existing fold. The `CommonPrefix` entries per page are
+        // pinned to current (pre-SQL-cap) behaviour.
+        let paged = walk_versions(&svc, 1, Some("/")).await;
+        assert_eq!(
+            paged.len(),
+            3,
+            "three keys must take three pages: {paged:?}"
+        );
+        assert_eq!(paged[0].prefixes, ["a/"]);
+        assert_eq!(paged[1].prefixes, ["a/"]);
+        assert_eq!(paged[2].prefixes, ["b/"]);
+        assert_eq!(paged[2].is_truncated, Some(false));
+        for page in &paged[..2] {
+            assert_eq!(page.is_truncated, Some(true), "{page:?}");
+            assert!(page.next_key_marker.is_some(), "{page:?}");
+            assert!(page.next_version_id_marker.is_some(), "{page:?}");
+        }
+        assert_eq!(paged[2].next_key_marker, None);
+        assert_eq!(paged[2].next_version_id_marker, None);
+
+        // Flat (no delimiter) walk: every key exactly once, in order.
+        let flat = walk_versions(&svc, 1, None).await;
+        assert_eq!(
+            flat.iter().map(|p| p.keys.clone()).collect::<Vec<_>>(),
+            [["a/1"], ["a/2"], ["b/1"]]
+        );
+        assert!(
+            flat.iter().all(|p| p.prefixes.is_empty()),
+            "no delimiter must mean no rollup: {flat:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_pages_cover_every_row_exactly_once() {
+        let svc = test_service().await;
+        seed_versions(&svc, &["a/1", "a/2", "a/3", "b/1", "b/2", "c/1"]).await;
+
+        let flat = walk_versions(&svc, 2, None).await;
+        assert_eq!(
+            flat.iter().flat_map(|p| p.keys.clone()).collect::<Vec<_>>(),
+            ["a/1", "a/2", "a/3", "b/1", "b/2", "c/1"],
+            "SQL-limited pages must neither skip nor repeat a key"
+        );
+        assert_eq!(flat.last().expect("last page").is_truncated, Some(false));
+    }
+
+    #[tokio::test]
+    async fn version_max_keys_of_one_pages_a_single_key() {
+        let svc = test_service().await;
+        seed_versions(&svc, &["a/1", "b/1"]).await;
+
+        let page = versions_page(&svc, 1, None, None, None).await;
+        assert_eq!(page.keys, ["a/1"]);
+        assert_eq!(page.is_truncated, Some(true));
+        assert_eq!(page.next_key_marker.as_deref(), Some("a/1"));
+        assert!(page.next_version_id_marker.is_some());
     }
 
     fn put_req(bucket: &str, key: &str, content_length: Option<i64>) -> S3Request<PutObjectInput> {
