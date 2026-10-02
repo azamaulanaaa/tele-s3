@@ -27,7 +27,7 @@ use super::helpers::{
     json_to_metadata, json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json,
     verify_checksums,
 };
-use super::repo::ObjectWrite;
+use super::repo::{ObjectWrite, Repository};
 use super::types::{Metadata, MetadataItem};
 use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader};
 
@@ -71,13 +71,18 @@ impl<B: Backend> TeleS3<B> {
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let size = checked_content_length(req.input.content_length)?;
 
+        // The blob row's `size` column is 32-bit; reject an oversized body up
+        // front so the failure still precedes the backend write, exactly as
+        // it did when the row was inserted separately.
+        Repository::checked_size(size)?;
+
         let condition = build_put_condition(
             req.input.if_match.as_ref(),
             req.input.if_none_match.as_ref(),
         )?;
 
         // Fast-fail doomed conditional writes before streaming into the
-        // backend; the atomic re-check still happens in cas_put_object.
+        // backend; the atomic re-check still happens at publish commit time.
         self.precondition_gate(&req.input.bucket, &req.input.key, &condition)
             .await?;
 
@@ -134,17 +139,11 @@ impl<B: Backend> TeleS3<B> {
             (id, hash_md5, computed.0, computed.1, computed.2, computed.3)
         };
 
-        // The backend blob now exists; register it before any fallible
-        // validation so a BadDigest cleanup can release it (mirrors the
-        // Content-MD5 path below). Until cas_put_object links it, this
-        // reference is owned solely by the incoming write.
-        if let Some(ref id) = id {
-            self.repo.register_new_blob(id.clone(), size).await?;
-        }
-
-        // Verify streaming checksums before the blob is linked. A mismatch
-        // means corrupt transport: drop the backend blob and fail fast so
-        // archives never store bad bytes under a good checksum.
+        // The backend blob now exists but nothing references it yet: its row
+        // is written by the publish transaction further down, together with
+        // the object row. Verify streaming checksums before that link is
+        // made. A mismatch means corrupt transport: drop the backend blob and
+        // fail fast so archives never store bad bytes under a good checksum.
         if let Err(e) = verify_checksums(
             computed_crc32,
             computed_crc32c,
@@ -156,7 +155,7 @@ impl<B: Backend> TeleS3<B> {
             expected_sha256.as_deref(),
         ) {
             if let Some(id) = id {
-                self.release_blobs(vec![id]).await?;
+                self.discard_backend_blobs(vec![id]).await;
             }
             return Err(e);
         }
@@ -171,7 +170,7 @@ impl<B: Backend> TeleS3<B> {
 
             if expected_digest[..] != hash_md5[..] {
                 if let Some(id) = id {
-                    self.release_blobs(vec![id]).await?;
+                    self.discard_backend_blobs(vec![id]).await;
                 }
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
@@ -236,13 +235,25 @@ impl<B: Backend> TeleS3<B> {
         let version_id = {
             let bucket = req.input.bucket.clone();
             let key = req.input.key.clone();
-            let result = self.repo.cas_put_object(bucket, key, data, condition).await;
+
+            // Blob row and object row are published in ONE transaction: a
+            // failure rolls both back, so no orphaned `s3_blob` row can
+            // survive the write. The caller then drops the backend bytes the
+            // rolled-back row would have owned.
+            let result = match id.clone() {
+                Some(blob_id) => {
+                    self.repo
+                        .publish_object_with_new_blob(blob_id, size, bucket, key, data, condition)
+                        .await
+                }
+                None => self.repo.cas_put_object(bucket, key, data, condition).await,
+            };
 
             match result {
                 Ok(vid) => vid,
                 Err(err) => {
                     if let Some(id) = id {
-                        let _ = self.release_blobs(vec![id]).await;
+                        self.discard_backend_blobs(vec![id]).await;
                     }
                     return Err(err);
                 }

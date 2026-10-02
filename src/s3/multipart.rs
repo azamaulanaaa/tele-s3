@@ -123,6 +123,14 @@ impl<B: Backend> TeleS3<B> {
 
         // The part blob is owned by the multipart upload state until the
         // upload completes (ownership moves to the object) or aborts.
+        //
+        // Registration stays a separate transaction here (unlike
+        // `PutObject`, which publishes blob + object together): the state
+        // update that links this blob is a bounded CAS retry loop
+        // (`cas_update_multipart_content`), and wrapping it would either
+        // hold a write lock across retries or change its retry semantics.
+        // An interrupted upload is therefore still reclaimable only by the
+        // start-up blob reconciler.
         self.repo.register_new_blob(id.clone(), size).await?;
 
         if verify_checksums(

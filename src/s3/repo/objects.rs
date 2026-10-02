@@ -78,6 +78,50 @@ impl Repository {
         }
     }
 
+    /// Atomic publish: record the freshly written blob row *and* the object
+    /// row in one transaction.
+    ///
+    /// `PutObject` used to run [`Self::cas_put_object`] as a second
+    /// transaction after `register_new_blob`. The backend blob already
+    /// existed at that point, so a crash (or any error) between the two left
+    /// a `s3_blob` row with `refs = 1` that nothing references: invisible to
+    /// every listing, never reclaimed. Composing the blob insert with the
+    /// already-factored `cas_put_object_txn` closes the window — both rows
+    /// appear together or not at all.
+    ///
+    /// Error mapping is unchanged: the condition check, the versioning
+    /// branches and their codes all come from `cas_put_object_txn`.
+    #[instrument(skip(self, data, condition), level = "debug", err)]
+    pub async fn publish_object_with_new_blob(
+        &self,
+        blob_id: String,
+        blob_size: u64,
+        bucket: String,
+        key: String,
+        data: ObjectWrite,
+        condition: PutCondition,
+    ) -> S3Result<String> {
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result = async {
+            Self::insert_blob(&txn, blob_id, blob_size).await?;
+            self.cas_put_object_txn(&txn, bucket, key, data, condition)
+                .await
+        }
+        .await;
+
+        match result {
+            Ok(version_id) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(version_id)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
+    }
+
     async fn cas_put_object_txn(
         &self,
         txn: &DatabaseTransaction,
@@ -1230,5 +1274,161 @@ mod tests {
             }
             Err(e) => panic!("latest read failed: {e:?}"),
         }
+    }
+
+    // ---- Atomicity of the blob + object publish ----
+
+    fn write_with_content(content: serde_json::Value, etag: &str) -> ObjectWrite {
+        ObjectWrite {
+            size: 1,
+            content_type: None,
+            etag: Some(etag.into()),
+            content,
+            user_metadata: serde_json::json!({}),
+            checksums: serde_json::json!({}),
+            tags: serde_json::json!([]),
+        }
+    }
+
+    fn content_for(blob_id: &str) -> serde_json::Value {
+        serde_json::json!({"item": [{"id": blob_id, "offset": 0, "size": 1}]})
+    }
+
+    async fn blob_rows(repo: &Repository) -> Vec<entity::blob::Model> {
+        entity::blob::Entity::find()
+            .all(&repo.db)
+            .await
+            .expect("load blob rows")
+    }
+
+    #[tokio::test]
+    async fn publish_records_the_blob_row_and_the_object_row_together() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let version_id = repo
+            .publish_object_with_new_blob(
+                "blob-1".into(),
+                1,
+                "b".into(),
+                "k".into(),
+                write_with_content(content_for("blob-1"), "e1"),
+                PutCondition::None,
+            )
+            .await
+            .expect("publish");
+
+        assert_eq!(version_id, "null");
+        let blobs = blob_rows(&repo).await;
+        assert_eq!(blobs.len(), 1, "the blob row must exist");
+        assert_eq!(blobs[0].id, "blob-1");
+        assert_eq!(blobs[0].refs, 1);
+
+        let object = repo.get_object("b", "k").await.expect("published object");
+        assert_eq!(object.content, content_for("blob-1"));
+    }
+
+    #[tokio::test]
+    async fn failed_publish_leaves_no_orphaned_blob_row() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        repo.cas_put_object(
+            "b".into(),
+            "k".into(),
+            write_with_content(serde_json::json!({"item": []}), "e1"),
+            PutCondition::None,
+        )
+        .await
+        .expect("seed object");
+
+        // Second step of the publish fails on the condition check; the blob
+        // row inserted moments earlier in the same transaction must go with
+        // it instead of surviving as a `refs = 1` row nothing references.
+        let err = repo
+            .publish_object_with_new_blob(
+                "blob-orphan".into(),
+                1,
+                "b".into(),
+                "k".into(),
+                write_with_content(content_for("blob-orphan"), "e2"),
+                PutCondition::IfNoneMatchAny,
+            )
+            .await
+            .expect_err("precondition must fail");
+        assert!(
+            format!("{err:?}").contains("PreconditionFailed"),
+            "expected PreconditionFailed, got {err:?}"
+        );
+
+        assert!(
+            blob_rows(&repo).await.is_empty(),
+            "a failed publish must not leave a blob row behind"
+        );
+        let object = repo.get_object("b", "k").await.expect("object unchanged");
+        assert_eq!(object.etag.as_deref(), Some("e1"));
+    }
+
+    #[tokio::test]
+    async fn publish_into_a_missing_bucket_leaves_no_blob_row() {
+        let repo = repo().await;
+
+        let err = repo
+            .publish_object_with_new_blob(
+                "blob-orphan".into(),
+                1,
+                "no-such-bucket".into(),
+                "k".into(),
+                write_with_content(content_for("blob-orphan"), "e1"),
+                PutCondition::None,
+            )
+            .await
+            .expect_err("missing bucket must fail");
+        assert!(
+            format!("{err:?}").contains("NoSuchBucket"),
+            "expected NoSuchBucket, got {err:?}"
+        );
+
+        assert!(
+            blob_rows(&repo).await.is_empty(),
+            "the rolled-back publish must not leave a blob row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_id_is_rejected_before_the_object_is_written() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        // An id that is already registered cannot be re-registered: the
+        // publish transaction must fail as a whole rather than overwrite the
+        // existing row's ownership.
+        repo.register_new_blob("blob-1".into(), 1)
+            .await
+            .expect("register");
+
+        repo.publish_object_with_new_blob(
+            "blob-1".into(),
+            1,
+            "b".into(),
+            "k".into(),
+            write_with_content(content_for("blob-1"), "e1"),
+            PutCondition::None,
+        )
+        .await
+        .expect_err("duplicate blob id must fail");
+
+        let blobs = blob_rows(&repo).await;
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].refs, 1, "the existing row is untouched");
+        assert!(
+            !repo.object_exists("b", "k").await.expect("exists"),
+            "no object row may survive a failed publish"
+        );
     }
 }

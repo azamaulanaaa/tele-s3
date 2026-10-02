@@ -60,6 +60,16 @@ async fn main() -> anyhow::Result<()> {
 
     let s3_service = {
         let teles3 = TeleS3::init(grammers.clone(), db.clone()).await?;
+
+        // One bounded, non-fatal reconciliation pass before any traffic:
+        // blob rows left behind by an interrupted publish are invisible to
+        // every listing and nothing else reclaims them.
+        match teles3.reconcile_orphan_blobs().await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!("Reconciled {removed} orphaned blob(s)"),
+            Err(err) => tracing::warn!("Blob reconciliation failed: {:?}", err),
+        }
+
         let mut builder = S3ServiceBuilder::new(teles3);
 
         let auth = SimpleAuth::from_single(&config.auth_access_key, config.auth_secret_key);

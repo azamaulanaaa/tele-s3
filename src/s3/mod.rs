@@ -37,6 +37,10 @@ pub struct TeleS3<B: Backend> {
     pub(crate) repo: repo::Repository,
 }
 
+/// Age a blob must reach before the start-up reconciler may consider its row
+/// garbage. Long enough that a write still in flight can never be undone.
+const ORPHAN_BLOB_MIN_AGE: chrono::Duration = chrono::Duration::hours(1);
+
 impl<B: Backend> TeleS3<B> {
     #[instrument(skip(backend, db), level = "debug", err)]
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
@@ -48,20 +52,89 @@ impl<B: Backend> TeleS3<B> {
     /// Release metadata references and hard-delete blobs whose reference
     /// count reached zero.
     ///
-    /// Backend deletion failures are ignored (best-effort cleanup);
-    /// refcount bookkeeping failures propagate.
+    /// The backend delete is attempted *before* the bookkeeping is dropped,
+    /// and its outcome is observed: only the ids the backend confirmed as
+    /// removed lose their row. An id whose delete failed keeps its row, so
+    /// the blob stays accounted for instead of becoming invisible data that
+    /// nothing ever retries.
+    ///
+    /// Backend deletion failures never fail the user request (best-effort
+    /// cleanup) but are logged; refcount bookkeeping failures propagate.
     async fn release_blobs(&self, ids: Vec<String>) -> S3Result<()> {
         let zero_ids = self.repo.release_blob_refs(&ids).await?;
-        let delete_futures = zero_ids.into_iter().map(|id| self.backend.delete(id));
-        let _ = futures::future::join_all(delete_futures).await;
+
+        if zero_ids.is_empty() {
+            return Ok(());
+        }
+
+        let results =
+            futures::future::join_all(zero_ids.iter().map(|id| self.backend.delete(id.clone())))
+                .await;
+
+        let mut deleted: Vec<String> = Vec::with_capacity(zero_ids.len());
+        let mut failed: Vec<String> = Vec::with_capacity(zero_ids.len());
+        for (id, result) in zero_ids.iter().zip(results) {
+            match result {
+                Ok(()) => deleted.push(id.clone()),
+                Err(err) => {
+                    tracing::warn!(blob_id = %id, error = ?err, "backend delete failed");
+                    failed.push(id.clone());
+                }
+            }
+        }
+
+        self.repo.delete_released_blob_rows(&deleted).await?;
+
+        if !failed.is_empty() {
+            tracing::warn!(
+                retained = failed.len(),
+                "blob rows kept after a failed backend delete; the start-up reconciler will drop them"
+            );
+        }
 
         Ok(())
     }
 
+    /// Delete backend blobs that were written but never recorded in the
+    /// metadata store (a publish rejected before its transaction).
+    ///
+    /// Best-effort by construction: there is no bookkeeping row to reconcile
+    /// against, so a failure is logged and the request keeps its original
+    /// error.
+    async fn discard_backend_blobs(&self, ids: Vec<String>) {
+        let results =
+            futures::future::join_all(ids.iter().map(|id| self.backend.delete(id.clone()))).await;
+
+        for (id, result) in ids.iter().zip(results) {
+            if let Err(err) = result {
+                tracing::warn!(
+                    blob_id = %id,
+                    error = ?err,
+                    "failed to delete a backend blob that was never registered"
+                );
+            }
+        }
+    }
+
+    /// Reconcile blob rows that no object version and no in-progress
+    /// multipart upload references any more.
+    ///
+    /// Run once at start-up, before the service accepts traffic. Bounded and
+    /// never fatal: an oversized database is skipped with a warning rather
+    /// than turning the reconciler into an unbounded scan.
+    pub async fn reconcile_orphan_blobs(&self) -> S3Result<usize> {
+        // Anything younger than this may still belong to a write that has
+        // not finished publishing.
+        let older_than = chrono::Local::now().to_utc() - ORPHAN_BLOB_MIN_AGE;
+
+        self.repo.reconcile_orphan_blobs(older_than).await
+    }
+
     /// Fast-fail doomed conditional writes before any expensive work or
-    /// validation. The atomic re-check still happens in cas_put_object at
-    /// commit time; this only avoids wasted effort and gives preconditions
-    /// correct precedence over other errors (e.g. InvalidPart).
+    /// validation. The atomic re-check still happens at commit time (in
+    /// `publish_object_with_new_blob` / `cas_put_object`); this only avoids
+    /// wasted effort and gives preconditions correct precedence over other
+    /// errors (e.g. InvalidPart).
     async fn precondition_gate(
         &self,
         bucket: &str,
@@ -336,5 +409,151 @@ impl<B: Backend> S3 for TeleS3<B> {
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         self.list_object_versions_inner(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use sea_orm::EntityTrait;
+
+    use super::repo::entity;
+    use super::*;
+    use crate::backend::{BoxedAsyncReader, Memory};
+
+    /// A backend whose deletes can be made to fail on demand, so the
+    /// release ordering is observable.
+    struct FlakyDelete {
+        inner: Memory<8, 8>,
+        fail_delete: AtomicBool,
+    }
+
+    impl FlakyDelete {
+        fn new(fail_delete: bool) -> Self {
+            Self {
+                inner: Memory::default(),
+                fail_delete: AtomicBool::new(fail_delete),
+            }
+        }
+
+        fn fail_deletes(&self, fail: bool) {
+            self.fail_delete.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FlakyDelete {
+        async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
+            self.inner.write(size, reader).await
+        }
+
+        async fn read(
+            &self,
+            key: String,
+            offset: u64,
+            limit: Option<u64>,
+        ) -> Result<Option<BoxedAsyncReader>, BackendError> {
+            self.inner.read(key, offset, limit).await
+        }
+
+        async fn delete(&self, key: String) -> Result<(), BackendError> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(BackendError::Other("delete refused".into()));
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    async fn service(fail_delete: bool) -> TeleS3<FlakyDelete> {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        TeleS3::init(FlakyDelete::new(fail_delete), db)
+            .await
+            .expect("init")
+    }
+
+    async fn blob_rows(svc: &TeleS3<FlakyDelete>) -> Vec<i64> {
+        let mut rows: Vec<i64> = entity::blob::Entity::find()
+            .all(&svc.repo.db)
+            .await
+            .expect("load blob rows")
+            .into_iter()
+            .map(|m| m.refs)
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn failed_backend_delete_keeps_the_blob_row() {
+        let svc = service(true).await;
+        svc.repo
+            .register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+
+        svc.release_blobs(vec!["b1".to_string()])
+            .await
+            .expect("release stays best-effort for the caller");
+
+        assert_eq!(
+            blob_rows(&svc).await,
+            [0],
+            "a blob the backend would not delete must keep its bookkeeping \
+             (and its zero refcount) instead of becoming invisible data"
+        );
+
+        // Once the backend accepts the delete the row is dropped.
+        svc.backend.fail_deletes(false);
+        svc.release_blobs(vec!["b1".to_string()])
+            .await
+            .expect("release again");
+
+        assert!(
+            blob_rows(&svc).await.is_empty(),
+            "a confirmed delete must drop the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphan_blobs_leaves_referenced_blobs_alone() {
+        let svc = service(true).await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.repo
+            .register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+
+        // Published through the atomic path, so the row and the object row
+        // agree on who owns the blob.
+        svc.repo
+            .publish_object_with_new_blob(
+                "b2".into(),
+                1,
+                "b".into(),
+                "k".into(),
+                super::repo::ObjectWrite {
+                    size: 1,
+                    content_type: None,
+                    etag: Some("e1".into()),
+                    content: serde_json::json!({"item": [{"id": "b2", "offset": 0, "size": 1}]}),
+                    user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                },
+                super::repo::PutCondition::None,
+            )
+            .await
+            .expect("publish");
+
+        // Both rows are younger than the threshold, so the start-up pass has
+        // nothing to do; it must not touch them either way.
+        assert_eq!(svc.reconcile_orphan_blobs().await.expect("reconcile"), 0);
+        assert_eq!(blob_rows(&svc).await, [1, 1]);
     }
 }

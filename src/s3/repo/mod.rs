@@ -64,7 +64,7 @@ impl Repository {
 
     /// The `size` columns are 32-bit. Reject anything larger instead of
     /// silently truncating it with `as u32`.
-    fn checked_size(size: u64) -> S3Result<u32> {
+    pub(super) fn checked_size(size: u64) -> S3Result<u32> {
         u32::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))
     }
 }
