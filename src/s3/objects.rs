@@ -1017,10 +1017,10 @@ impl<B: Backend> TeleS3<B> {
         // Recombine in global order (key asc, last-modified desc) so the
         // truncation cursor points at the true last returned entry,
         // regardless of how versions and delete markers interleave.
-        let mut combined: Vec<super::repo::entity::object::Model> = versions
+        let mut combined = versions
             .into_iter()
-            .chain(delete_markers.into_iter())
-            .collect();
+            .chain(delete_markers)
+            .collect::<Vec<_>>();
         combined.sort_by(|a, b| {
             a.id.cmp(&b.id)
                 .then_with(|| b.last_modified.cmp(&a.last_modified))
@@ -1039,8 +1039,12 @@ impl<B: Backend> TeleS3<B> {
             (None, None)
         };
 
-        let mut versions: Vec<super::repo::entity::object::Model> = Vec::new();
-        let mut delete_markers: Vec<super::repo::entity::object::Model> = Vec::new();
+        // The repository returns projected listing rows, not full
+        // `object::Model`s: this handler reads only `id`, `version_id`,
+        // `is_latest`, `is_delete_marker`, `size`, `last_modified` and `etag`,
+        // so the JSON columns are never fetched.
+        let mut versions: Vec<_> = Vec::new();
+        let mut delete_markers: Vec<_> = Vec::new();
         for m in combined {
             if m.is_delete_marker {
                 delete_markers.push(m);
@@ -1053,8 +1057,8 @@ impl<B: Backend> TeleS3<B> {
         let delimiter = req.input.delimiter.clone();
         let prefix = req.input.prefix.clone().unwrap_or_default();
         let mut common_prefixes_set = BTreeSet::new();
-        let mut filtered_versions = Vec::new();
-        let mut filtered_delete_markers = Vec::new();
+        let mut filtered_versions: Vec<_> = Vec::new();
+        let mut filtered_delete_markers: Vec<_> = Vec::new();
 
         if let Some(del) = delimiter.clone() {
             for v in &versions {
