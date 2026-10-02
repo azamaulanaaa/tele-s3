@@ -23,6 +23,7 @@ use super::helpers::{
     StreamingBlobExt, build_put_condition, chrono_to_timestamp, metadata_to_json,
     tagging_header_to_json, verify_checksums,
 };
+use super::objects::checked_content_length;
 use super::repo::ObjectWrite;
 use super::types::{Metadata, MetadataItem, MultipartUploadPart};
 use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher};
@@ -73,10 +74,7 @@ impl<B: Backend> TeleS3<B> {
             .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
             .await?;
 
-        let size =
-            req.input
-                .content_length
-                .ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))? as u64;
+        let size = checked_content_length(req.input.content_length)?;
 
         if size == 0 {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument));
@@ -416,12 +414,14 @@ impl<B: Backend> TeleS3<B> {
         let mut is_truncated = false;
         let mut next_part_number_marker: Option<i32> = None;
 
-        if let Some(max_parts) = req.input.max_parts
-            && parts.len() > max_parts as usize
-        {
-            parts.truncate(max_parts as usize);
-            next_part_number_marker = parts.last().and_then(|p| p.part_number);
-            is_truncated = true;
+        if let Some(max_parts) = req.input.max_parts {
+            let max_parts = usize::try_from(max_parts)
+                .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+            if parts.len() > max_parts {
+                parts.truncate(max_parts);
+                next_part_number_marker = parts.last().and_then(|p| p.part_number);
+                is_truncated = true;
+            }
         }
 
         let res = S3Response::new(ListPartsOutput {
@@ -698,5 +698,106 @@ impl<B: Backend> TeleS3<B> {
         });
 
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Memory;
+    use crate::s3::TeleS3;
+
+    async fn test_service_with_upload() -> (TeleS3<Memory<1, 1>>, String) {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        let svc = TeleS3::init(Memory::default(), db).await.expect("init");
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        let upload_id = "u1".to_string();
+        svc.repo
+            .upsert_multipart_upload_state(
+                "b".into(),
+                "k".into(),
+                upload_id.clone(),
+                None,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create upload state");
+        (svc, upload_id)
+    }
+
+    fn list_parts_req(upload_id: &str, max_parts: Option<i32>) -> S3Request<ListPartsInput> {
+        S3Request {
+            input: ListPartsInput {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                upload_id: upload_id.to_string(),
+                max_parts,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: "/b/k".parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn upload_part_req(upload_id: &str, content_length: Option<i64>) -> S3Request<UploadPartInput> {
+        S3Request {
+            input: UploadPartInput {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                upload_id: upload_id.to_string(),
+                part_number: 1,
+                content_length,
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: "/b/k".parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_max_parts_is_invalid_argument() {
+        let (svc, upload_id) = test_service_with_upload().await;
+
+        let err = svc
+            .list_parts_inner(list_parts_req(&upload_id, Some(-1)))
+            .await
+            .expect_err("negative max-parts must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn negative_content_length_is_invalid_argument() {
+        let (svc, upload_id) = test_service_with_upload().await;
+
+        let err = svc
+            .upload_part_inner(upload_part_req(&upload_id, Some(-1)))
+            .await
+            .expect_err("negative content-length must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = svc
+            .upload_part_inner(upload_part_req(&upload_id, None))
+            .await
+            .expect_err("missing content-length must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::MissingContentLength);
     }
 }

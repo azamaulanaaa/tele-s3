@@ -31,16 +31,36 @@ use super::repo::ObjectWrite;
 use super::types::{Metadata, MetadataItem};
 use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader};
 
+/// Upper bound the S3 API applies to `max-keys`; larger client values are
+/// silently clamped rather than rejected.
+pub(super) const MAX_KEYS_CEILING: i32 = 1000;
+
+/// Validate a client-supplied paging size and apply the S3 ceiling.
+///
+/// `s3s` parses `max-keys` as a plain `i32` with no range check, so a
+/// negative value must be rejected here instead of being cast into a huge
+/// unsigned limit further down.
+pub(super) fn checked_max_keys(max_keys: Option<i32>) -> S3Result<i32> {
+    let raw = max_keys.unwrap_or(MAX_KEYS_CEILING);
+    if raw < 0 {
+        return Err(S3Error::new(S3ErrorCode::InvalidArgument));
+    }
+    Ok(raw.min(MAX_KEYS_CEILING))
+}
+
+/// Narrow a client-supplied `Content-Length` to `u64`.
+pub(super) fn checked_content_length(content_length: Option<i64>) -> S3Result<u64> {
+    let len = content_length.ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))?;
+    u64::try_from(len).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))
+}
+
 impl<B: Backend> TeleS3<B> {
     #[instrument(skip(self), err)]
     pub(crate) async fn put_object_inner(
         &self,
         mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let size =
-            req.input
-                .content_length
-                .ok_or_else(|| S3Error::new(S3ErrorCode::MissingContentLength))? as u64;
+        let size = checked_content_length(req.input.content_length)?;
 
         let condition = build_put_condition(
             req.input.if_match.as_ref(),
@@ -780,7 +800,9 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
-        let limit = req.input.max_keys.unwrap_or(1000) as u64;
+        let max_keys = checked_max_keys(req.input.max_keys)?;
+        let limit =
+            u64::try_from(max_keys).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
 
         // Fetch one extra row to detect truncation without a false
         // positive when exactly `limit` items remain.
@@ -849,7 +871,7 @@ impl<B: Backend> TeleS3<B> {
             is_truncated: Some(is_truncated),
             marker: req.input.marker,
             next_marker,
-            max_keys: Some(limit as i32),
+            max_keys: Some(max_keys),
             name: Some(req.input.bucket),
             prefix: req.input.prefix,
             ..Default::default()
@@ -863,7 +885,9 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let limit = req.input.max_keys.unwrap_or(1000) as u64;
+        let max_keys = checked_max_keys(req.input.max_keys)?;
+        let limit =
+            u64::try_from(max_keys).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
 
         // Fetch one extra row to detect truncation without a false
         // positive when exactly `limit` items remain.
@@ -937,7 +961,7 @@ impl<B: Backend> TeleS3<B> {
             is_truncated: Some(is_truncated),
             next_continuation_token: next_marker,
             key_count: Some(models.len() as i32),
-            max_keys: Some(limit as i32),
+            max_keys: Some(max_keys),
             name: Some(req.input.bucket),
             prefix: req.input.prefix,
             ..Default::default()
@@ -952,7 +976,9 @@ impl<B: Backend> TeleS3<B> {
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         self.repo.get_bucket(&req.input.bucket).await?;
-        let max_keys = req.input.max_keys.unwrap_or(1000);
+        let max_keys = checked_max_keys(req.input.max_keys)?;
+        let limit =
+            usize::try_from(max_keys).map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
         // Fetch one extra row so truncation is detected from actual
         // remaining data instead of guessing from a full page.
         let fetch_max = max_keys.saturating_add(1);
@@ -980,7 +1006,7 @@ impl<B: Backend> TeleS3<B> {
                 .then_with(|| b.last_modified.cmp(&a.last_modified))
         });
 
-        let is_truncated = combined.len() as i32 > max_keys && max_keys > 0;
+        let is_truncated = limit > 0 && combined.len() > limit;
         if is_truncated {
             combined.pop();
         }
@@ -1427,5 +1453,171 @@ mod tests {
             !debug.contains("x-amz-delete-marker"),
             "plain missing key must not claim a marker: {debug}"
         );
+    }
+
+    fn list_req(bucket: &str, max_keys: Option<i32>) -> S3Request<ListObjectsInput> {
+        S3Request {
+            input: ListObjectsInput {
+                bucket: bucket.to_string(),
+                max_keys,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/{bucket}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn list_v2_req(bucket: &str, max_keys: Option<i32>) -> S3Request<ListObjectsV2Input> {
+        S3Request {
+            input: ListObjectsV2Input {
+                bucket: bucket.to_string(),
+                max_keys,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/{bucket}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn list_versions_req(
+        bucket: &str,
+        max_keys: Option<i32>,
+    ) -> S3Request<ListObjectVersionsInput> {
+        S3Request {
+            input: ListObjectVersionsInput {
+                bucket: bucket.to_string(),
+                max_keys,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/{bucket}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn put_req(bucket: &str, key: &str, content_length: Option<i64>) -> S3Request<PutObjectInput> {
+        S3Request {
+            input: PutObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                content_length,
+                ..Default::default()
+            },
+            method: http::Method::PUT,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_max_keys_is_invalid_argument() {
+        let svc = test_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let err = svc
+            .list_objects_inner(list_req("b", Some(-1)))
+            .await
+            .expect_err("negative max-keys must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = svc
+            .list_objects_v2_inner(list_v2_req("b", Some(-1)))
+            .await
+            .expect_err("negative max-keys must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = svc
+            .list_object_versions_inner(list_versions_req("b", Some(-1)))
+            .await
+            .expect_err("negative max-keys must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn max_keys_above_ceiling_is_clamped() {
+        let svc = test_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let res = svc
+            .list_objects_inner(list_req("b", Some(5000)))
+            .await
+            .expect("oversized max-keys must be clamped, not rejected");
+        assert_eq!(res.output.max_keys, Some(1000));
+
+        let res = svc
+            .list_objects_v2_inner(list_v2_req("b", Some(5000)))
+            .await
+            .expect("oversized max-keys must be clamped, not rejected");
+        assert_eq!(res.output.max_keys, Some(1000));
+
+        let res = svc
+            .list_object_versions_inner(list_versions_req("b", Some(5000)))
+            .await
+            .expect("oversized max-keys must be clamped, not rejected");
+        assert_eq!(res.output.max_keys, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn default_max_keys_is_the_ceiling() {
+        let svc = test_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let res = svc
+            .list_objects_inner(list_req("b", None))
+            .await
+            .expect("unset max-keys defaults to the ceiling");
+        assert_eq!(res.output.max_keys, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn negative_content_length_is_invalid_argument() {
+        let svc = test_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let err = svc
+            .put_object_inner(put_req("b", "k", Some(-1)))
+            .await
+            .expect_err("negative content-length must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = svc
+            .put_object_inner(put_req("b", "k", None))
+            .await
+            .expect_err("missing content-length must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::MissingContentLength);
     }
 }

@@ -9,6 +9,7 @@ use tracing::instrument;
 
 use super::entity;
 use super::{ObjectWrite, PutCondition, Repository};
+use crate::s3::objects::MAX_KEYS_CEILING;
 
 impl Repository {
     async fn get_latest_model(
@@ -686,7 +687,8 @@ impl Repository {
         }
 
         // Apply max_keys truncation in handler, but we can pre-truncate
-        let limit = max_keys.unwrap_or(1000) as usize;
+        let limit = usize::try_from(max_keys.unwrap_or(MAX_KEYS_CEILING))
+            .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
         let truncated = all.len() > limit;
         if truncated {
             all.truncate(limit);
