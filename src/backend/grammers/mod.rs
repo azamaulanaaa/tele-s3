@@ -278,7 +278,9 @@ impl Grammers {
             let guard = self
                 .flood_guard
                 .lock()
-                .map_err(|_| BackendError::Other("Flood guard is poisoned".into()))?;
+                .map_err(|_| BackendError::PoisonedLock {
+                    lock: "flood_guard",
+                })?;
 
             if let Some(until) = *guard {
                 let now = Instant::now();
@@ -295,7 +297,9 @@ impl Grammers {
             let mut guard = self
                 .flood_guard
                 .lock()
-                .map_err(|_| BackendError::Other("Flood guard is poisoned".into()))?;
+                .map_err(|_| BackendError::PoisonedLock {
+                    lock: "flood_guard",
+                })?;
             *guard = None;
         }
 
@@ -310,10 +314,12 @@ impl Grammers {
         match classify_rpc_error(rpc_err.code, &rpc_err.name, rpc_err.value) {
             RpcFailure::FloodWait(duration) => {
                 {
-                    let mut guard = self
-                        .flood_guard
-                        .lock()
-                        .map_err(|_| BackendError::Other("Flood guard is poisoned".into()))?;
+                    let mut guard =
+                        self.flood_guard
+                            .lock()
+                            .map_err(|_| BackendError::PoisonedLock {
+                                lock: "flood_guard",
+                            })?;
                     *guard = Some(Instant::now() + duration);
                 }
 

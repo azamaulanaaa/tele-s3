@@ -184,17 +184,27 @@ impl<B: Backend> TeleS3<B> {
 
 impl From<BackendError> for S3Error {
     fn from(err: BackendError) -> Self {
-        match err {
+        // Matched by reference so the `Display` render of a variant can be
+        // reused verbatim as the client-facing message instead of being
+        // re-formatted here: one condition must have exactly one message.
+        match &err {
             // Rate limiting is transient; surfacing SlowDown (503) lets AWS
             // SDK clients retry automatically instead of treating it as a
             // hard failure.
             BackendError::SlowDown => S3Error::new(s3s::S3ErrorCode::SlowDown),
-            BackendError::ExceedLimitSize { max, actual } => S3Error::with_message(
-                s3s::S3ErrorCode::EntityTooLarge,
-                format!("Size {actual} exceeds limit {max}"),
-            ),
+            BackendError::ExceedLimitSize { .. } => {
+                S3Error::with_message(s3s::S3ErrorCode::EntityTooLarge, err.to_string())
+            }
             BackendError::OutOfRange => S3Error::new(s3s::S3ErrorCode::InvalidRange),
-            other => S3Error::internal_error(other),
+            // Permanent backend faults: no S3 code means "retrying cannot
+            // help", so these stay 500 — but the message now names the
+            // actual fault instead of the useless catch-all render.
+            BackendError::PoisonedLock { .. } | BackendError::InvariantViolation { .. } => {
+                S3Error::with_message(s3s::S3ErrorCode::InternalError, err.to_string())
+            }
+            // `BackendError` is `#[non_exhaustive]`: this arm must stay a
+            // catch-all so a future variant is not a breaking change here.
+            _ => S3Error::internal_error(err),
         }
     }
 }
@@ -484,6 +494,74 @@ mod tests {
             .collect();
         rows.sort_unstable();
         rows
+    }
+
+    #[test]
+    fn retryable_backend_failures_keep_their_transient_s3_codes() {
+        let err: S3Error = BackendError::SlowDown.into();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::SlowDown);
+        assert_eq!(
+            err.status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        let err: S3Error = BackendError::OutOfRange.into();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidRange);
+    }
+
+    #[test]
+    fn size_limit_failure_keeps_entity_too_large_and_the_backend_message() {
+        let message = BackendError::ExceedLimitSize {
+            max: 10,
+            actual: 20,
+        }
+        .to_string();
+
+        let err: S3Error = BackendError::ExceedLimitSize {
+            max: 10,
+            actual: 20,
+        }
+        .into();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::EntityTooLarge);
+        // The mapping reuses the `Display` render rather than re-formatting,
+        // so the client sees exactly what the backend reported.
+        assert_eq!(err.message(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn permanent_backend_faults_are_named_internal_errors() {
+        let poisoned: S3Error = BackendError::PoisonedLock {
+            lock: "flood_guard",
+        }
+        .into();
+        assert_eq!(*poisoned.code(), s3s::S3ErrorCode::InternalError);
+        assert_eq!(
+            poisoned.message(),
+            Some("Internal lock `flood_guard` is poisoned")
+        );
+
+        let invariant: S3Error = BackendError::InvariantViolation {
+            detail: "a free chunk slot was no longer free",
+        }
+        .into();
+        assert_eq!(*invariant.code(), s3s::S3ErrorCode::InternalError);
+        assert_eq!(
+            invariant.message(),
+            Some("Backend invariant violated: a free chunk slot was no longer free")
+        );
+    }
+
+    #[test]
+    fn wrapped_upstream_errors_still_carry_their_source_chain() {
+        let err: S3Error =
+            BackendError::Other(std::io::Error::other("telegram said no").into()).into();
+
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InternalError);
+        let backend = err.source().expect("the backend error is the source");
+        let upstream = backend
+            .source()
+            .expect("the wrapped upstream error is preserved");
+        assert!(upstream.to_string().contains("telegram said no"));
     }
 
     #[tokio::test]

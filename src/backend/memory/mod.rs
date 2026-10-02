@@ -110,9 +110,17 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
             };
 
             for idx in chunks_idx.into_iter() {
-                let chunk = storage[idx]
-                    .take()
-                    .ok_or_else(|| BackendError::Other("unable to take free chunk".into()))?;
+                // `chunks_idx` was collected from this very array under
+                // this very lock, so a slot that was free a moment ago
+                // cannot be occupied now. Reaching `None` means the
+                // backend's own bookkeeping is corrupt, which is neither
+                // recoverable by the caller nor retryable.
+                let chunk =
+                    storage[idx]
+                        .take()
+                        .ok_or_else(|| BackendError::InvariantViolation {
+                            detail: "a free chunk slot was no longer free",
+                        })?;
                 object.chunks.push(chunk);
             }
 

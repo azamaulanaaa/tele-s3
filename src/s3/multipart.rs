@@ -135,18 +135,19 @@ impl<B: Backend> TeleS3<B> {
         // start-up blob reconciler.
         self.repo.register_new_blob(id.clone(), size).await?;
 
-        if verify_checksums(
+        // `verify_checksums` distinguishes an undecodable client checksum
+        // (`InvalidDigest`) from a genuine mismatch (`BadDigest`); both are
+        // propagated as-is so the client learns which one happened.
+        if let Err(e) = verify_checksums(
             computed_crc32,
             computed_crc32c,
             &computed_sha1,
             &computed_sha256,
             &expected_checksums,
-        )
-        .is_err()
-        {
+        ) {
             self.release_blobs(vec![id]).await?;
 
-            return Err(S3Error::new(S3ErrorCode::BadDigest));
+            return Err(e);
         }
 
         if let Some(expected) = req.input.content_md5 {
@@ -775,6 +776,20 @@ mod tests {
         }
     }
 
+    /// A one-byte `UploadPart` carrying `checksum_crc32` as the client's
+    /// `x-amz-checksum-crc32` value.
+    fn upload_part_with_crc32_req(
+        upload_id: &str,
+        checksum_crc32: &str,
+    ) -> S3Request<UploadPartInput> {
+        let mut req = upload_part_req(upload_id, Some(1));
+        req.input.body = Some(s3s::dto::StreamingBlob::from_bytes(
+            bytes::Bytes::from_static(b"x"),
+        ));
+        req.input.checksum_crc32 = Some(checksum_crc32.to_string());
+        req
+    }
+
     fn list_uploads_req(
         max_uploads: Option<i32>,
         key_marker: Option<String>,
@@ -882,5 +897,25 @@ mod tests {
             .await
             .expect_err("missing content-length must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::MissingContentLength);
+    }
+
+    #[tokio::test]
+    async fn upload_part_reports_the_specific_checksum_failure() {
+        let (svc, upload_id) = test_service_with_upload().await;
+
+        // A decodable but wrong checksum is a digest mismatch.
+        let err = svc
+            .upload_part_inner(upload_part_with_crc32_req(&upload_id, "AAAAAA=="))
+            .await
+            .expect_err("a mismatching crc32 must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+
+        // An undecodable checksum is a different condition and must not be
+        // flattened into the same BadDigest.
+        let err = svc
+            .upload_part_inner(upload_part_with_crc32_req(&upload_id, "not base64!"))
+            .await
+            .expect_err("an undecodable crc32 must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidDigest);
     }
 }
