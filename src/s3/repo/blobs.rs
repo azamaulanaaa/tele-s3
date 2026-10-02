@@ -467,7 +467,7 @@ fn collect_referenced_ids<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::repo::{ObjectWrite, PutCondition};
+    use crate::s3::repo::{MultipartUploadStateUpdate, ObjectWrite, PutCondition};
 
     async fn repo() -> Repository {
         let db = sea_orm::Database::connect("sqlite::memory:")
@@ -553,15 +553,15 @@ mod tests {
         seed_old_blob(&repo, "held-by-upload").await;
 
         put_object(&repo, "k", "held-by-object").await;
-        repo.upsert_multipart_upload_state(
-            "b".into(),
-            "k".into(),
-            "u1".into(),
-            None,
-            serde_json::json!({}),
-            serde_json::json!([]),
-            upload_content("held-by-upload"),
-        )
+        repo.upsert_multipart_upload_state(MultipartUploadStateUpdate {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: "u1".into(),
+            content_type: None,
+            user_metadata: serde_json::json!({}),
+            tags: serde_json::json!([]),
+            content: upload_content("held-by-upload"),
+        })
         .await
         .expect("in-progress upload");
 

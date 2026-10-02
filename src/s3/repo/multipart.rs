@@ -11,19 +11,41 @@ use super::Repository;
 use super::entity;
 use crate::s3::objects::checked_max_uploads;
 
+/// Field bundle for writing an in-progress multipart upload's state row.
+///
+/// Three of these are positional JSON payloads, so a swapped pair would
+/// compile cleanly and silently corrupt the upload; naming the fields
+/// keeps every call site self-checking.
+#[derive(Debug)]
+pub(crate) struct MultipartUploadStateUpdate {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) upload_id: String,
+    pub(crate) content_type: Option<String>,
+    /// x-amz-meta-* map as a JSON object; empty object when none.
+    pub(crate) user_metadata: serde_json::Value,
+    /// Object tag-set as a JSON array of {key, value}; empty array when none.
+    pub(crate) tags: serde_json::Value,
+    /// Ordered part list describing the upload's committed content.
+    pub(crate) content: serde_json::Value,
+}
+
 impl Repository {
     #[instrument(skip(self), level = "debug", err)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_multipart_upload_state(
         &self,
-        bucket: String,
-        key: String,
-        upload_id: String,
-        content_type: Option<String>,
-        user_metadata: serde_json::Value,
-        tags: serde_json::Value,
-        content: serde_json::Value,
+        update: MultipartUploadStateUpdate,
     ) -> S3Result<()> {
+        let MultipartUploadStateUpdate {
+            bucket,
+            key,
+            upload_id,
+            content_type,
+            user_metadata,
+            tags,
+            content,
+        } = update;
+
         let active_model = entity::multipart_upload_state::ActiveModel {
             bucket_id: Set(bucket),
             object_id: Set(key),
@@ -266,15 +288,15 @@ mod tests {
             .expect("create bucket");
         for key in keys {
             for i in 0..uploads_per_key {
-                repo.upsert_multipart_upload_state(
-                    "b".into(),
-                    (*key).to_string(),
-                    format!("u{i}"),
-                    None,
-                    serde_json::json!({}),
-                    serde_json::json!([]),
-                    serde_json::json!({"part": i}),
-                )
+                repo.upsert_multipart_upload_state(MultipartUploadStateUpdate {
+                    bucket: "b".into(),
+                    key: (*key).to_string(),
+                    upload_id: format!("u{i}"),
+                    content_type: None,
+                    user_metadata: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                    content: serde_json::json!({"part": i}),
+                })
                 .await
                 .unwrap_or_else(|e| panic!("seed {key}/u{i}: {e:?}"));
             }

@@ -20,11 +20,11 @@ use tracing::instrument;
 
 use super::TeleS3;
 use super::helpers::{
-    StreamingBlobExt, build_put_condition, chrono_to_timestamp, metadata_to_json,
-    tagging_header_to_json, verify_checksums,
+    ExpectedChecksums, StreamingBlobExt, build_put_condition, chrono_to_timestamp,
+    metadata_to_json, tagging_header_to_json, verify_checksums,
 };
 use super::objects::checked_content_length;
-use super::repo::ObjectWrite;
+use super::repo::{MultipartUploadStateUpdate, ObjectWrite};
 use super::types::{Metadata, MetadataItem, MultipartUploadPart};
 use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher};
 
@@ -43,15 +43,15 @@ impl<B: Backend> TeleS3<B> {
         let tags = tagging_header_to_json(req.input.tagging.as_deref())?;
 
         self.repo
-            .upsert_multipart_upload_state(
-                req.input.bucket.clone(),
-                req.input.key.clone(),
-                upload_id.clone(),
-                req.input.content_type,
-                metadata_to_json(req.input.metadata.clone()),
+            .upsert_multipart_upload_state(MultipartUploadStateUpdate {
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                upload_id: upload_id.clone(),
+                content_type: req.input.content_type,
+                user_metadata: metadata_to_json(req.input.metadata.clone()),
                 tags,
-                content_json,
-            )
+                content: content_json,
+            })
             .await?;
 
         let res = S3Response::new(CreateMultipartUploadOutput {
@@ -80,10 +80,12 @@ impl<B: Backend> TeleS3<B> {
             return Err(S3Error::new(S3ErrorCode::InvalidArgument));
         }
 
-        let expected_crc32 = req.input.checksum_crc32.clone();
-        let expected_crc32c = req.input.checksum_crc32c.clone();
-        let expected_sha1 = req.input.checksum_sha1.clone();
-        let expected_sha256 = req.input.checksum_sha256.clone();
+        let expected_checksums = ExpectedChecksums::new(
+            req.input.checksum_crc32.clone(),
+            req.input.checksum_crc32c.clone(),
+            req.input.checksum_sha1.clone(),
+            req.input.checksum_sha256.clone(),
+        );
 
         let reader = {
             let body_stream = req
@@ -138,10 +140,7 @@ impl<B: Backend> TeleS3<B> {
             computed_crc32c,
             &computed_sha1,
             &computed_sha256,
-            expected_crc32.as_deref(),
-            expected_crc32c.as_deref(),
-            expected_sha1.as_deref(),
-            expected_sha256.as_deref(),
+            &expected_checksums,
         )
         .is_err()
         {
@@ -149,13 +148,6 @@ impl<B: Backend> TeleS3<B> {
 
             return Err(S3Error::new(S3ErrorCode::BadDigest));
         }
-
-        // Echo verified checksums back so SDKs can confirm the part landed
-        // intact; unverified (absent) checksums stay absent.
-        let checksum_crc32 = expected_crc32;
-        let checksum_crc32c = expected_crc32c;
-        let checksum_sha1 = expected_sha1;
-        let checksum_sha256 = expected_sha256;
 
         if let Some(expected) = req.input.content_md5 {
             let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
@@ -199,10 +191,12 @@ impl<B: Backend> TeleS3<B> {
 
         let res = S3Response::new(UploadPartOutput {
             e_tag: Some(ETag::Strong(multipart_upload_part.hash)),
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
+            // Echo verified checksums back so SDKs can confirm the part
+            // landed intact; unverified (absent) checksums stay absent.
+            checksum_crc32: expected_checksums.crc32,
+            checksum_crc32c: expected_checksums.crc32c,
+            checksum_sha1: expected_checksums.sha1,
+            checksum_sha256: expected_checksums.sha256,
             ..Default::default()
         });
 
@@ -726,15 +720,15 @@ mod tests {
             .expect("create bucket");
         let upload_id = "u1".to_string();
         svc.repo
-            .upsert_multipart_upload_state(
-                "b".into(),
-                "k".into(),
-                upload_id.clone(),
-                None,
-                serde_json::json!({}),
-                serde_json::json!([]),
-                serde_json::json!({}),
-            )
+            .upsert_multipart_upload_state(MultipartUploadStateUpdate {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: upload_id.clone(),
+                content_type: None,
+                user_metadata: serde_json::json!({}),
+                tags: serde_json::json!([]),
+                content: serde_json::json!({}),
+            })
             .await
             .expect("create upload state");
         (svc, upload_id)
@@ -820,15 +814,15 @@ mod tests {
     async fn list_uploads_paginates_and_reports_next_markers() {
         let (svc, _upload_id) = test_service_with_upload().await;
         svc.repo
-            .upsert_multipart_upload_state(
-                "b".into(),
-                "k".into(),
-                "u2".into(),
-                None,
-                serde_json::json!({}),
-                serde_json::json!([]),
-                serde_json::json!({}),
-            )
+            .upsert_multipart_upload_state(MultipartUploadStateUpdate {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: "u2".into(),
+                content_type: None,
+                user_metadata: serde_json::json!({}),
+                tags: serde_json::json!([]),
+                content: serde_json::json!({}),
+            })
             .await
             .expect("create second upload state");
 

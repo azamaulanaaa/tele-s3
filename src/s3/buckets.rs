@@ -191,6 +191,7 @@ mod tests {
     use super::*;
     use crate::backend::Memory;
     use crate::s3::TeleS3;
+    use crate::s3::repo::MultipartUploadStateUpdate;
 
     fn create_req(bucket: &str) -> S3Request<CreateBucketInput> {
         S3Request {
@@ -254,15 +255,15 @@ mod tests {
             .await
             .expect("create");
         svc.repo
-            .upsert_multipart_upload_state(
-                "mpu-bucket".into(),
-                "k".into(),
-                "upload-1".into(),
-                None,
-                serde_json::json!({}),
-                serde_json::json!([]),
-                serde_json::json!({}),
-            )
+            .upsert_multipart_upload_state(MultipartUploadStateUpdate {
+                bucket: "mpu-bucket".into(),
+                key: "k".into(),
+                upload_id: "upload-1".into(),
+                content_type: None,
+                user_metadata: serde_json::json!({}),
+                tags: serde_json::json!([]),
+                content: serde_json::json!({}),
+            })
             .await
             .expect("create upload");
 

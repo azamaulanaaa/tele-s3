@@ -9,6 +9,8 @@ mod objects;
 
 pub mod entity;
 
+pub(crate) use multipart::MultipartUploadStateUpdate;
+
 /// Precondition for a compare-and-swap object write.
 pub enum PutCondition {
     /// Unconditional upsert (no If-Match / If-None-Match header).

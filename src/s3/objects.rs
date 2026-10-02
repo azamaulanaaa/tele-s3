@@ -22,10 +22,9 @@ use tracing::instrument;
 
 use super::TeleS3;
 use super::helpers::{
-    StreamingBlobExt, build_put_condition, canned_owner, check_conditional_get, checksums_to_json,
-    chrono_to_timestamp, delete_marker_error, full_control_grant, json_to_checksum_fields,
-    json_to_metadata, json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json,
-    verify_checksums,
+    ExpectedChecksums, StreamingBlobExt, build_put_condition, canned_owner, check_conditional_get,
+    chrono_to_timestamp, delete_marker_error, full_control_grant, json_to_metadata,
+    json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json, verify_checksums,
 };
 use super::repo::entity::object;
 use super::repo::{ObjectWrite, Repository};
@@ -146,17 +145,14 @@ impl<B: Backend> TeleS3<B> {
         self.precondition_gate(&req.input.bucket, &req.input.key, &condition)
             .await?;
 
-        let checksums = checksums_to_json(
+        let expected = ExpectedChecksums::new(
             req.input.checksum_crc32.clone(),
             req.input.checksum_crc32c.clone(),
             req.input.checksum_sha1.clone(),
             req.input.checksum_sha256.clone(),
-        )?;
+        );
 
-        let expected_crc32 = req.input.checksum_crc32.clone();
-        let expected_crc32c = req.input.checksum_crc32c.clone();
-        let expected_sha1 = req.input.checksum_sha1.clone();
-        let expected_sha256 = req.input.checksum_sha256.clone();
+        let checksums = expected.to_json()?;
 
         let reader = {
             let body_stream = req
@@ -209,10 +205,7 @@ impl<B: Backend> TeleS3<B> {
             computed_crc32c,
             &computed_sha1,
             &computed_sha256,
-            expected_crc32.as_deref(),
-            expected_crc32c.as_deref(),
-            expected_sha1.as_deref(),
-            expected_sha256.as_deref(),
+            &expected,
         ) {
             if let Some(id) = id {
                 self.discard_backend_blobs(vec![id]).await;
@@ -324,18 +317,17 @@ impl<B: Backend> TeleS3<B> {
             delete_old_future.await?;
         }
 
-        let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
-            json_to_checksum_fields(&checksums);
+        let stored_checksums = ExpectedChecksums::from_json(&checksums);
 
         let response_version_id = if is_versioned { Some(version_id) } else { None };
 
         let res = S3Response::new(PutObjectOutput {
             e_tag: etag.map(ETag::Strong),
             size: Some(size as i64),
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
+            checksum_crc32: stored_checksums.crc32,
+            checksum_crc32c: stored_checksums.crc32c,
+            checksum_sha1: stored_checksums.sha1,
+            checksum_sha256: stored_checksums.sha256,
             version_id: response_version_id,
             ..Default::default()
         });
@@ -601,8 +593,7 @@ impl<B: Backend> TeleS3<B> {
         let body = StreamingBlob::wrap(chain_readers);
 
         let object_metadata = json_to_metadata(&model.user_metadata);
-        let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
-            json_to_checksum_fields(&model.checksums);
+        let stored_checksums = ExpectedChecksums::from_json(&model.checksums);
 
         // VersionId header: return it if bucket is versioned
         let versioning = self
@@ -623,10 +614,10 @@ impl<B: Backend> TeleS3<B> {
             e_tag: model.etag.map(ETag::Strong),
             metadata: object_metadata,
             body: Some(body),
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
+            checksum_crc32: stored_checksums.crc32,
+            checksum_crc32c: stored_checksums.crc32c,
+            checksum_sha1: stored_checksums.sha1,
+            checksum_sha256: stored_checksums.sha256,
             version_id: response_version_id,
             ..Default::default()
         });
@@ -655,8 +646,7 @@ impl<B: Backend> TeleS3<B> {
             req.input.if_unmodified_since.as_ref(),
         )?;
 
-        let (checksum_crc32, checksum_crc32c, checksum_sha1, checksum_sha256) =
-            json_to_checksum_fields(&model.checksums);
+        let stored_checksums = ExpectedChecksums::from_json(&model.checksums);
 
         let versioning = self
             .repo
@@ -676,10 +666,10 @@ impl<B: Backend> TeleS3<B> {
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
             e_tag: model.etag.map(ETag::Strong),
             metadata: json_to_metadata(&model.user_metadata),
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
+            checksum_crc32: stored_checksums.crc32,
+            checksum_crc32c: stored_checksums.crc32c,
+            checksum_sha1: stored_checksums.sha1,
+            checksum_sha256: stored_checksums.sha256,
             version_id: response_version_id,
             ..Default::default()
         });
