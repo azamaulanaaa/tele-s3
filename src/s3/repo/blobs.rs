@@ -43,6 +43,72 @@ impl Repository {
         Self::insert_blob(&self.db, id, size).await
     }
 
+    /// Record the intent to publish an object, *before* the backend is called.
+    ///
+    /// The write is the caller's own identifier (`publish_id`) so that an
+    /// object published without its answer coming back can still be found by
+    /// that identifier; this row is the durable record of that identifier and
+    /// of what it was written for. See
+    /// [`entity::publish_intent`](super::entity::publish_intent) for the
+    /// state machine.
+    ///
+    /// Inserted up front rather than after the call so a failure — including a
+    /// failure with no answer at all — leaves the intent on record. A caller
+    /// that cannot record the intent must not call the backend: an
+    /// unrecorded publish is unrecoverable.
+    #[instrument(skip(self), level = "debug", err)]
+    pub async fn record_publish_intent(
+        &self,
+        publish_id: String,
+        bucket_id: String,
+        object_id: String,
+        size: u64,
+    ) -> S3Result<()> {
+        let active_model = entity::publish_intent::ActiveModel {
+            publish_id: Set(publish_id),
+            bucket_id: Set(bucket_id),
+            object_id: Set(object_id),
+            size: Set(Self::checked_size(size)?),
+            blob_id: Set(None),
+            created_at: Set(chrono::Local::now().to_utc()),
+            resolved_at: Set(None),
+        };
+
+        entity::publish_intent::Entity::insert(active_model)
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(())
+    }
+
+    /// Mark a recorded intent resolved now that the backend returned a key.
+    ///
+    /// Only ever called on the success path. A failed write leaves the row
+    /// pending on purpose — that pending row is the only record an
+    /// unpublished-but-published-anyway object can be found by.
+    #[instrument(skip(self), level = "debug", err)]
+    pub async fn resolve_publish_intent(&self, publish_id: &str, blob_id: String) -> S3Result<()> {
+        let now = chrono::Local::now().to_utc();
+
+        entity::publish_intent::Entity::update_many()
+            .col_expr(
+                entity::publish_intent::Column::BlobId,
+                sea_orm::sea_query::Expr::value(blob_id),
+            )
+            .col_expr(
+                entity::publish_intent::Column::ResolvedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(entity::publish_intent::Column::PublishId.eq(publish_id))
+            .filter(entity::publish_intent::Column::ResolvedAt.is_null())
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(())
+    }
+
     /// Acquire one additional reference for each listed blob.
     ///
     /// Implemented as a single atomic upsert

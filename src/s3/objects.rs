@@ -31,6 +31,7 @@ use super::repo::{ObjectWrite, Repository};
 use super::types::{Metadata, MetadataItem};
 use crate::backend::{
     Backend, BoxedAsyncReader, ChainReaders, IntegrityDigests, IntegrityReader, ReadOutcome,
+    new_publish_id,
 };
 
 /// Map one [`ReadOutcome`] to the reader this read path needs.
@@ -188,11 +189,33 @@ impl<B: Backend> TeleS3<B> {
             let id = if size > 0 {
                 let reader_with_hasher = Box::pin(IntegrityReader::new(reader, state.clone()));
 
+                // The publish intent is recorded *before* the backend is
+                // called, because the failure this exists for is a call whose
+                // answer never arrives. If the row cannot be written the
+                // backend must not be called at all: a publish with no record
+                // of it is unrecoverable, so failing here is strictly safer.
+                let publish_id = new_publish_id();
+                self.repo
+                    .record_publish_intent(
+                        publish_id.clone(),
+                        req.input.bucket.clone(),
+                        req.input.key.clone(),
+                        size,
+                    )
+                    .await?;
+
                 let id = self
                     .backend
-                    .write(size, reader_with_hasher)
+                    .write(publish_id.clone(), size, reader_with_hasher)
                     .await
                     .map_err(S3Error::from)?;
+
+                // Only a confirmed publish clears the intent; on failure the
+                // row stays pending, which is the whole point of writing it.
+                self.repo
+                    .resolve_publish_intent(&publish_id, id.clone())
+                    .await?;
+
                 Some(id)
             } else {
                 None
@@ -1299,13 +1322,80 @@ mod tests {
     use super::*;
     use crate::backend::{BackendError, Memory};
     use crate::s3::TeleS3;
-    use sea_orm::ConnectionTrait;
+    use sea_orm::{ConnectionTrait, EntityTrait};
 
     async fn test_service() -> TeleS3<Memory<1, 1>> {
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("connect");
         TeleS3::init(Memory::default(), db).await.expect("init")
+    }
+
+    /// A backend whose writes can be made to fail on demand, so what the
+    /// publish intent survives is observable.
+    struct FlakyWrite {
+        inner: Memory<8, 8>,
+        fail_write: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyWrite {
+        fn fail_writes(&self, fail: bool) {
+            self.fail_write
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FlakyWrite {
+        async fn write(
+            &self,
+            publish_id: String,
+            size: u64,
+            reader: BoxedAsyncReader,
+        ) -> Result<String, BackendError> {
+            if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(BackendError::Other("write refused".into()));
+            }
+
+            self.inner.write(publish_id, size, reader).await
+        }
+
+        async fn read(
+            &self,
+            key: String,
+            offset: u64,
+            limit: Option<u64>,
+        ) -> Result<ReadOutcome, BackendError> {
+            self.inner.read(key, offset, limit).await
+        }
+
+        async fn delete(&self, key: String) -> Result<(), BackendError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    async fn flaky_write_service() -> TeleS3<FlakyWrite> {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        TeleS3::init(
+            FlakyWrite {
+                inner: Memory::default(),
+                fail_write: std::sync::atomic::AtomicBool::new(false),
+            },
+            db,
+        )
+        .await
+        .expect("init")
+    }
+
+    async fn intents(
+        svc: &TeleS3<impl Backend>,
+    ) -> Vec<crate::s3::repo::entity::publish_intent::Model> {
+        crate::s3::repo::entity::publish_intent::Entity::find()
+            .all(&svc.repo.db)
+            .await
+            .expect("load publish intents")
     }
 
     #[test]
@@ -2000,11 +2090,23 @@ mod tests {
     }
 
     fn put_req(bucket: &str, key: &str, content_length: Option<i64>) -> S3Request<PutObjectInput> {
+        put_body_req(bucket, key, content_length, Vec::new())
+    }
+
+    /// A `PutObject` carrying `body`, so the write actually reaches the
+    /// backend (a zero-length body never calls it).
+    fn put_body_req(
+        bucket: &str,
+        key: &str,
+        content_length: Option<i64>,
+        body: Vec<u8>,
+    ) -> S3Request<PutObjectInput> {
         S3Request {
             input: PutObjectInput {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 content_length,
+                body: Some(StreamingBlob::from_bytes(bytes::Bytes::from(body))),
                 ..Default::default()
             },
             method: http::Method::PUT,
@@ -2016,6 +2118,101 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_records_and_resolves_a_publish_intent() {
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        svc.put_object_inner(put_body_req("b", "k", Some(3), b"abc".to_vec()))
+            .await
+            .expect("put");
+
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1, "exactly one intent per write: {rows:?}");
+
+        let row = &rows[0];
+        assert_eq!(row.bucket_id, "b");
+        assert_eq!(row.object_id, "k");
+        assert_eq!(row.size, 3);
+        assert!(
+            row.resolved_at.is_some(),
+            "a confirmed publish must resolve its intent: {row:?}"
+        );
+        assert!(
+            row.blob_id.is_some(),
+            "a resolved intent records the backend key: {row:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_leaves_its_publish_intent_pending() {
+        // The load-bearing assertion of this scope: a publish that may have
+        // happened and returned no key is found by nothing else, so a failed
+        // write must not clear the only record of it. A reconciler that finds
+        // no pending intent has nothing to repair.
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.backend.fail_writes(true);
+
+        svc.put_object_inner(put_body_req("b", "k", Some(3), b"abc".to_vec()))
+            .await
+            .expect_err("a refused write must fail the request");
+
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1, "the intent outlives the failure: {rows:?}");
+
+        let row = &rows[0];
+        assert!(
+            row.resolved_at.is_none(),
+            "a failed write must leave the intent pending: {row:?}"
+        );
+        assert!(
+            row.blob_id.is_none(),
+            "no key was returned, so none can be recorded: {row:?}"
+        );
+        assert_eq!(row.bucket_id, "b");
+        assert_eq!(row.object_id, "k");
+    }
+
+    #[tokio::test]
+    async fn a_publish_id_carries_no_user_data() {
+        // The identifier is published under in the backend, so it must never
+        // embed the bucket or key the object was written for.
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("customer-private".into(), None)
+            .await
+            .expect("create bucket");
+
+        svc.put_object_inner(put_body_req(
+            "customer-private",
+            "invoices/q3.pdf",
+            Some(3),
+            b"abc".to_vec(),
+        ))
+        .await
+        .expect("put");
+
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1);
+
+        let publish_id = &rows[0].publish_id;
+        assert!(
+            !publish_id.contains("customer-private"),
+            "the publish identifier leaks the bucket: {publish_id}"
+        );
+        assert!(
+            !publish_id.contains("invoices/q3.pdf"),
+            "the publish identifier leaks the key: {publish_id}"
+        );
     }
 
     #[tokio::test]

@@ -26,7 +26,9 @@ use super::helpers::{
 use super::objects::{checked_content_length, read_outcome_to_reader};
 use super::repo::{MultipartUploadStateUpdate, ObjectWrite};
 use super::types::{Metadata, MetadataItem, MultipartUploadPart};
-use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher};
+use crate::backend::{
+    Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher, new_publish_id,
+};
 
 impl<B: Backend> TeleS3<B> {
     #[instrument(skip(self), err)]
@@ -102,11 +104,27 @@ impl<B: Backend> TeleS3<B> {
 
             let reader_with_hasher = Box::pin(IntegrityReader::new(reader, state.clone()));
 
+            // As in `put_object_inner`: the intent is durable before the
+            // backend is called, and only a confirmed publish clears it.
+            let publish_id = new_publish_id();
+            self.repo
+                .record_publish_intent(
+                    publish_id.clone(),
+                    req.input.bucket.clone(),
+                    req.input.key.clone(),
+                    size,
+                )
+                .await?;
+
             let id = self
                 .backend
-                .write(size, reader_with_hasher)
+                .write(publish_id.clone(), size, reader_with_hasher)
                 .await
                 .map_err(S3Error::from)?;
+
+            self.repo
+                .resolve_publish_intent(&publish_id, id.clone())
+                .await?;
 
             let mut guard = state
                 .lock()

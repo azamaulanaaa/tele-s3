@@ -460,8 +460,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Backend for FlakyDelete {
-        async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
-            self.inner.write(size, reader).await
+        async fn write(
+            &self,
+            publish_id: String,
+            size: u64,
+            reader: BoxedAsyncReader,
+        ) -> Result<String, BackendError> {
+            self.inner.write(publish_id, size, reader).await
         }
 
         async fn read(

@@ -501,6 +501,16 @@ impl AttemptError {
     }
 }
 
+/// Name a caller-supplied publish identifier publishes under.
+///
+/// The published file name is the caller's identifier and nothing else: the
+/// caller recorded it as a publish intent before this write, so a publish
+/// whose answer was lost is still findable by this exact string. Pure, so
+/// the "the name is the identifier" contract is testable without a session.
+fn publish_name(publish_id: &str) -> &str {
+    publish_id
+}
+
 impl Grammers {
     /// Upload the parts `plan` describes from `reader`, then prove the reader
     /// really ended.
@@ -887,6 +897,11 @@ impl Grammers {
 impl Backend for Grammers {
     /// Store `size` bytes as a message in the peer chat and return its id.
     ///
+    /// The message is published under `publish_id`, the identifier the caller
+    /// chose and recorded as a publish intent before calling. It is the only
+    /// thing tying an orphaned publish back to this layer, so it must reach
+    /// the wire unchanged.
+    ///
     /// # The residual window this cannot close
     ///
     /// The upload and the publish are two requests, and only the first is
@@ -918,7 +933,12 @@ impl Backend for Grammers {
     /// record of the intended publish plus a backend-aware reconciler, and is
     /// deliberately out of scope here.
     #[instrument(skip(self, reader), level = "debug", ret, err)]
-    async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
+    async fn write(
+        &self,
+        publish_id: String,
+        size: u64,
+        reader: BoxedAsyncReader,
+    ) -> Result<String, BackendError> {
         let max_size = MAX_PARTS as u64 * PART_SIZE as u64;
         if size > max_size {
             return Err(BackendError::ExceedLimitSize {
@@ -935,7 +955,11 @@ impl Backend for Grammers {
             duration.as_millis() as i64
         };
 
-        let name = uuid::Uuid::new_v4().to_string();
+        // The published file name is the caller's identifier verbatim. It is
+        // deliberately opaque and carries no bucket or key: it becomes
+        // visible in the peer chat, and it is the one coordinate a later
+        // reconciler can search a lost publish by.
+        let name = publish_name(&publish_id).to_owned();
         let mut compat_reader = reader.compat();
 
         self.check_flood_wait().await?;
@@ -1138,6 +1162,34 @@ impl Backend for Grammers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_published_name_is_the_caller_supplied_identifier() {
+        // The orphan-recovery contract: the caller records this identifier
+        // as a publish intent *before* the write, so it must reach the
+        // message name unchanged or a lost publish is unfindable.
+        let id = crate::backend::new_publish_id();
+
+        assert_eq!(publish_name(&id), id);
+    }
+
+    #[test]
+    fn a_publish_id_carries_no_user_data() {
+        // The identifier is published in a Telegram chat, so it must not
+        // embed the bucket or key the object was written for. The generator
+        // takes no such arguments at all; this guards that against a later
+        // change to the format.
+        let bucket = "customer-private-bucket";
+        let key = "invoices/2026/q3-report.pdf";
+        let id = crate::backend::new_publish_id();
+
+        assert!(!id.contains(bucket), "identifier leaks the bucket: {id}");
+        assert!(!id.contains(key), "identifier leaks the key: {id}");
+        assert!(
+            crate::backend::is_publish_id(&id),
+            "identifier is not in the published shape: {id}"
+        );
+    }
 
     #[test]
     fn flood_error_with_duration_is_retried_after_the_requested_window() {

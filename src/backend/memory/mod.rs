@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
 
-use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome};
+use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, is_publish_id};
 
 struct ObjectReader<const M: usize> {
     object: Arc<RwLock<Object<M>>>,
@@ -69,7 +69,7 @@ struct Object<const M: usize> {
 
 pub struct Memory<const N: usize, const M: usize> {
     storage: Mutex<[Option<[u8; M]>; N]>,
-    table: RwLock<BTreeMap<u128, Arc<RwLock<Object<M>>>>>,
+    table: RwLock<BTreeMap<String, Arc<RwLock<Object<M>>>>>,
 }
 
 impl<const N: usize, const M: usize> Default for Memory<N, M> {
@@ -83,7 +83,19 @@ impl<const N: usize, const M: usize> Default for Memory<N, M> {
 
 #[async_trait::async_trait]
 impl<const N: usize, const M: usize> Backend for Memory<N, M> {
-    async fn write(&self, size: u64, mut reader: BoxedAsyncReader) -> Result<String, BackendError> {
+    /// Store the bytes under the caller-supplied `publish_id` and return it
+    /// unchanged as the key.
+    ///
+    /// The identifier is opaque and chosen by the layer above so it can be
+    /// recorded as a publish intent before this call and used to find the
+    /// object afterwards. This backend honours the contract literally: the
+    /// key is the identifier it was handed, byte for byte.
+    async fn write(
+        &self,
+        publish_id: String,
+        size: u64,
+        mut reader: BoxedAsyncReader,
+    ) -> Result<String, BackendError> {
         let mut object = {
             let mut storage = self.storage.lock().await;
 
@@ -171,10 +183,12 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
             let mut table = self.table.write().await;
 
             let object = Arc::new(RwLock::new(object));
-            let key = uuid::Uuid::new_v4().as_u128();
-            let _ = table.insert(key, object);
+            // A collision would make two objects share one entry, so the
+            // caller-owned identifier must be unique; the S3 layer mints it
+            // from a UUID for exactly this reason.
+            let _ = table.insert(publish_id.clone(), object);
 
-            key.to_string()
+            publish_id
         };
 
         Ok(key)
@@ -191,21 +205,19 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
         let table = self.table.read().await;
 
-        // A key this backend cannot parse as one of its own names nothing it
-        // ever wrote, so the object is not absent — it is unreadable. Same
-        // rule `Grammers` applies, and deliberately opposite to `delete`,
-        // where an unparseable key is an absent key by construction.
-        let key = match key.parse::<u128>() {
-            Ok(v) => v,
-            Err(_) => {
-                // Logged here, where the offending key is still in hand: the
-                // fault's `detail` never reaches the client.
-                tracing::error!(key = %key, "backend read fault: key is not a key this backend minted");
-                return Ok(ReadOutcome::Fault(BackendError::InvariantViolation {
-                    detail: "key is not a key this backend minted",
-                }));
-            }
-        };
+        // A key that is not the shape of an identifier this backend was
+        // handed names nothing it ever wrote, so the object is not absent —
+        // it is unreadable. Same rule `Grammers` applies, and deliberately
+        // opposite to `delete`, where an unaddressable key is an absent key
+        // by construction.
+        if !is_publish_id(&key) {
+            // Logged here, where the offending key is still in hand: the
+            // fault's `detail` never reaches the client.
+            tracing::error!(key = %key, "backend read fault: key is not a key this backend minted");
+            return Ok(ReadOutcome::Fault(BackendError::InvariantViolation {
+                detail: "key is not a key this backend minted",
+            }));
+        }
 
         let object = match table.get(&key) {
             Some(v) => v.clone(),
@@ -222,11 +234,6 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         // Idempotent by contract: a key that names nothing — including one
         // this backend cannot parse, which names nothing it ever wrote — is
         // deleted successfully.
-        let key = match key.parse::<u128>() {
-            Ok(v) => v,
-            Err(_) => return Ok(()),
-        };
-
         let object = {
             let mut table = self.table.write().await;
             let object = table.remove(&key);
@@ -268,13 +275,18 @@ mod tests {
         }
     }
 
+    /// A fresh identifier, in the shape the S3 layer mints them.
+    fn publish_id() -> String {
+        crate::backend::new_publish_id()
+    }
+
     #[tokio::test]
     async fn test_read_non_existing() -> anyhow::Result<()> {
         let backend = Memory::<1, 1>::default();
 
-        // A well-formed key that was never written: genuinely missing, as
-        // opposed to a key this backend cannot address at all.
-        let key = u128::MAX.to_string();
+        // A well-formed identifier that was never written: genuinely
+        // missing, as opposed to a key this backend cannot address at all.
+        let key = publish_id();
         let result = backend.read(key, 0, None).await;
 
         if !result.is_ok_and(|v| matches!(v, ReadOutcome::Missing)) {
@@ -304,9 +316,9 @@ mod tests {
         let backend = Memory::<3, 2>::default();
 
         // Never written, and twice, plus once under a key this backend
-        // cannot parse: the idempotency contract covers all of them.
-        backend.delete(u128::MAX.to_string()).await?;
-        backend.delete(u128::MAX.to_string()).await?;
+        // cannot address at all: the idempotency contract covers all of them.
+        backend.delete(publish_id()).await?;
+        backend.delete(publish_id()).await?;
         backend.delete("key".to_string()).await?;
 
         Ok(())
@@ -318,7 +330,9 @@ mod tests {
 
         let content = "content";
         let content_reader = Box::pin(Cursor::new(content.as_bytes()));
-        let result = backend.write(content.len() as u64, content_reader).await;
+        let result = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await;
 
         match result {
             Err(BackendError::ExceedLimitSize { max: _, actual: _ }) => (),
@@ -339,12 +353,43 @@ mod tests {
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
 
-        let key = backend.write(content.len() as u64, content_reader).await?;
+        let key = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
 
         let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
 
+        assert_eq!(out[..], content);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_stored_key_is_the_caller_supplied_identifier() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        // The contract the whole publish-intent scheme rests on: the key the
+        // backend returns is the identifier it was given, verbatim, so the
+        // caller can find the object by what it recorded beforehand.
+        let id = publish_id();
+
+        let content = [1, 2, 3];
+        let key = backend
+            .write(
+                id.clone(),
+                content.len() as u64,
+                Box::pin(Cursor::new(content)),
+            )
+            .await?;
+
+        assert_eq!(key, id);
+
+        // And the object really is addressable by that identifier.
+        let mut reader = present(backend.read(key, 0, None).await?)?;
+        let mut out = Vec::new();
+        let _ = reader.read_to_end(&mut out).await?;
         assert_eq!(out[..], content);
 
         Ok(())
@@ -357,7 +402,9 @@ mod tests {
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
 
-        let key = backend.write(content.len() as u64, content_reader).await?;
+        let key = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
 
         let mut reader = present(backend.read(key, 1, None).await?)?;
         let mut out = Vec::new();
@@ -375,7 +422,9 @@ mod tests {
         let content: Vec<u8> = (0..10).collect();
         let content_reader = Box::pin(Cursor::new(content.clone()));
 
-        let key = backend.write(content.len() as u64, content_reader).await?;
+        let key = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
 
         let mut reader = present(backend.read(key, 2, Some(5)).await?)?;
         let mut out = Vec::new();
@@ -393,7 +442,9 @@ mod tests {
         let content: Vec<u8> = (0..10).collect();
         let content_reader = Box::pin(Cursor::new(content.clone()));
 
-        let key = backend.write(content.len() as u64, content_reader).await?;
+        let key = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
 
         let mut reader = present(backend.read(key, 5, Some(3)).await?)?;
         let mut out = Vec::new();
@@ -411,7 +462,7 @@ mod tests {
         let content: [u8; 0] = [];
         let content_reader = Box::pin(Cursor::new(content));
 
-        let key = backend.write(0, content_reader).await?;
+        let key = backend.write(publish_id(), 0, content_reader).await?;
 
         let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
@@ -429,7 +480,9 @@ mod tests {
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
 
-        let _ = backend.write(content.len() as u64, content_reader).await?;
+        let _ = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
 
         let free_map = {
             let storage = backend.storage.lock().await;
@@ -448,8 +501,10 @@ mod tests {
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
 
-        let key = backend.write(content.len() as u64, content_reader).await?;
-        backend.delete(key).await?;
+        let key = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
+        backend.delete(key.clone()).await?;
 
         let free_map = {
             let storage = backend.storage.lock().await;
@@ -468,7 +523,9 @@ mod tests {
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
 
-        let key = backend.write(content.len() as u64, content_reader).await?;
+        let key = backend
+            .write(publish_id(), content.len() as u64, content_reader)
+            .await?;
         backend.delete(key.clone()).await?;
 
         let result = backend.read(key, 0, None).await;

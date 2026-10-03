@@ -14,6 +14,34 @@ mod grammers;
 mod memory;
 mod reader_with_hasher;
 
+/// Fixed prefix of every [`publish_id`], so an operator (or a later
+/// reconciler) looking at a message in the chat can recognise it as one of
+/// ours without knowing anything else about it.
+pub const PUBLISH_ID_PREFIX: &str = "s3pub-";
+
+/// Mint the opaque, caller-owned identifier that names one publish.
+///
+/// The S3 layer generates this *before* it calls [`Backend::write`] and
+/// records it in a durable intent row, so that a write whose response is
+/// lost is still findable afterwards by this exact string. The backend must
+/// publish the object under it — for `Grammers` that is the file name of the
+/// Telegram message — and it must carry no user data: bucket names and keys
+/// are chosen by clients, and this string is visible in the chat.
+pub fn new_publish_id() -> String {
+    format!("{PUBLISH_ID_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Whether `id` has the shape [`new_publish_id`] mints.
+///
+/// Pure, and used by backends whose keys are caller-supplied rather than
+/// self-minted: without it they cannot tell a key they were handed from
+/// something they could never address, which is the distinction
+/// [`ReadOutcome::Fault`] turns on.
+pub fn is_publish_id(id: &str) -> bool {
+    id.strip_prefix(PUBLISH_ID_PREFIX)
+        .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The reader [`Backend`] speaks in: a pinned, task-safe `AsyncRead`.
 ///
 /// An alias rather than a newtype so the crate's own adapters can be handed
@@ -98,7 +126,8 @@ impl fmt::Debug for ReadOutcome {
 }
 
 /// Storage for opaque byte objects, addressed by the opaque keys
-/// [`Backend::write`] mints.
+/// [`Backend::write`] returns, each derived from the publish identifier its
+/// caller supplied.
 ///
 /// This is the crate's extension surface, so the S3 layer above assumes only
 /// what is stated here:
@@ -116,7 +145,18 @@ impl fmt::Debug for ReadOutcome {
 /// distinct keys and must not assume a caller serializes them for it.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
-    /// Store `reader`'s bytes under a freshly minted key and return it.
+    /// Store `reader`'s bytes under the object named by `publish_id` and
+    /// return the key that names it.
+    ///
+    /// `publish_id` is chosen by the caller (see [`new_publish_id`]) and is
+    /// the one coordinate that survives a failed write: the caller records
+    /// it in a durable intent row *before* calling this, so an object that
+    /// was published without its answer ever coming back is still findable
+    /// by this string. An implementation must therefore use it verbatim as
+    /// the name the object is published under — for `Grammers`, the file
+    /// name of the message — and must not derive the published name from
+    /// anything else. It must never be parsed or embedded in a returned
+    /// key.
     ///
     /// `size` is the authoritative object length, not a hint: it decides
     /// capacity accounting, the recorded `s3_blob.size`, and the range
@@ -137,7 +177,12 @@ pub trait Backend: Send + Sync + 'static {
     /// returned key names, and nothing above can clean it up: the
     /// reconciler drops metadata *rows*, not backend objects. Keep that
     /// window as small as the backend allows.
-    async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError>;
+    async fn write(
+        &self,
+        publish_id: String,
+        size: u64,
+        reader: BoxedAsyncReader,
+    ) -> Result<String, BackendError>;
 
     /// Open a byte range of `key`, or report what is — or is not — there.
     ///
