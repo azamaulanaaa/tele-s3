@@ -277,7 +277,8 @@ impl BodyPlan {
 /// carry it and this is the one place both numbers are in hand.
 fn overlong_body(size: u64) -> BackendError {
     tracing::error!(
-        declared = size,
+        declared_bytes = size,
+        error.type = "write_body_overlong",
         "backend write fault: the body is longer than the declared size"
     );
 
@@ -448,6 +449,7 @@ fn unpublished_upload(fault: PublishFault, file_id: i64, name: &str) -> BackendE
                     file_id,
                     name,
                     outcome = "possibly-published",
+                    error.type = "unpublished_upload",
                     "upload may exist as a Telegram message but no key was returned; \
                      it is unreachable by key and must be deleted from the chat by hand"
                 );
@@ -496,6 +498,7 @@ impl From<KeyFault> for ReadOutcome {
 fn poisoned_flood_guard() -> BackendError {
     tracing::error!(
         lock = "flood_guard",
+        error.type = "poisoned_lock",
         "flood guard mutex poisoned; rate-limit waits are no longer tracked"
     );
     BackendError::PoisonedLock {
@@ -603,6 +606,12 @@ impl Grammers {
                 .map_err(|e| BackendError::Other(e.into()))?;
 
             upload_part(part_index as i32, buffer).await?;
+
+            tracing::debug!(
+                part_index = part_index as u32,
+                bytes = len,
+                "uploaded part to Telegram"
+            );
         }
 
         // The declared `size` is now uploaded. One byte more is all it takes
@@ -627,7 +636,7 @@ impl Grammers {
         let limits = config.limits.sanitized();
         tracing::info!(
             max_concurrent_requests = limits.max_concurrent_requests,
-            io_timeout = ?limits.io_timeout,
+            io_timeout_ms = limits.io_timeout.as_millis() as u64,
             max_attempts = limits.max_attempts,
             "Telegram backend limits"
         );
@@ -707,7 +716,10 @@ impl Grammers {
         };
 
         if let Some(duration) = wait_time {
-            warn!("Flood guard active. Sleeping for {:.2?}", duration);
+            tracing::warn!(
+                duration_ms = duration.as_millis() as u64,
+                "flood guard active; sleeping for the remaining rate-limit window"
+            );
             tokio::time::sleep(duration).await;
 
             let mut guard = self
@@ -735,7 +747,11 @@ impl Grammers {
                     *guard = Some(Instant::now() + duration);
                 }
 
-                tracing::warn!("Hit {} ({}s). Blocking.", rpc_err.name, duration.as_secs());
+                tracing::warn!(
+                    operation = rpc_err.name,
+                    duration_ms = duration.as_millis() as u64,
+                    "hit a Telegram rate limit; blocking every outbound request for that window"
+                );
 
                 Ok(true)
             }
@@ -822,13 +838,24 @@ impl Grammers {
                     match next_attempt(attempt, self.limits.max_attempts) {
                         Attempt::Retry => {}
                         Attempt::Exhausted { attempts } => {
-                            warn!(attempts, error = %err, "Download retry budget exhausted");
+                            warn!(
+                                attempts,
+                                operation = "download_chunk",
+                                error.type = "rpc",
+                                error.message = %err,
+                                "download retry budget exhausted"
+                            );
                             return Err(AttemptError::Rpc(err).into_backend_error());
                         }
                     }
                 }
                 Err(AttemptError::Timeout(timeout)) => {
-                    warn!(?timeout, "Download chunk exceeded its deadline");
+                    warn!(
+                        operation = "download_chunk",
+                        timeout_ms = timeout.as_millis() as u64,
+                        error.type = "timeout",
+                        "download chunk exceeded its deadline"
+                    );
                     return Err(AttemptError::Timeout(timeout).into_backend_error());
                 }
             }
@@ -871,7 +898,12 @@ impl Grammers {
                 Ok(Some(message)) => message,
                 Ok(None) => return Ok(None),
                 Err(AttemptError::Timeout(timeout)) => {
-                    warn!(?timeout, "Telegram history request exceeded its deadline");
+                    warn!(
+                        operation = "get_messages_by_id",
+                        timeout_ms = timeout.as_millis() as u64,
+                        error.type = "timeout",
+                        "Telegram history request exceeded its deadline"
+                    );
                     return Err(AttemptError::Timeout(timeout).into_backend_error());
                 }
                 // A history request that fails is *not* proof that no message
@@ -916,7 +948,11 @@ impl Grammers {
             let err = match self.attempt(rpc()).await {
                 Ok(value) => return Ok(value),
                 Err(AttemptError::Timeout(timeout)) => {
-                    warn!(?timeout, "Telegram request exceeded its deadline");
+                    warn!(
+                        timeout_ms = timeout.as_millis() as u64,
+                        error.type = "timeout",
+                        "Telegram request exceeded its deadline"
+                    );
                     return Err(AttemptError::Timeout(timeout).into_backend_error());
                 }
                 Err(AttemptError::Rpc(err)) => err,
@@ -926,10 +962,22 @@ impl Grammers {
                 return Err(AttemptError::Rpc(err).into_backend_error());
             }
 
+            tracing::debug!(
+                attempts = attempt,
+                error.type = "rpc",
+                error.message = %err,
+                "retrying Telegram request after a rate limit"
+            );
+
             match next_attempt(attempt, self.limits.max_attempts) {
                 Attempt::Retry => {}
                 Attempt::Exhausted { attempts } => {
-                    warn!(attempts, error = %err, "Telegram retry budget exhausted");
+                    warn!(
+                        attempts,
+                        error.type = "rpc",
+                        error.message = %err,
+                        "Telegram retry budget exhausted"
+                    );
                     return Err(AttemptError::Rpc(err).into_backend_error());
                 }
             }
@@ -980,7 +1028,12 @@ impl Grammers {
                     Err(_) => return Err(PublishFault::Dispatched(failure)),
                 },
                 AttemptError::Timeout(timeout) => {
-                    warn!(?timeout, "Telegram publish exceeded its deadline");
+                    warn!(
+                        operation = "publish_message",
+                        timeout_ms = timeout.as_millis() as u64,
+                        error.type = "timeout",
+                        "Telegram publish exceeded its deadline"
+                    );
                     return Err(PublishFault::Dispatched(failure));
                 }
             };
@@ -989,10 +1042,23 @@ impl Grammers {
                 return Err(PublishFault::Dispatched(failure));
             }
 
+            tracing::debug!(
+                attempts = attempt,
+                error.type = "rpc",
+                error.message = ?failure,
+                "retrying Telegram publish after a rate limit"
+            );
+
             match next_attempt(attempt, self.limits.max_attempts) {
                 Attempt::Retry => {}
                 Attempt::Exhausted { attempts } => {
-                    warn!(attempts, error = ?failure, "Telegram publish retry budget exhausted");
+                    warn!(
+                        attempts,
+                        operation = "publish_message",
+                        error.type = "rpc",
+                        error.message = ?failure,
+                        "Telegram publish retry budget exhausted"
+                    );
                     return Err(PublishFault::Dispatched(failure));
                 }
             }
@@ -1142,6 +1208,7 @@ impl Backend for Grammers {
             Err(fault) => {
                 tracing::error!(
                     key = %key,
+                    error.type = "key_not_minted",
                     "backend read fault: key is not a message id this backend minted"
                 );
                 return Ok(fault);
@@ -1180,6 +1247,7 @@ impl Backend for Grammers {
                 None => {
                     tracing::error!(
                         key = %key,
+                        error.type = "no_media",
                         "backend read fault: the message a key names exists but carries no media"
                     );
                     return Ok(KeyFault::NoMedia.into());
@@ -1299,7 +1367,8 @@ impl Backend for Grammers {
                 tracing::warn!(
                     message_id,
                     publish_id = %publish_id,
-                    error = ?err,
+                    error.type = "reclaim_publish",
+                    error.message = ?err,
                     "found an unconfirmed publish but could not delete it; \
                      the intent stays pending for a later pass"
                 );
@@ -1671,8 +1740,12 @@ mod tests {
 /// A subscriber is installed for the closure only, so this needs no global
 /// state and no dependency beyond the `tracing-subscriber` the binary already
 /// uses.
+///
+/// `DEBUG` is enabled so `debug!` events are captured too; the default
+/// subscriber filter would drop them and a field assertion on one would pass
+/// vacuously.
 #[cfg(test)]
-fn capture_log(f: impl FnOnce()) -> String {
+pub(crate) fn capture_log(f: impl FnOnce()) -> String {
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -1706,6 +1779,7 @@ fn capture_log(f: impl FnOnce()) -> String {
     let buffer = Buffer(Arc::default());
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(buffer.clone())
         .finish();
     let sink = Arc::clone(&buffer.0);
@@ -1718,6 +1792,87 @@ fn capture_log(f: impl FnOnce()) -> String {
         .clone();
 
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The field names the crate's events carry, asserted on captured output.
+///
+/// These check the *names*, not the prose. An event that leaves its data in
+/// the message can be read by a human and counted by nothing, which is the
+/// gap this module exists to keep closed: a later edit that drops a field
+/// fails here rather than silently breaking a downstream exporter.
+#[cfg(test)]
+mod field_vocabulary {
+    use super::*;
+
+    /// A body longer than the caller declared reports the number it was
+    /// measured against, so the fault can be counted without reading prose.
+    #[test]
+    fn an_overlong_body_names_its_declared_size_and_error_type() {
+        let log = capture_log(|| {
+            let _ = overlong_body(4_096);
+        });
+
+        assert!(log.contains("declared_bytes=4096"), "{log}");
+        assert!(log.contains("error.type=\"write_body_overlong\""), "{log}");
+    }
+
+    /// The orphan-publish warning is the only record that tells an operator
+    /// which message to delete by hand, so every identifier it needs must be
+    /// a field.
+    #[test]
+    fn an_unconfirmed_publish_names_what_to_delete_and_why_it_failed() {
+        let log = capture_log(|| {
+            let _ = unpublished_upload(
+                PublishFault::Dispatched(PublishFailure::TimedOut {
+                    after: Duration::from_secs(120),
+                }),
+                1_700_000_000_000,
+                "0d1e2f3a-4b5c-4d6e-8f90-a1b2c3d4e5f6",
+            );
+        });
+
+        for field in [
+            "file_id",
+            "name",
+            "outcome",
+            "error.type",
+            "unpublished_upload",
+        ] {
+            assert!(log.contains(field), "{field} must be a field: {log}");
+        }
+    }
+
+    /// A poisoned mutex disables rate-limit tracking for the life of the
+    /// process, and the log is the only place it is written down.
+    #[test]
+    fn a_poisoned_flood_guard_names_the_lock_it_lost() {
+        let log = capture_log(|| {
+            let _ = poisoned_flood_guard();
+        });
+
+        assert!(log.contains("lock=\"flood_guard\""), "{log}");
+        assert!(log.contains("error.type=\"poisoned_lock\""), "{log}");
+    }
+
+    /// Each part upload is reported at `debug` with its index and size, which
+    /// is what makes a stalled multi-part upload diagnosable.
+    #[test]
+    fn every_uploaded_part_is_reported_with_its_index_and_size() {
+        let log = capture_log(|| {
+            let mut body = std::io::Cursor::new(vec![1u8, 2, 3]);
+            let plan = BodyPlan::for_size(3);
+            futures::executor::block_on(Grammers::upload_parts(
+                &mut body,
+                &plan,
+                |_index, _bytes| futures::future::ready(Ok(())),
+            ))
+            .expect("a body of the declared size uploads cleanly");
+        });
+
+        assert!(log.contains("part_index=0"), "{log}");
+        assert!(log.contains("bytes=3"), "{log}");
+        assert!(log.contains("DEBUG"), "{log}");
+    }
 }
 
 /// The `write` size contract, exercised through a fake part sink.

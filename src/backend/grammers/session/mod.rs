@@ -151,7 +151,7 @@ impl Session for SessionStorage {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(DEFAULT_DC),
             Err(e) => {
-                error!(error = ?e, "Failed to query Home DC");
+                error!(operation = "query_home_dc", error.type = "session_store", error.message = ?e, "Failed to query Home DC");
 
                 Err(e.into())
             }
@@ -190,7 +190,7 @@ impl Session for SessionStorage {
             let (ipv4, ipv6) = match (ipv4, ipv6) {
                 (Ok(v4), Ok(v6)) => (v4, v6),
                 _ => {
-                    error!(dc_id, "Corrupted IP address in database. Ignoring row.");
+                    error!(dc_id, error.type = "corrupt_dc_option", "Corrupted IP address in database. Ignoring row.");
 
                     return None;
                 }
@@ -201,7 +201,7 @@ impl Session for SessionStorage {
                 Some(bytes) => match bytes.try_into() {
                     Ok(key) => Some(key),
                     Err(_) => {
-                        error!(dc_id, "Corrupted auth key in database. Ignoring row.");
+                        error!(dc_id, error.type = "corrupt_dc_option", "Corrupted auth key in database. Ignoring row.");
 
                         return None;
                     }

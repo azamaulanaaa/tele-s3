@@ -165,6 +165,19 @@ Out-of-range values are clamped rather than rejected, so a bad setting degrades 
 TELEGRAM_MAX_CONCURRENT_REQUESTS=2 TELEGRAM_IO_TIMEOUT_SECS=300 cargo run -- --config config.toml
 ```
 
+### Logging
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `RUST_LOG` | `tele_s3=info` | The usual `tracing-subscriber` filter. `RUST_LOG=tele_s3=debug` turns up the high-frequency internals — every uploaded part, every backend read, every retry after a Telegram rate limit. Anything the dependencies emit needs their targets named explicitly, e.g. `RUST_LOG=tele_s3=debug,s3s=info`. |
+| `TELE_S3_LOG_FORMAT` | `text` | `json` emits one JSON object per event instead of the human-readable rendering, for ingestion into a log pipeline. Any other value keeps `text`, so a typo degrades to the default rather than to a process that logs nothing. |
+
+Every event this service emits carries its data as named fields rather than prose, so the same event can be counted and grouped downstream: `bucket`, `key`, `blob_id`, `publish_id`, `message_id`, `part_index`, `bytes`, `attempts`, `duration_ms`, `timeout_ms`, `error.type`, `error.message` and so on. The full vocabulary — every field name and what it means — is documented on `init_tracing` in `src/main.rs`, and it is the contract a log or tracing exporter binds to.
+
+```bash
+TELE_S3_LOG_FORMAT=json RUST_LOG=tele_s3=debug cargo run -- --config config.toml
+```
+
 ## Architecture
 
 ```

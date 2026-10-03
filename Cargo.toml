@@ -27,7 +27,7 @@ hyper-util = { version = "0.1.20", features = ["server", "server-auto", "tokio"]
 uuid = { version = "1.26.1", features = ["v4"] }
 async-stream = "0.3.6"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 md-5 = "0.10.6"
 sha1 = "0.10.7"
 sha2 = "0.10.9"

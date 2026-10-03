@@ -395,6 +395,7 @@ impl Repository {
                 tracing::warn!(
                     candidates = candidates.len(),
                     cap = Self::BLOB_MAX_CANDIDATES,
+                    error.type = "reconciliation_cap",
                     "skipped blob reconciliation: too many candidate blobs to check within the cap"
                 );
                 return Ok(None);

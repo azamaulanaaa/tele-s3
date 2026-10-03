@@ -140,7 +140,7 @@ impl<B: Backend> TeleS3<B> {
             match result {
                 Ok(()) => deleted.push(id.clone()),
                 Err(err) => {
-                    tracing::warn!(blob_id = %id, error = ?err, "backend delete failed");
+                    tracing::warn!(blob_id = %id, error.type = "backend_delete", error.message = ?err, "backend delete failed");
                     failed.push(id.clone());
                 }
             }
@@ -151,6 +151,7 @@ impl<B: Backend> TeleS3<B> {
         if !failed.is_empty() {
             tracing::warn!(
                 retained = failed.len(),
+                error.type = "retained_blob_rows",
                 "blob rows kept after a failed backend delete; the start-up reconciler will drop them"
             );
         }
@@ -172,7 +173,8 @@ impl<B: Backend> TeleS3<B> {
             if let Err(err) = result {
                 tracing::warn!(
                     blob_id = %id,
-                    error = ?err,
+                    error.type = "backend_delete",
+                    error.message = ?err,
                     "failed to delete a backend blob that was never registered"
                 );
             }
@@ -261,6 +263,7 @@ impl<B: Backend> TeleS3<B> {
                 IntentDisposition::KeepPending => match &outcome {
                     Ok(ReclaimOutcome::ReclaimFailed) => tracing::warn!(
                         publish_id = %intent.publish_id,
+                        error.type = "reclaim_publish",
                         "an unconfirmed publish could not be deleted; its intent stays pending"
                     ),
                     // `Err` here is "this pass could not find out", not "there
@@ -268,7 +271,8 @@ impl<B: Backend> TeleS3<B> {
                     // because the row survives either way.
                     Err(err) => tracing::warn!(
                         publish_id = %intent.publish_id,
-                        error = ?err,
+                        error.type = "reclaim_publish",
+                        error.message = ?err,
                         "could not reclaim an unconfirmed publish; its intent stays pending"
                     ),
                     // Not `unreachable!`: this runs at start-up, where a panic
@@ -278,6 +282,7 @@ impl<B: Backend> TeleS3<B> {
                     Ok(other) => tracing::warn!(
                         publish_id = %intent.publish_id,
                         outcome = ?other,
+                        error.type = "unrecognised_reclaim_outcome",
                         "unrecognised reclaim outcome; its intent stays pending"
                     ),
                 },

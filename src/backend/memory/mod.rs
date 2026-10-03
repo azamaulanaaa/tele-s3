@@ -131,6 +131,7 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
                 let chunk = storage[idx].take().ok_or_else(|| {
                     tracing::error!(
                         chunk_index = idx,
+                        error.type = "chunk_slot_taken",
                         "backend write fault: a free chunk slot was no longer free"
                     );
                     BackendError::InvariantViolation {
@@ -179,6 +180,12 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
             }
         }
 
+        tracing::debug!(
+            publish_id = %publish_id,
+            bytes = size,
+            "memory backend storing object"
+        );
+
         let key = {
             let mut table = self.table.write().await;
 
@@ -213,11 +220,17 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         if !is_publish_id(&key) {
             // Logged here, where the offending key is still in hand: the
             // fault's `detail` never reaches the client.
-            tracing::error!(key = %key, "backend read fault: key is not a key this backend minted");
+            tracing::error!(
+                key = %key,
+                error.type = "key_not_minted",
+                "backend read fault: key is not a key this backend minted"
+            );
             return Ok(ReadOutcome::Fault(BackendError::InvariantViolation {
                 detail: "key is not a key this backend minted",
             }));
         }
+
+        tracing::debug!(key = %key, offset, limit = ?limit, "memory backend read");
 
         let object = match table.get(&key) {
             Some(v) => v.clone(),
@@ -280,6 +293,67 @@ mod tests {
 
     use anyhow::anyhow;
     use futures::io::Cursor;
+
+    use crate::backend::grammers::capture_log;
+
+    /// A stored object is announced at `debug` with its size, so a run's
+    /// total written bytes can be summed without parsing prose.
+    #[test]
+    fn a_write_is_announced_with_its_publish_id_and_size() {
+        let log = capture_log(|| {
+            futures::executor::block_on(async {
+                let backend = Memory::<2, 8>::default();
+                let body = Box::pin(Cursor::new(vec![1u8, 2, 3]));
+                backend
+                    .write(publish_id(), 3, body)
+                    .await
+                    .expect("a 3-byte body fits");
+            })
+        });
+
+        assert!(log.contains("publish_id="), "{log}");
+        assert!(log.contains("bytes=3"), "{log}");
+        assert!(log.contains("DEBUG"), "{log}");
+    }
+
+    /// A read is announced at `debug` with the range it was asked for, which
+    /// is what makes a stream that stalls mid-object diagnosable.
+    #[test]
+    fn a_read_is_announced_with_its_range() {
+        let log = capture_log(|| {
+            futures::executor::block_on(async {
+                let backend = Memory::<2, 8>::default();
+                let key = backend
+                    .write(publish_id(), 3, Box::pin(Cursor::new(vec![1u8, 2, 3])))
+                    .await
+                    .expect("a 3-byte body fits");
+                backend
+                    .read(key, 1, None)
+                    .await
+                    .expect("the key is readable");
+            })
+        });
+
+        assert!(log.contains("key="), "{log}");
+        assert!(log.contains("offset=1"), "{log}");
+        assert!(log.contains("DEBUG"), "{log}");
+    }
+
+    /// An unaddressable key is a fault, not an absence, and the offending key
+    /// reaches the operator only as a field.
+    #[test]
+    fn an_unaddressable_key_is_logged_as_its_own_error_type() {
+        let log = capture_log(|| {
+            futures::executor::block_on(async {
+                let backend = Memory::<2, 8>::default();
+                let _ = backend.read("not-a-key".to_owned(), 0, None).await;
+            })
+        });
+
+        assert!(log.contains("key=not-a-key"), "{log}");
+        assert!(log.contains("error.type"), "{log}");
+        assert!(log.contains("key_not_minted"), "{log}");
+    }
 
     /// Assert that a `read` found the object and hand back its reader.
     fn present(outcome: ReadOutcome) -> anyhow::Result<BoxedAsyncReader> {
