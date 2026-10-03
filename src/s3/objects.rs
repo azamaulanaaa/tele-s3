@@ -40,8 +40,8 @@ use crate::backend::{
 /// bytes that were promised are gone, and `Fault` means the backend cannot
 /// serve bytes it holds. Neither is a client error — the object was resolved,
 /// so it exists and a `NoSuchKey` would be a lie. Both answer
-/// [`S3ErrorCode::InternalError`], the fault keeping its own message so the
-/// log says which of the two it was.
+/// [`S3ErrorCode::InternalError`] with that code's own generic text; what
+/// distinguished them reaches the server log, as the fault's error source.
 pub(super) fn read_outcome_to_reader(outcome: ReadOutcome) -> S3Result<BoxedAsyncReader> {
     match outcome {
         ReadOutcome::Present(reader) => Ok(reader),
@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fault_read_outcome_is_an_internal_error_that_names_the_fault() {
+    fn a_fault_read_outcome_is_an_internal_error_that_hides_the_fault() {
         let err =
             match read_outcome_to_reader(ReadOutcome::Fault(BackendError::InvariantViolation {
                 detail: "key is not a message id this backend minted",
@@ -1313,11 +1313,19 @@ mod tests {
             };
 
         assert_eq!(*err.code(), S3ErrorCode::InternalError);
-        // The message is the difference this scope bought: an operator can
-        // tell a corrupt key from a deleted object.
-        assert_eq!(
-            err.message(),
-            Some("Backend invariant violated: key is not a message id this backend minted")
+        // The detail is what tells an operator reading the *log* whether the
+        // object was deleted or the storage is corrupt, so it must survive as
+        // the error's source — and must not be the body the client reads.
+        let detail = err
+            .source()
+            .expect("the backend fault is kept as the error source")
+            .to_string();
+        assert!(detail.contains("key is not a message id this backend minted"));
+
+        let message = err.message().unwrap_or_default();
+        assert!(
+            !message.contains("message id") && !message.contains("invariant"),
+            "the internal detail must not reach the client: {message}"
         );
     }
 

@@ -114,13 +114,17 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
                 // this very lock, so a slot that was free a moment ago
                 // cannot be occupied now. Reaching `None` means the
                 // backend's own bookkeeping is corrupt, which is neither
-                // recoverable by the caller nor retryable.
-                let chunk =
-                    storage[idx]
-                        .take()
-                        .ok_or_else(|| BackendError::InvariantViolation {
-                            detail: "a free chunk slot was no longer free",
-                        })?;
+                // recoverable by the caller nor retryable. The `detail`
+                // stays out of the client's response, so it is logged here.
+                let chunk = storage[idx].take().ok_or_else(|| {
+                    tracing::error!(
+                        chunk_index = idx,
+                        "backend write fault: a free chunk slot was no longer free"
+                    );
+                    BackendError::InvariantViolation {
+                        detail: "a free chunk slot was no longer free",
+                    }
+                })?;
                 object.chunks.push(chunk);
             }
 
@@ -194,6 +198,9 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         let key = match key.parse::<u128>() {
             Ok(v) => v,
             Err(_) => {
+                // Logged here, where the offending key is still in hand: the
+                // fault's `detail` never reaches the client.
+                tracing::error!(key = %key, "backend read fault: key is not a key this backend minted");
                 return Ok(ReadOutcome::Fault(BackendError::InvariantViolation {
                     detail: "key is not a key this backend minted",
                 }));

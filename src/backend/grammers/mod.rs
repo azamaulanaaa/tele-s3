@@ -233,6 +233,22 @@ impl From<KeyFault> for ReadOutcome {
     }
 }
 
+/// The flood guard's mutex is poisoned, so its bookkeeping is of unknown
+/// consistency for the life of the process.
+///
+/// The `detail`/`lock` a permanent fault carries is deliberately kept out of
+/// the response the client sees, which leaves the log as the only place it
+/// is ever written down — so it is written here, where the lock is named.
+fn poisoned_flood_guard() -> BackendError {
+    tracing::error!(
+        lock = "flood_guard",
+        "flood guard mutex poisoned; rate-limit waits are no longer tracked"
+    );
+    BackendError::PoisonedLock {
+        lock: "flood_guard",
+    }
+}
+
 /// Resolve a key to the message id to fetch.
 ///
 /// `Err` carries the [`ReadOutcome`] to report. A key this backend cannot
@@ -343,9 +359,7 @@ impl Grammers {
             let guard = self
                 .flood_guard
                 .lock()
-                .map_err(|_| BackendError::PoisonedLock {
-                    lock: "flood_guard",
-                })?;
+                .map_err(|_| poisoned_flood_guard())?;
 
             if let Some(until) = *guard {
                 let now = Instant::now();
@@ -362,9 +376,7 @@ impl Grammers {
             let mut guard = self
                 .flood_guard
                 .lock()
-                .map_err(|_| BackendError::PoisonedLock {
-                    lock: "flood_guard",
-                })?;
+                .map_err(|_| poisoned_flood_guard())?;
             *guard = None;
         }
 
@@ -379,12 +391,10 @@ impl Grammers {
         match classify_rpc_error(rpc_err.code, &rpc_err.name, rpc_err.value) {
             RpcFailure::FloodWait(duration) => {
                 {
-                    let mut guard =
-                        self.flood_guard
-                            .lock()
-                            .map_err(|_| BackendError::PoisonedLock {
-                                lock: "flood_guard",
-                            })?;
+                    let mut guard = self
+                        .flood_guard
+                        .lock()
+                        .map_err(|_| poisoned_flood_guard())?;
                     *guard = Some(Instant::now() + duration);
                 }
 
@@ -629,10 +639,18 @@ impl Backend for Grammers {
     ) -> Result<ReadOutcome, BackendError> {
         // A key this backend cannot address is a fault, not an absence:
         // saying it is missing would tell the operator the object was
-        // deleted when it was never one of ours.
+        // deleted when it was never one of ours. The fault's `detail` never
+        // reaches the client, so it is logged here, where the blob id is
+        // still in hand.
         let message_id = match resolve_key(&key) {
             Ok(message_id) => message_id,
-            Err(fault) => return Ok(fault),
+            Err(fault) => {
+                tracing::error!(
+                    key = %key,
+                    "backend read fault: key is not a message id this backend minted"
+                );
+                return Ok(fault);
+            }
         };
         let offset: usize = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
         let limit: Option<usize> = limit
@@ -664,7 +682,13 @@ impl Backend for Grammers {
             // is unreadable, not absent.
             match message.media() {
                 Some(v) => v,
-                None => return Ok(KeyFault::NoMedia.into()),
+                None => {
+                    tracing::error!(
+                        key = %key,
+                        "backend read fault: the message a key names exists but carries no media"
+                    );
+                    return Ok(KeyFault::NoMedia.into());
+                }
             }
         };
 

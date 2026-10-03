@@ -184,26 +184,32 @@ impl<B: Backend> TeleS3<B> {
 
 impl From<BackendError> for S3Error {
     fn from(err: BackendError) -> Self {
-        // Matched by reference so the `Display` render of a variant can be
-        // reused verbatim as the client-facing message instead of being
-        // re-formatted here: one condition must have exactly one message.
+        // Split by what the client can *act on*, because the message goes
+        // into the response body verbatim: anything a caller can provoke is
+        // disclosed, however useful it reads in a log. Matched by reference
+        // so the `Display` render of the one variant whose message is
+        // client-facing is reused verbatim instead of being re-formatted
+        // here — one condition must have exactly one message.
         match &err {
             // Rate limiting is transient; surfacing SlowDown (503) lets AWS
             // SDK clients retry automatically instead of treating it as a
             // hard failure.
             BackendError::SlowDown => S3Error::new(s3s::S3ErrorCode::SlowDown),
+            // The only message worth sending: two numbers the client can
+            // shrink its next request to fit.
             BackendError::ExceedLimitSize { .. } => {
                 S3Error::with_message(s3s::S3ErrorCode::EntityTooLarge, err.to_string())
             }
             BackendError::OutOfRange => S3Error::new(s3s::S3ErrorCode::InvalidRange),
-            // Permanent backend faults: no S3 code means "retrying cannot
-            // help", so these stay 500 — but the message now names the
-            // actual fault instead of the useless catch-all render.
-            BackendError::PoisonedLock { .. } | BackendError::InvariantViolation { .. } => {
-                S3Error::with_message(s3s::S3ErrorCode::InternalError, err.to_string())
-            }
-            // `BackendError` is `#[non_exhaustive]`: this arm must stay a
-            // catch-all so a future variant is not a breaking change here.
+            // A poisoned lock and a violated invariant describe this
+            // process, not the request: the names are an inventory of the
+            // backend's internals for anyone who can provoke a fault. They
+            // still map to `InternalError` — retrying cannot help — but only
+            // as the error's `source`, which the handler's
+            // `#[instrument(err)]` renders into the log. `Backend` is a
+            // public extension surface, so this stays a catch-all and a
+            // future or third-party variant lands here too: an
+            // unrecognised fault is opaque to the client by default.
             _ => S3Error::internal_error(err),
         }
     }
@@ -524,12 +530,20 @@ mod tests {
         .into();
         assert_eq!(*err.code(), s3s::S3ErrorCode::EntityTooLarge);
         // The mapping reuses the `Display` render rather than re-formatting,
-        // so the client sees exactly what the backend reported.
+        // so the client sees exactly what the backend reported. Redaction
+        // must not swallow this one: the numbers are what the client can act
+        // on, so they are the whole point of the error.
         assert_eq!(err.message(), Some(message.as_str()));
+        assert_eq!(err.message(), Some("Size 20 exceeds limit 10"));
     }
 
     #[test]
-    fn permanent_backend_faults_are_named_internal_errors() {
+    fn permanent_backend_faults_are_internal_errors_that_name_nothing() {
+        // The detail of a permanent fault is an inventory of this backend's
+        // internals: anything that can reach the endpoint can provoke one and
+        // read the names back. The message the client receives is the S3
+        // code's own fixed text; the detail survives only as the error's
+        // source, which the handler's `#[instrument(err)]` logs.
         let poisoned: S3Error = BackendError::PoisonedLock {
             lock: "flood_guard",
         }
@@ -537,7 +551,14 @@ mod tests {
         assert_eq!(*poisoned.code(), s3s::S3ErrorCode::InternalError);
         assert_eq!(
             poisoned.message(),
-            Some("Internal lock `flood_guard` is poisoned")
+            s3s::S3ErrorCode::InternalError.default_message()
+        );
+        assert!(
+            !poisoned
+                .message()
+                .unwrap_or_default()
+                .contains("flood_guard"),
+            "the poisoned lock's name must not reach the client"
         );
 
         let invariant: S3Error = BackendError::InvariantViolation {
@@ -547,7 +568,59 @@ mod tests {
         assert_eq!(*invariant.code(), s3s::S3ErrorCode::InternalError);
         assert_eq!(
             invariant.message(),
-            Some("Backend invariant violated: a free chunk slot was no longer free")
+            poisoned.message(),
+            "every internal-only fault answers with the same uninformative text"
+        );
+        assert!(
+            !invariant
+                .message()
+                .unwrap_or_default()
+                .contains("free chunk slot"),
+            "the violated invariant must not reach the client"
+        );
+    }
+
+    #[test]
+    fn a_permanent_fault_keeps_its_detail_in_the_error_source() {
+        // Redaction is only safe because the detail is not lost: this is
+        // what an operator reads to tell a corrupt key from a dead lock.
+        let poisoned: S3Error = BackendError::PoisonedLock {
+            lock: "flood_guard",
+        }
+        .into();
+        let detail = poisoned
+            .source()
+            .expect("the backend fault is kept as the error source")
+            .to_string();
+        assert!(detail.contains("flood_guard"), "logged detail: {detail}");
+
+        let invariant: S3Error = BackendError::InvariantViolation {
+            detail: "a free chunk slot was no longer free",
+        }
+        .into();
+        let detail = invariant
+            .source()
+            .expect("the backend fault is kept as the error source")
+            .to_string();
+        assert!(
+            detail.contains("free chunk slot"),
+            "logged detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn the_other_catch_all_is_generic_too() {
+        // `Backend` is a public extension surface: a third-party backend's
+        // `Other`, and any variant added later, must not become a message.
+        let err: S3Error =
+            BackendError::Other(std::io::Error::other("telegram said no").into()).into();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InternalError);
+        assert!(
+            !err.message()
+                .unwrap_or_default()
+                .contains("telegram said no"),
+            "an unrecognized backend failure must not reach the client: {:?}",
+            err.message()
         );
     }
 
