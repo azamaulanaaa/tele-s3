@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use grammers_client::{
     Client,
     media::{Media, Uploaded},
-    message::InputMessage,
+    message::{InputMessage, Message},
     tl::{functions::upload::SaveBigFilePart, types::InputFileBig},
 };
 use grammers_mtsender::{InvocationError, SenderPool, SenderPoolFatHandle};
@@ -273,6 +273,152 @@ enum AttemptError {
     /// is not always safe — a timed-out `send_message` would duplicate the
     /// message.
     Timeout(Duration),
+}
+
+/// Whether the publish step of [`Grammers::write`] left a message behind.
+///
+/// The upload is already complete when the message is published, so the only
+/// question this answers is whether the chat may now be holding a message
+/// that nothing else in the system knows about.
+#[derive(Debug, PartialEq, Eq)]
+enum PublishOutcome {
+    /// Nothing was published: the request never reached Telegram, or
+    /// Telegram answered it with an error. The bytes are unreferenced part
+    /// state that the server reclaims on its own.
+    NothingPublished,
+    /// A message may exist in the peer chat holding the uploaded bytes,
+    /// with no key and therefore no metadata row naming it.
+    PossiblyPublished,
+}
+
+/// How the publish step of [`Grammers::write`] failed, without any client type
+/// in it.
+///
+/// Deliberately separate from [`AttemptError`]: the classification below must
+/// be exercisable with no session, no connection and no Telegram server, and
+/// only the conversion needs to know what an [`InvocationError`] is.
+#[derive(Debug, PartialEq, Eq)]
+enum PublishFailure {
+    /// Telegram returned an error for this request.
+    Rejected { rpc_error: String },
+    /// The request outlived the per-request deadline after it was dispatched.
+    TimedOut { after: Duration },
+    /// The request failed below the RPC layer once it was on the wire, so the
+    /// server may already have created the message. `kind` names the layer
+    /// for the log.
+    ResponseLost { kind: &'static str },
+}
+
+/// Which publish failures may have created a message.
+///
+/// The rule is deliberately one-sided: only a rejection Telegram reported for
+/// *this* request is treated as proof that nothing was published. A deadline
+/// and every failure below the RPC layer leave the outcome unknown, so they
+/// are classified [`PublishOutcome::PossiblyPublished`] and the operator is
+/// handed the identifiers to look for.
+///
+/// What is coarse about it:
+///
+/// * `InvocationError::Session` usually means the request was never
+///   dispatched — the session was consulted before the peer was known — so
+///   classifying it as possibly published is the conservative over-approximation
+///   rather than a claim that a message exists.
+/// * The reverse coarseness sits on the other arm: Telegram's own error
+///   contract does not forbid a server-side error *after* the side effect,
+///   so [`PublishOutcome::NothingPublished`] really means "Telegram
+///   reported no error for this request", not "no message exists".
+///
+/// Either way no retry can repair it: MTProto offers no idempotency key for
+/// message creation, so re-sending an ambiguous `send_message` risks
+/// publishing the object twice. See [`Grammers::write`].
+fn classify_publish_failure(failure: &PublishFailure) -> PublishOutcome {
+    match failure {
+        PublishFailure::Rejected { .. } => PublishOutcome::NothingPublished,
+        PublishFailure::TimedOut { .. } | PublishFailure::ResponseLost { .. } => {
+            PublishOutcome::PossiblyPublished
+        }
+    }
+}
+
+impl PublishFailure {
+    /// Name the layer that lost the response, without guessing where it was
+    /// lost.
+    fn from_attempt(err: &AttemptError) -> Self {
+        match err {
+            AttemptError::Timeout(after) => PublishFailure::TimedOut { after: *after },
+            AttemptError::Rpc(err) => match err.as_ref() {
+                InvocationError::Rpc(rpc) => PublishFailure::Rejected {
+                    rpc_error: match rpc.value {
+                        Some(value) => format!("{} ({value})", rpc.name),
+                        None => rpc.name.clone(),
+                    },
+                },
+                InvocationError::Io(_) => PublishFailure::ResponseLost { kind: "io" },
+                InvocationError::Deserialize(_) => PublishFailure::ResponseLost {
+                    kind: "deserialize",
+                },
+                InvocationError::Transport(_) => PublishFailure::ResponseLost { kind: "transport" },
+                // `Session`, `Dropped`, `InvalidDc`, `Authentication` and any
+                // variant a later grammers adds: none of them is a statement
+                // from the server that it refused the create, so none is
+                // allowed to claim the upload published nothing.
+                _ => PublishFailure::ResponseLost {
+                    kind: "uncategorised",
+                },
+            },
+        }
+    }
+
+    /// The error the caller sees. No key is returned on any of these paths.
+    fn into_backend_error(self) -> BackendError {
+        match self {
+            PublishFailure::Rejected { rpc_error } => BackendError::Other(rpc_error.into()),
+            PublishFailure::TimedOut { after } => BackendError::Other(
+                format!("Telegram publish request exceeded the {after:?} deadline").into(),
+            ),
+            PublishFailure::ResponseLost { kind } => {
+                BackendError::Other(format!("Telegram publish response lost ({kind})").into())
+            }
+        }
+    }
+}
+
+/// Why [`Grammers::write`] published no message and can name no key.
+enum PublishFault {
+    /// The request was never dispatched — a local fault, here the flood
+    /// guard's mutex. Nothing reached Telegram, so nothing was published.
+    NotDispatched(BackendError),
+    /// The request was dispatched and failed. Whether a message exists
+    /// depends on the failure; see [`classify_publish_failure`].
+    Dispatched(PublishFailure),
+}
+
+/// Turn a publish fault into the caller's error, logging the only record of
+/// a possible orphan.
+///
+/// `file_id` and `name` are the upload's coordinates: on the ambiguous
+/// outcomes a message holding those bytes may be sitting in the peer chat
+/// with no key pointing at it, so no metadata row exists and
+/// `reconcile_orphan_blobs` — which drops rows, not backend objects — can
+/// never see it. They are written here and nowhere else, which makes this log
+/// line the operator's only way to find and delete that message by hand.
+fn unpublished_upload(fault: PublishFault, file_id: i64, name: &str) -> BackendError {
+    match fault {
+        PublishFault::NotDispatched(err) => err,
+        PublishFault::Dispatched(failure) => {
+            if classify_publish_failure(&failure) == PublishOutcome::PossiblyPublished {
+                tracing::error!(
+                    file_id,
+                    name,
+                    outcome = "possibly-published",
+                    "upload may exist as a Telegram message but no key was returned; \
+                     it is unreachable by key and must be deleted from the chat by hand"
+                );
+            }
+
+            failure.into_backend_error()
+        }
+    }
 }
 
 /// Why a [`Grammers`] key could not be turned into a message to fetch.
@@ -672,10 +818,105 @@ impl Grammers {
             }
         }
     }
+
+    /// Publish the uploaded parts as a message in the peer chat.
+    ///
+    /// The flood-wait loop is [`Grammers::retry_rpc`]'s: a rate limit is
+    /// slept off and the create is repeated, which is safe because nothing
+    /// has been created yet. Everything else stops the loop, and the failure
+    /// is reported as a [`PublishFault`] rather than flattened into a
+    /// [`BackendError`], because on the ambiguous outcomes the caller must
+    /// learn that a message may exist behind the error.
+    ///
+    /// Split out of [`Grammers::write`] so the classification in
+    /// [`classify_publish_failure`] is testable with no client in it.
+    async fn publish_message(&self, draft: InputMessage) -> Result<Message, PublishFault> {
+        let mut attempt: u32 = 0;
+
+        loop {
+            // Local fault: nothing has been dispatched, so nothing can have
+            // been published.
+            self.check_flood_wait()
+                .await
+                .map_err(PublishFault::NotDispatched)?;
+
+            attempt += 1;
+
+            let err = match self
+                .attempt(self.client.send_message(self.peer, draft.clone()))
+                .await
+            {
+                Ok(message) => return Ok(message),
+                Err(err) => err,
+            };
+
+            let failure = PublishFailure::from_attempt(&err);
+
+            // Only a rate limit is retried. A deadline is not: the message
+            // may already have been created and MTProto has no idempotency key
+            // for message creation, so re-sending would publish a duplicate.
+            let retryable = match &err {
+                AttemptError::Rpc(err) => match self.catch_flood_error(err).await {
+                    Ok(retry) => retry,
+                    // A flood wait with no duration is still a rejection of
+                    // this request, so the failure keeps its own wording.
+                    Err(_) => return Err(PublishFault::Dispatched(failure)),
+                },
+                AttemptError::Timeout(timeout) => {
+                    warn!(?timeout, "Telegram publish exceeded its deadline");
+                    return Err(PublishFault::Dispatched(failure));
+                }
+            };
+
+            if !retryable {
+                return Err(PublishFault::Dispatched(failure));
+            }
+
+            match next_attempt(attempt, self.limits.max_attempts) {
+                Attempt::Retry => {}
+                Attempt::Exhausted { attempts } => {
+                    warn!(attempts, error = ?failure, "Telegram publish retry budget exhausted");
+                    return Err(PublishFault::Dispatched(failure));
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl Backend for Grammers {
+    /// Store `size` bytes as a message in the peer chat and return its id.
+    ///
+    /// # The residual window this cannot close
+    ///
+    /// The upload and the publish are two requests, and only the first is
+    /// idempotent. Once every part is in, `send_message` turns the uploaded
+    /// bytes into a real message — and it is deliberately not retried on a
+    /// deadline, because MTProto offers no idempotency key for message
+    /// creation: a retry after a lost answer risks publishing the object
+    /// twice.
+    ///
+    /// So if the create **succeeds server-side but its answer is lost**, or
+    /// the attempt budget is spent after Telegram has already created the
+    /// message, `write` fails and returns no key. The chat then holds a
+    /// message that nothing in the system points at: no key means no metadata
+    /// row, and `reconcile_orphan_blobs` removes metadata *rows*, not backend
+    /// objects, so it has nothing to see and nothing to miss. That leak is
+    /// **not closed** and cannot be closed by retrying.
+    ///
+    /// What this function does instead is make it findable.
+    /// [`classify_publish_failure`] separates the outcomes where the answer
+    /// proves nothing was published from the ones where a message may exist,
+    /// and on the ambiguous side [`unpublished_upload`] logs the upload's
+    /// `file_id` and `name` — after this failure those identifiers exist
+    /// nowhere else, so the log is the operator's only way to locate the
+    /// orphan and delete it from the chat by hand.
+    ///
+    /// A follow-up scope owns the real repair: grammers 0.10 does expose
+    /// `search_message`/`search_all_message`, which could find a message that
+    /// was created without a key and mint one for it. That needs a durable
+    /// record of the intended publish plus a backend-aware reconciler, and is
+    /// deliberately out of scope here.
     #[instrument(skip(self, reader), level = "debug", ret, err)]
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError> {
         let max_size = MAX_PARTS as u64 * PART_SIZE as u64;
@@ -731,7 +972,7 @@ impl Backend for Grammers {
             InputFileBig {
                 id: file_id,
                 parts: total_parts,
-                name,
+                name: name.clone(),
             }
             .into(),
         );
@@ -741,14 +982,13 @@ impl Backend for Grammers {
         // The parts are already uploaded, so this is a single metadata RPC
         // against the peer. It is deliberately *not* retried on a deadline:
         // the message may still have been created, and sending it again
-        // would publish a duplicate.
+        // would publish a duplicate. A failure here reports no key, so the
+        // outcome is classified and, where a message may exist, logged with
+        // the identifiers that name the upload — see the doc comment above.
         let message = self
-            .retry_rpc(|| async {
-                self.client
-                    .send_message(self.peer, draft_message.clone())
-                    .await
-            })
-            .await?;
+            .publish_message(draft_message)
+            .await
+            .map_err(|fault| unpublished_upload(fault, file_id, &name))?;
         let message_id = message.id().to_string();
 
         Ok(message_id)
@@ -1057,6 +1297,202 @@ mod tests {
         assert!(matches!(fault, ReadOutcome::Fault(_)));
         assert!(matches!(missing, ReadOutcome::Missing));
     }
+
+    #[test]
+    fn a_rejected_publish_published_nothing() {
+        // Telegram answered this exact request with an error, so no message
+        // was created and there is no orphan to look for.
+        let failure = PublishFailure::Rejected {
+            rpc_error: "CHAT_WRITE_FORBIDDEN".to_owned(),
+        };
+
+        assert_eq!(
+            classify_publish_failure(&failure),
+            PublishOutcome::NothingPublished
+        );
+        // A rate limit that never cleared is the same arm: the create was
+        // refused on every attempt, so nothing exists in the chat.
+        let exhausted = PublishFailure::Rejected {
+            rpc_error: "FLOOD_WAIT".to_owned(),
+        };
+
+        assert_eq!(
+            classify_publish_failure(&exhausted),
+            PublishOutcome::NothingPublished
+        );
+    }
+
+    #[test]
+    fn a_publish_that_ran_out_of_time_is_ambiguous() {
+        // The request was dispatched; its answer may have been lost, and the
+        // message may already be in the chat.
+        let failure = PublishFailure::TimedOut {
+            after: Duration::from_secs(120),
+        };
+
+        assert_eq!(
+            classify_publish_failure(&failure),
+            PublishOutcome::PossiblyPublished
+        );
+    }
+
+    #[test]
+    fn a_publish_lost_below_the_rpc_layer_is_ambiguous() {
+        // Every layer that fails after dispatch leaves the same question
+        // open, whatever it is called.
+        for kind in ["io", "deserialize", "transport", "uncategorised"] {
+            assert_eq!(
+                classify_publish_failure(&PublishFailure::ResponseLost { kind }),
+                PublishOutcome::PossiblyPublished,
+                "{kind} must not claim the upload published nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_rejection_is_a_proof_that_nothing_was_published() {
+        let failures = [
+            PublishFailure::Rejected {
+                rpc_error: "CHAT_WRITE_FORBIDDEN".to_owned(),
+            },
+            PublishFailure::TimedOut {
+                after: Duration::from_secs(1),
+            },
+            PublishFailure::ResponseLost { kind: "io" },
+        ];
+
+        let outcomes: Vec<_> = failures.iter().map(classify_publish_failure).collect();
+
+        assert_eq!(
+            outcomes,
+            vec![
+                PublishOutcome::NothingPublished,
+                PublishOutcome::PossiblyPublished,
+                PublishOutcome::PossiblyPublished,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_publish_is_logged_with_the_identifiers_of_the_upload() {
+        // The only record of an orphan: no key is returned on this path, so
+        // there is no metadata row and nothing else in the system names the
+        // message.
+        let log = capture_log(|| {
+            let err = unpublished_upload(
+                PublishFault::Dispatched(PublishFailure::TimedOut {
+                    after: Duration::from_secs(120),
+                }),
+                1_700_000_000_000,
+                "0d1e2f3a-4b5c-4d6e-8f90-a1b2c3d4e5f6",
+            );
+
+            assert!(matches!(err, BackendError::Other(_)), "{err:?}");
+        });
+
+        assert!(
+            log.contains("1700000000000"),
+            "the log must carry the file_id: {log}"
+        );
+        assert!(
+            log.contains("0d1e2f3a-4b5c-4d6e-8f90-a1b2c3d4e5f6"),
+            "the log must carry the message name: {log}"
+        );
+        assert!(
+            log.contains("possibly-published"),
+            "the log must say the outcome may have published: {log}"
+        );
+    }
+
+    #[test]
+    fn a_definite_publish_failure_logs_no_orphan_warning() {
+        let log = capture_log(|| {
+            unpublished_upload(
+                PublishFault::Dispatched(PublishFailure::Rejected {
+                    rpc_error: "CHAT_WRITE_FORBIDDEN".to_owned(),
+                }),
+                1_700_000_000_000,
+                "0d1e2f3a-4b5c-4d6e-8f90-a1b2c3d4e5f6",
+            );
+        });
+
+        assert!(
+            !log.contains("1700000000000"),
+            "nothing was published, so there is nothing to search for: {log}"
+        );
+    }
+
+    #[test]
+    fn a_publish_that_never_left_the_process_keeps_its_own_error() {
+        // A local fault is passed through untouched, and claims nothing was
+        // published.
+        let err = unpublished_upload(
+            PublishFault::NotDispatched(BackendError::PoisonedLock {
+                lock: "flood_guard",
+            }),
+            1_700_000_000_000,
+            "0d1e2f3a-4b5c-4d6e-8f90-a1b2c3d4e5f6",
+        );
+
+        assert!(
+            matches!(err, BackendError::PoisonedLock { lock } if lock == "flood_guard"),
+            "{err:?}"
+        );
+    }
+}
+
+/// Collect everything `f` writes through `tracing` into a string.
+///
+/// A subscriber is installed for the closure only, so this needs no global
+/// state and no dependency beyond the `tracing-subscriber` the binary already
+/// uses.
+#[cfg(test)]
+fn capture_log(f: impl FnOnce()) -> String {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// A `MakeWriter` that appends into the buffer it shares.
+    #[derive(Clone)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log buffer lock is never held")
+                .extend_from_slice(buf);
+
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buffer = Buffer(Arc::default());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(buffer.clone())
+        .finish();
+    let sink = Arc::clone(&buffer.0);
+
+    tracing::subscriber::with_default(subscriber, f);
+
+    let bytes = sink
+        .lock()
+        .expect("the log buffer lock is never held")
+        .clone();
+
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// The `write` size contract, exercised through a fake part sink.
