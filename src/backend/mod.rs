@@ -42,6 +42,32 @@ pub fn is_publish_id(id: &str) -> bool {
         .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// What reclaiming an unconfirmed publish actually found.
+///
+/// Named for the outcome rather than the mechanism: a backend may answer it
+/// by searching an index, by scanning history, or — like [`Memory`] — by
+/// knowing it keeps nothing outside itself. What the caller may rely on is
+/// only what each arm says.
+///
+/// The enum is exhaustive on purpose, for the same reason [`ReadOutcome`] is:
+/// the row an intent leaves behind depends on the arm, so a caller must
+/// handle every case deliberately rather than through a catch-all that would
+/// quietly pick the wrong final state for a future variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// Nothing was ever published under this identifier, so there is nothing
+    /// to reclaim and the intent may simply be forgotten.
+    NothingPublished,
+    /// Something was published under it and has now been deleted. Nothing
+    /// of that publish remains in the backend.
+    Reclaimed,
+    /// Something was published under it and could **not** be deleted. The
+    /// publish is still there, so the intent must stay pending: this is the
+    /// one arm a caller may not treat as resolved, because a later pass is
+    /// the only thing that can retry the deletion.
+    ReclaimFailed,
+}
+
 /// The reader [`Backend`] speaks in: a pinned, task-safe `AsyncRead`.
 ///
 /// An alias rather than a newtype so the crate's own adapters can be handed
@@ -256,4 +282,37 @@ pub trait Backend: Send + Sync + 'static {
     /// a rate limit, a refusal. It must never be returned merely because the
     /// key was already absent.
     async fn delete(&self, key: String) -> Result<(), BackendError>;
+
+    /// Find out what was published under `publish_id` and reclaim it if
+    /// anything was.
+    ///
+    /// `publish_id` is the identifier [`Backend::write`] was given, and it is
+    /// the only coordinate a publish whose answer was lost can still be found
+    /// by — the caller never received a key, so nothing above the backend
+    /// knows one. An implementation must therefore match on the *published
+    /// name* it was asked to publish under (for `Grammers`, the message's
+    /// file name), never on anything it derived itself.
+    ///
+    /// The answer is [`ReclaimOutcome`], and the caller turns each arm into a
+    /// different final state for the recorded intent, so which arm an
+    /// implementation returns is fixed:
+    ///
+    /// - [`ReclaimOutcome::NothingPublished`] — nothing is there under this
+    ///   name. The intent is safe to drop.
+    /// - [`ReclaimOutcome::Reclaimed`] — something was there and is now
+    ///   gone, with the same guarantee [`Backend::delete`] gives.
+    /// - [`ReclaimOutcome::ReclaimFailed`] — something was there and the
+    ///   deletion did not happen.
+    ///
+    /// `Err` is reserved for "this call failed" and must never be used for
+    /// the third case: an `Err` says the backend could not find out, while
+    /// [`ReclaimOutcome::ReclaimFailed`] says it found something and could
+    /// not remove it. Both leave the caller's intent pending for a later pass,
+    /// but they are different facts and the logs should not conflate them.
+    ///
+    /// A lookup is expected to be **bounded**: an implementation that can only
+    /// reach recent history must say so in its own documentation, because a
+    /// name older than that window is indistinguishable from a name that was
+    /// never published.
+    async fn reclaim_publish(&self, publish_id: String) -> Result<ReclaimOutcome, BackendError>;
 }

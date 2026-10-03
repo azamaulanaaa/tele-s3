@@ -26,7 +26,7 @@ use tokio_util::{
 };
 use tracing::{instrument, warn};
 
-use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome};
+use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, ReclaimOutcome};
 
 mod session;
 
@@ -44,6 +44,43 @@ const FLOOD_ERROR_CODE: i32 = 420;
 // every request the instant it started, which looks like a total outage
 // rather than a misconfiguration.
 const MIN_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How far back into the chat history [`Grammers::reclaim_publish`] looks
+/// for a publish by its file name.
+///
+/// # Why iteration, and not search
+///
+/// Telegram's message search (`client.search_messages` / `search_all_messages`
+/// — the `q` of `messages.search`) indexes **message text**, and the publish
+/// identifier is never part of that text: [`Grammers::write`] sends it as the
+/// attachment's *file name* and sends no caption. Whether Telegram also
+/// indexes an attachment's file name into its text search is a server-side
+/// indexing decision that cannot be verified from the client API, so it is not
+/// relied on here.
+///
+/// Walking the history can be verified from the vendored grammers 0.10 source
+/// instead, which is what this implementation does. Two facts from
+/// `/root/.cargo/registry/src/*/grammers-client-0.10.0`:
+///
+/// * `Media::Document::name()` (`src/media/media.rs`) returns the file name
+///   straight off the `filename` document attribute — the very attribute
+///   `src/media/mod.rs` sets from `Uploaded::name()` on upload, i.e. the one
+///   [`Grammers::write`] passed as `publish_name`;
+/// * `Client::iter_messages` (`src/client/messages.rs`) returns newest-first
+///   history with a `.limit(n)`.
+///
+/// # The limitation this buys
+///
+/// The sweep can only see this many most-recent messages. A message older than
+/// the window is indistinguishable from one that was never published, so a
+/// publish that has aged out of the window answers
+/// [`ReclaimOutcome::NothingPublished`] and its bytes stay in the chat until an
+/// operator deletes them by hand. That is a real leak an unbounded sweep would
+/// close and a bounded one cannot: walking the whole history per intent is
+/// unbounded work at start-up, which the reconciler contract forbids. The
+/// window is sized for the gap between a write losing its answer and the next
+/// start-up.
+const PUBLISH_LOOKBACK_MESSAGES: usize = 500;
 
 /// Telegram operations allowed in flight at once, process-wide.
 ///
@@ -511,6 +548,16 @@ fn publish_name(publish_id: &str) -> &str {
     publish_id
 }
 
+/// Whether an attachment's file name is the publish being looked for.
+///
+/// The name is the *only* coordinate a lost publish can be found by, so the
+/// comparison is exact and whole: no prefix match (a partial match would
+/// happily delete the wrong message), no case folding (Telegram preserves the
+/// name, so the caller must match what it sent), and no trimming.
+fn attachment_is_publish(file_name: Option<&str>, publish_id: &str) -> bool {
+    file_name == Some(publish_id)
+}
+
 impl Grammers {
     /// Upload the parts `plan` describes from `reader`, then prove the reader
     /// really ended.
@@ -784,6 +831,66 @@ impl Grammers {
                     warn!(?timeout, "Download chunk exceeded its deadline");
                     return Err(AttemptError::Timeout(timeout).into_backend_error());
                 }
+            }
+        }
+    }
+
+    /// Id of a recent message in the peer chat whose attachment is named
+    /// exactly `publish_id`.
+    ///
+    /// One bounded walk of [`PUBLISH_LOOKBACK_MESSAGES`] newest messages, each
+    /// step under the same concurrency bound and the same per-request deadline
+    /// as every other outbound request here (`attempt` is what
+    /// [`Grammers::retry_rpc`] uses underneath, and the flood wait is checked
+    /// up front exactly as it does).
+    ///
+    /// The first match wins. A duplicate name would mean two messages holding
+    /// the same bytes under one identifier, which the S3 layer cannot produce:
+    /// `publish_id` is minted from a UUID and the intent row is its primary
+    /// key. So there is nothing a caller could do with a second anyway.
+    ///
+    /// # The window
+    ///
+    /// Only the newest [`PUBLISH_LOOKBACK_MESSAGES`] messages are examined.
+    /// A publish older than that is reported as not found — see
+    /// [`PUBLISH_LOOKBACK_MESSAGES`] for why that is a deliberate limit and
+    /// not an oversight.
+    async fn find_published_message(&self, publish_id: &str) -> Result<Option<i32>, BackendError> {
+        let mut messages = self
+            .client
+            .iter_messages(self.peer)
+            .limit(PUBLISH_LOOKBACK_MESSAGES);
+
+        loop {
+            // Not `retry_rpc`: that takes a `FnMut` closure, and a future
+            // borrowing `messages` cannot escape one. The bound is applied
+            // through `attempt` instead, which is the same request path.
+            self.check_flood_wait().await?;
+
+            let message = match self.attempt(messages.next()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => return Ok(None),
+                Err(AttemptError::Timeout(timeout)) => {
+                    warn!(?timeout, "Telegram history request exceeded its deadline");
+                    return Err(AttemptError::Timeout(timeout).into_backend_error());
+                }
+                // A history request that fails is *not* proof that no message
+                // is there: answering "nothing published" off a failed lookup
+                // would clear an intent for bytes that may well be sitting in
+                // the chat. It fails the call instead.
+                Err(AttemptError::Rpc(err)) => {
+                    return Err(AttemptError::Rpc(err).into_backend_error());
+                }
+            };
+
+            // Only an attachment can carry a published name; a photo, a
+            // sticker or a text message never can.
+            let Some(Media::Document(document)) = message.media() else {
+                continue;
+            };
+
+            if attachment_is_publish(document.name(), publish_id) {
+                return Ok(Some(message.id()));
             }
         }
     }
@@ -1157,6 +1264,49 @@ impl Backend for Grammers {
         })
         .await
     }
+
+    /// Walk the recent history of the peer chat looking for a message whose
+    /// attachment is named exactly `publish_id`, and delete it.
+    ///
+    /// The sweep is one bounded pass: at most
+    /// [`PUBLISH_LOOKBACK_MESSAGES`] messages are examined, so the cost of a
+    /// call is fixed rather than a function of how much traffic the chat has
+    /// seen.
+    ///
+    /// Deletion reuses [`Grammers::delete`], so it carries the same retry loop
+    /// and the same idempotency: a message that turns out to have been
+    /// removed already is a successful reclaim, not a failure.
+    ///
+    /// A history request that fails is an `Err`, *not* a
+    /// [`ReclaimOutcome::ReclaimFailed`]: the first is "this call could not
+    /// find out", the second is "something was found and could not be
+    /// removed". Both leave the caller's intent pending, but only the second
+    /// claims to know a message is still there.
+    async fn reclaim_publish(&self, publish_id: String) -> Result<ReclaimOutcome, BackendError> {
+        let message_id = self.find_published_message(&publish_id).await?;
+
+        let Some(message_id) = message_id else {
+            return Ok(ReclaimOutcome::NothingPublished);
+        };
+
+        match self.delete(message_id.to_string()).await {
+            Ok(()) => Ok(ReclaimOutcome::Reclaimed),
+            Err(err) => {
+                // Logged here rather than answered as `Err`: the caller keeps
+                // the intent pending either way, but only this arm says the
+                // message is still sitting in the chat, and that is the fact
+                // an operator needs.
+                tracing::warn!(
+                    message_id,
+                    publish_id = %publish_id,
+                    error = ?err,
+                    "found an unconfirmed publish but could not delete it; \
+                     the intent stays pending for a later pass"
+                );
+                Ok(ReclaimOutcome::ReclaimFailed)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1189,6 +1339,29 @@ mod tests {
             crate::backend::is_publish_id(&id),
             "identifier is not in the published shape: {id}"
         );
+    }
+
+    #[test]
+    fn a_publish_is_matched_only_by_its_exact_file_name() {
+        let id = crate::backend::new_publish_id();
+
+        assert!(
+            attachment_is_publish(Some(&id), &id),
+            "the name the write published under is the name to find"
+        );
+        assert!(
+            !attachment_is_publish(None, &id),
+            "a message with no attachment name cannot be this publish"
+        );
+
+        // Nothing looser than equality: a partial or folded match would let
+        // the sweep delete the wrong message, which is unrecoverable.
+        let other = crate::backend::new_publish_id();
+        assert!(!attachment_is_publish(Some(&other), &id));
+        assert!(!attachment_is_publish(Some(&id[..id.len() - 1]), &id));
+        assert!(!attachment_is_publish(Some(&format!("{id}x")), &id));
+        assert!(!attachment_is_publish(Some(&id.to_uppercase()), &id));
+        assert!(!attachment_is_publish(Some(&format!(" {id}")), &id));
     }
 
     #[test]

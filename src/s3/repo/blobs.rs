@@ -109,6 +109,54 @@ impl Repository {
         Ok(())
     }
 
+    /// Pending publish intents older than `older_than`, oldest first, capped
+    /// at `limit` rows.
+    ///
+    /// The age filter is the whole safety rule of the pass: an intent younger
+    /// than the threshold may belong to a write that is still in flight, and
+    /// acting on it would look for a publish that has not happened yet. It is
+    /// applied here rather than in the caller so the query and the rule cannot
+    /// drift apart.
+    ///
+    /// Bounded by `limit` and ordered by the primary key, so one page is
+    /// enough for a pass and no statement — and therefore no write lock — is
+    /// ever wider than that page.
+    pub async fn pending_publish_intents(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> S3Result<Vec<entity::publish_intent::Model>> {
+        entity::publish_intent::Entity::find()
+            .filter(entity::publish_intent::Column::ResolvedAt.is_null())
+            .filter(entity::publish_intent::Column::CreatedAt.lt(older_than))
+            .order_by_asc(entity::publish_intent::Column::PublishId)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(S3Error::internal_error)
+    }
+
+    /// Drop the recorded intents whose publishes are settled.
+    ///
+    /// Guarded on `resolved_at IS NULL` so a write that resolved between the
+    /// selection and this statement keeps its row: a resolved row is the only
+    /// record of which key a confirmed publish produced, and the reconciler
+    /// has no business removing one.
+    pub async fn clear_publish_intents(&self, publish_ids: &[String]) -> S3Result<()> {
+        if publish_ids.is_empty() {
+            return Ok(());
+        }
+
+        entity::publish_intent::Entity::delete_many()
+            .filter(entity::publish_intent::Column::PublishId.is_in(publish_ids.to_vec()))
+            .filter(entity::publish_intent::Column::ResolvedAt.is_null())
+            .exec(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+        Ok(())
+    }
+
     /// Acquire one additional reference for each listed blob.
     ///
     /// Implemented as a single atomic upsert

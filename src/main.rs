@@ -104,13 +104,24 @@ async fn main() -> anyhow::Result<()> {
     let s3_service = {
         let teles3 = TeleS3::init(grammers.clone(), db.clone()).await?;
 
-        // One bounded, non-fatal reconciliation pass before any traffic:
-        // blob rows left behind by an interrupted publish are invisible to
+        // Two bounded, non-fatal reconciliation passes before any traffic.
+        // They are independent of each other and either may be skipped.
+        //
+        // Blob rows left behind by an interrupted publish are invisible to
         // every listing and nothing else reclaims them.
         match teles3.reconcile_orphan_blobs().await {
             Ok(0) => {}
             Ok(removed) => tracing::info!("Reconciled {removed} orphaned blob(s)"),
             Err(err) => tracing::warn!("Blob reconciliation failed: {:?}", err),
+        }
+
+        // Publishes that were never confirmed hold real bytes in the chat that
+        // no key names, so no blob row points at them and the pass above
+        // cannot see them.
+        match teles3.reconcile_publish_intents().await {
+            Ok(0) => {}
+            Ok(cleared) => tracing::info!("Reconciled {cleared} unconfirmed publish intent(s)"),
+            Err(err) => tracing::warn!("Publish intent reconciliation failed: {:?}", err),
         }
 
         let mut builder = S3ServiceBuilder::new(teles3);

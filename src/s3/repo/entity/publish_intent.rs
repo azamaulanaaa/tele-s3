@@ -34,8 +34,10 @@ use sea_orm::entity::prelude::*;
 /// reconciler that finds nothing has nothing to repair.
 ///
 /// A pending row is therefore the *only* record by which an object that was
-/// published-but-unacknowledged can be found. Nothing else scans this table
-/// at runtime: acting on pending intents is a separate, later scope.
+/// published-but-unacknowledged can be found. The reconciler in
+/// [`crate::s3::TeleS3::reconcile_publish_intents`] scans this table and acts
+/// on it: it asks the backend what was published under `publish_id` and drops
+/// the row only once the publish is settled. Nothing else scans it.
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "s3_publish_intent")]

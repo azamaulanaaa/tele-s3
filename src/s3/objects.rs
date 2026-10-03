@@ -1372,6 +1372,13 @@ mod tests {
         async fn delete(&self, key: String) -> Result<(), BackendError> {
             self.inner.delete(key).await
         }
+
+        async fn reclaim_publish(
+            &self,
+            publish_id: String,
+        ) -> Result<crate::backend::ReclaimOutcome, BackendError> {
+            self.inner.reclaim_publish(publish_id).await
+        }
     }
 
     async fn flaky_write_service() -> TeleS3<FlakyWrite> {

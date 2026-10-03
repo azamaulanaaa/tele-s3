@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
 
-use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, is_publish_id};
+use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, ReclaimOutcome, is_publish_id};
 
 struct ObjectReader<const M: usize> {
     object: Arc<RwLock<Object<M>>>,
@@ -258,6 +258,20 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
         Ok(())
     }
+
+    async fn reclaim_publish(&self, publish_id: String) -> Result<ReclaimOutcome, BackendError> {
+        // Always "nothing published", and that is a fact about this backend
+        // rather than a shortcut past one. Its table lives inside this
+        // process and dies with it, so a write whose answer was lost cannot
+        // leave anything a later pass could find: the pass necessarily runs
+        // in a *later* process, by which time the table is gone. Within one
+        // process the table is also written only on the success path of
+        // `write`, so a pending intent has no entry under this identifier
+        // either.
+        let _ = publish_id;
+
+        Ok(ReclaimOutcome::NothingPublished)
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +504,30 @@ mod tests {
         };
 
         assert_eq!(free_map[..], [false, false, true]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_reports_nothing_published() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        // An identifier this backend was never handed, and one it was handed
+        // and published: both answer the same, because its table dies with the
+        // process and so can never hold anything a later pass could find.
+        let published = backend
+            .write(publish_id(), 3, Box::pin(Cursor::new([1, 2, 3])))
+            .await?;
+        assert!(!published.is_empty());
+
+        for id in [publish_id(), published] {
+            let outcome = backend.reclaim_publish(id.clone()).await?;
+            assert_eq!(
+                outcome,
+                ReclaimOutcome::NothingPublished,
+                "{id} has no external store to reclaim from"
+            );
+        }
 
         Ok(())
     }
