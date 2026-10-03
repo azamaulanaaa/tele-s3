@@ -28,6 +28,22 @@ uuid = { version = "1.26.1", features = ["v4"] }
 async-stream = "0.3.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+# Trace export over OTLP. Pinned to one OpenTelemetry release family (0.33)
+# so `tracing-opentelemetry`, the SDK and the exporter cannot drift apart.
+# `opentelemetry` is the family facade: `opentelemetry_sdk` re-exports none of
+# `KeyValue`/`Key`/`Value`, so the `service.version` resource attribute is not
+# reachable without it.
+# `opentelemetry-otlp` is built with the HTTP/protobuf transport only: the
+# gRPC client would drag in a tonic/prost server stack for no benefit here.
+tracing-opentelemetry = "0.34"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-client",
+    "reqwest-rustls",
+] }
 md-5 = "0.10.6"
 sha1 = "0.10.7"
 sha2 = "0.10.9"

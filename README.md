@@ -178,6 +178,31 @@ Every event this service emits carries its data as named fields rather than pros
 TELE_S3_LOG_FORMAT=json RUST_LOG=tele_s3=debug cargo run -- --config config.toml
 ```
 
+### Trace export (OTLP)
+
+The same `tracing` spans that produce log lines are also exported as OTLP traces, so a collector can show a request as a tree rather than as unrelated lines. Export is **opt-in and off by default**: with no endpoint configured no exporter is built, no background thread is started, and the process runs exactly as it did before — a self-hosted deployment that never configures telemetry pays nothing for it.
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `TELE_S3_OTLP_ENDPOINT` | unset | Full OTLP traces endpoint, e.g. `http://collector:4318/v1/traces`. Setting it turns trace export on. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | The standard OpenTelemetry variable, honoured as a fallback so an operator who already points other services at a collector need not learn this crate's spelling. `TELE_S3_OTLP_ENDPOINT` wins when both are set. |
+| `TELE_S3_OTLP_SAMPLE_RATIO` | `1.0` | Fraction of traces to export, `0.0` to `1.0`. Applied to whole traces, so a span never joins a trace its parent was excluded from. Any value that is not a number in range falls back to `1.0` and logs `error.type=unparsable_telemetry_config`. |
+
+| Setting | Value |
+|---------|-------|
+| Protocol | OTLP over HTTP with protobuf-encoded payloads. gRPC is not compiled in: it would drag a tonic/prost server stack in for no benefit at this scale. |
+| Export | Batching. A span costs a queue send, and the exporter's own worker thread does the network work off the request path. |
+| Resource attributes | `service.name=tele-s3` and `service.version`, taken from the crate version so it cannot drift from the binary. |
+| Filtering | `RUST_LOG` governs both the log layer and the trace layer, so a `tele_s3=info` operator does not export the debug spans they asked not to see. |
+| Shutdown | On `SIGINT`/`SIGTERM` the queue is drained and the exporter shut down before the process exits, so in-flight spans are not lost. A flush that fails is logged with `error.type=telemetry_export` and otherwise ignored. |
+| Failure | Telemetry never takes the server down. An unreachable or slow collector, or an endpoint the exporter cannot even be built from, is logged and ignored; no request fails and nothing panics. |
+
+Whether export is on is published at `/.tele-s3/introspect` as `telemetry.trace_export`, as a boolean — the endpoint itself is operator infrastructure and this document is unauthenticated.
+
+```bash
+TELE_S3_OTLP_ENDPOINT=http://collector:4318/v1/traces cargo run -- --config config.toml
+```
+
 ### Admin endpoints
 
 Three JSON endpoints share the S3 listener and are answered before any request reaches the S3 handlers. They are **unauthenticated** — a probe that has to sign a request is a probe that stops working when the signature expires — so they publish no credential material: no access key, secret key, `api_hash`, `bot_token` or `database_uri`, and no error message that might quote one.
@@ -186,7 +211,7 @@ Three JSON endpoints share the S3 listener and are answered before any request r
 |------|---------|
 | `/.tele-s3/healthz` | Liveness: the process is alive and serving HTTP. Always `200`, derived from nothing — not Telegram, not the database. A rate-limited upstream must never make a healthy server look dead to its supervisor. |
 | `/.tele-s3/readyz` | Readiness: start-up finished, so S3 traffic is being served. Always `200`, with the outcome of both start-up reconcilers in the body. |
-| `/.tele-s3/introspect` | Introspection: the effective runtime state — the three Telegram knobs in force (after environment overrides and clamping), the listen port, the version, and what each reconciler did. |
+| `/.tele-s3/introspect` | Introspection: the effective runtime state — the three Telegram knobs in force (after environment overrides and clamping), the listen port, the version, whether OTLP trace export is on, and what each reconciler did. |
 
 The `/.tele-s3` prefix is reserved deliberately: an S3 bucket name must begin and end with a lowercase letter or a digit, so `.tele-s3` can never be a bucket and these paths can never shadow `/{bucket}/{key}` (a bare `/healthz` would have been read as bucket `healthz`). Anything else under the prefix is a `404`.
 

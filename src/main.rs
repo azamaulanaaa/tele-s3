@@ -7,7 +7,19 @@ use tokio::{net::TcpListener, signal};
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use tracing_subscriber::{EnvFilter, fmt::Subscriber as FmtSubscriber};
+
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{
+    Resource,
+    trace::{Sampler, SdkTracer, SdkTracerProvider},
+};
+
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry, fmt::Subscriber as FmtSubscriber, layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use tele_s3::{
     admin::{
@@ -123,7 +135,180 @@ impl LogFormat {
 /// Selects the process-wide log format. See [`LOG_FORMAT_ENV`].
 const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
 
+/// Name this process reports to the collector, as `service.name`.
+const SERVICE_NAME: &str = "tele-s3";
+
+/// OTLP endpoint traces are exported to. Unset means trace export is off.
+///
+/// Follows the same environment-variable convention as the log format and the
+/// Telegram limits: read once, here, before anything is built, so an operator
+/// can set it on a container without touching `config.toml`.
+const OTLP_ENDPOINT_ENV: &str = "TELE_S3_OTLP_ENDPOINT";
+
+/// The standard OpenTelemetry endpoint variable, honoured as a fallback.
+///
+/// An operator who already points other services at a collector does not have
+/// to learn this crate's spelling. [`OTLP_ENDPOINT_ENV`] takes precedence, so
+/// the crate's own variable works standalone.
+const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+/// Fraction of traces to export, `0.0` to `1.0`. Unset means every trace.
+const OTLP_SAMPLE_RATIO_ENV: &str = "TELE_S3_OTLP_SAMPLE_RATIO";
+
+/// The only transport built into this binary.
+///
+/// `opentelemetry-otlp` is compiled without its gRPC client, so there is no
+/// code path that could speak gRPC even if a collector asked for it. The name
+/// is published at start-up so an operator can see which one they got.
+const TRACE_TRANSPORT: &str = "otlp_http_protobuf";
+
+/// Every trace is exported unless the operator says otherwise.
+const DEFAULT_SAMPLE_RATIO: f64 = 1.0;
+
+/// `error.type` for a telemetry setting that could not be read.
+const TELEMETRY_CONFIG_ERROR_TYPE: &str = "unparsable_telemetry_config";
+
+/// `error.type` for spans that could not be flushed to the collector.
+const TELEMETRY_EXPORT_ERROR_TYPE: &str = "telemetry_export";
+
+/// Where and how much to export, read once from the environment.
+///
+/// `None` — no endpoint configured — is the default and by far the common
+/// case. It is genuinely inert rather than merely quiet: with no endpoint
+/// nothing here builds an exporter, no batching thread is started, and the
+/// subscriber is the log-only one that shipped before this scope existed. A
+/// self-hosted operator who never configures telemetry pays nothing for the
+/// machinery.
+#[derive(Debug, Clone, PartialEq)]
+struct TraceExport {
+    /// OTLP collector endpoint, HTTP scheme, protobuf-encoded payloads.
+    endpoint: String,
+    /// Fraction of traces to keep.
+    sample_ratio: f64,
+}
+
+impl TraceExport {
+    /// Read the settings, or `None` when no endpoint is configured.
+    fn from_env() -> Option<Self> {
+        let endpoint = Self::endpoint_from(
+            env::var(OTLP_ENDPOINT_ENV).ok().as_deref(),
+            env::var(OTEL_ENDPOINT_ENV).ok().as_deref(),
+        )?;
+
+        Some(Self {
+            endpoint,
+            sample_ratio: Self::sample_ratio_from_env(),
+        })
+    }
+
+    /// The first usable endpoint among the crate's own variable, then the
+    /// standard one. An unset *or blank* value is not a configuration: it
+    /// falls through rather than producing an endpoint of `""`.
+    ///
+    /// Pure, so the precedence rule can be tested without mutating the process
+    /// environment, which every test in a binary shares.
+    fn endpoint_from(own: Option<&str>, standard: Option<&str>) -> Option<String> {
+        [own, standard]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|raw| !raw.is_empty())
+            .map(str::to_string)
+    }
+
+    /// A usable sample ratio, or `None` if `raw` is not one.
+    ///
+    /// Out-of-range and non-finite values are rejected here rather than left
+    /// to the sampler's own clamping, so an absurd setting degrades to a
+    /// logged default instead of quietly meaning "export nothing".
+    fn sample_ratio(raw: &str) -> Option<f64> {
+        let parsed = raw.trim().parse::<f64>().ok()?;
+
+        parsed
+            .is_finite()
+            .then_some(parsed)
+            .filter(|ratio| (0.0..=1.0).contains(ratio))
+    }
+
+    /// The configured ratio, or [`DEFAULT_SAMPLE_RATIO`] with a reason logged.
+    fn sample_ratio_from_env() -> f64 {
+        let Ok(raw) = env::var(OTLP_SAMPLE_RATIO_ENV) else {
+            return DEFAULT_SAMPLE_RATIO;
+        };
+
+        Self::sample_ratio(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                env_var = OTLP_SAMPLE_RATIO_ENV,
+                value = %raw,
+                error.type = TELEMETRY_CONFIG_ERROR_TYPE,
+                "unparsable trace sample ratio; exporting every trace"
+            );
+            DEFAULT_SAMPLE_RATIO
+        })
+    }
+
+    /// The resource every exported span carries.
+    ///
+    /// The version is the crate version, so it cannot drift from the binary
+    /// that produced the span. Built empty rather than from the SDK's
+    /// detectors: this document is the identity of *this* process, and an
+    /// operator diffing two of them should not be reading SDK filler.
+    fn resource(&self) -> Resource {
+        Resource::builder_empty()
+            .with_service_name(SERVICE_NAME)
+            .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+            .build()
+    }
+
+    /// Build the batching pipeline, or `None` if the exporter refuses.
+    ///
+    /// An endpoint the exporter will not accept is a configuration error, not
+    /// a reason to refuse to serve S3. The caller logs it and continues with
+    /// the log-only subscriber.
+    fn build_pipeline(&self) -> Option<SdkTracerProvider> {
+        let exporter = SpanExporter::builder()
+            .with_http()
+            .with_endpoint(self.endpoint.clone())
+            .build()
+            .inspect_err(|err| {
+                tracing::warn!(
+                    telemetry_endpoint = %self.endpoint,
+                    error.type = TELEMETRY_CONFIG_ERROR_TYPE,
+                    error.message = %err,
+                    "cannot build the OTLP exporter; continuing without trace export"
+                );
+            })
+            .ok()?;
+
+        // `ParentBased` so the ratio applies to whole traces and a child span
+        // never joins a trace its parent was excluded from.
+        let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(self.sample_ratio)));
+
+        Some(
+            SdkTracerProvider::builder()
+                .with_resource(self.resource())
+                .with_sampler(sampler)
+                // Batching: a span costs a channel send rather than a round
+                // trip, and the exporter's own worker thread does the network
+                // work off the request path.
+                .with_batch_exporter(exporter)
+                .build(),
+        )
+    }
+}
+
 /// Install the process-wide `tracing` subscriber.
+///
+/// Returns the trace provider when export is on, which the caller keeps and
+/// flushes on the graceful-exit path. `None` means export is off — either no
+/// endpoint was configured or the exporter refused the one that was — and the
+/// subscriber installed is then byte for byte the one that shipped before
+/// trace export existed.
+///
+/// An OTLP failure is never fatal. The exporter is built before the log layer
+/// so the reason for skipping it reaches the log; once the pipeline is up,
+/// export happens on its own background thread and a collector that is down,
+/// slow or gone cannot fail a request or panic the process.
 ///
 /// # Field vocabulary
 ///
@@ -146,6 +331,8 @@ const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
 /// | `name` | Telegram part/file name of an upload. |
 /// | `dc_id` | Telegram datacentre id. |
 /// | `endpoint` | Which admin endpoint answered a request. |
+/// | `telemetry_endpoint` | OTLP collector this process exports traces to. |
+/// | `transport` | Wire protocol a telemetry export speaks. |
 ///
 /// ## Sizes, counts and durations
 ///
@@ -187,27 +374,119 @@ const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
 /// function's arguments on the span, so `operation`-shaped fields such as
 /// `key`, `blob_id` and `publish_id` also arrive as span fields. Promote a
 /// field to the span rather than re-logging it if it is already there.
-fn init_tracing() {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tele_s3=info"));
-
+///
+/// They are also the OTLP span attributes. The [`tracing-opentelemetry`]
+/// layer binds to these same names, so a field is spelled once for both a log
+/// line and a trace.
+fn init_tracing() -> Option<SdkTracerProvider> {
     let format = LogFormat::from_env();
 
+    let Some(settings) = TraceExport::from_env() else {
+        init_log_subscriber(format);
+        return None;
+    };
+
+    let Some(provider) = settings.build_pipeline() else {
+        init_log_subscriber(format);
+        return None;
+    };
+
+    tracing::info!(
+        telemetry_endpoint = %settings.endpoint,
+        transport = TRACE_TRANSPORT,
+        "exporting traces over OTLP"
+    );
+
+    init_otel_subscriber(format, provider.tracer(SERVICE_NAME));
+
+    Some(provider)
+}
+
+/// `RUST_LOG`, or the crate's own default when it is unset or unreadable.
+///
+/// Built per layer rather than once and shared: [`EnvFilter`] is not `Clone`,
+/// and each layer needs its own copy.
+fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tele_s3=info"))
+}
+
+/// Install the log layer on its own.
+///
+/// This is the whole subscriber for a process with no trace export: the same
+/// `fmt` renderer, the same environment filter, the same default of pretty
+/// text.
+fn init_log_subscriber(format: LogFormat) {
     match format {
         LogFormat::Text => FmtSubscriber::builder()
             .pretty()
-            .with_env_filter(env_filter)
+            .with_env_filter(env_filter())
             .init(),
         LogFormat::Json => FmtSubscriber::builder()
             .json()
-            .with_env_filter(env_filter)
+            .with_env_filter(env_filter())
             .init(),
+    }
+}
+
+/// Install the log layer *and* the OTLP trace layer.
+///
+/// The log layer is `tracing-subscriber`'s own `fmt` renderer — the same one
+/// [`init_log_subscriber`] installs, only expressed as a layer rather than as
+/// a whole subscriber, because a trace layer can only be composed onto a
+/// [`Registry`]. Both log formats therefore keep working exactly as before,
+/// and the trace layer writes nothing to stdout: it observes spans on their
+/// way to the collector.
+///
+/// Both layers are filtered by the same `RUST_LOG`. Filtering only the log
+/// layer would let a `tele_s3=info` operator export the debug spans they
+/// asked not to see.
+fn init_otel_subscriber(format: LogFormat, tracer: SdkTracer) {
+    let logs: Box<dyn Layer<Registry> + Send + Sync> = match format {
+        LogFormat::Text => Box::new(
+            tracing_subscriber::fmt::layer()
+                .pretty()
+                .with_filter(env_filter()),
+        ),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(env_filter()),
+        ),
+    };
+
+    Registry::default()
+        .with(logs)
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(env_filter()),
+        )
+        .init();
+}
+
+/// Flush in-flight spans and stop the exporter's worker thread.
+///
+/// Called on the graceful-exit path, and a no-op when export is off. Both
+/// halves are attempted even if the first fails: draining the queue is what
+/// saves the spans, and stopping the thread is what lets the process exit
+/// rather than wait on a socket that is never going to answer.
+fn flush_traces(provider: Option<&SdkTracerProvider>) {
+    let Some(provider) = provider else {
+        return;
+    };
+
+    if let Err(err) = provider.force_flush().and(provider.shutdown()) {
+        tracing::warn!(
+            error.type = TELEMETRY_EXPORT_ERROR_TYPE,
+            error.message = %err,
+            "could not flush traces on shutdown"
+        );
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    let telemetry = init_tracing();
 
     let args = Args::parse();
 
@@ -295,10 +574,13 @@ async fn main() -> anyhow::Result<()> {
 
         // Health, readiness and introspection, answered ahead of S3 and ahead
         // of any signature check. See `admin` for what they publish and why.
+        // The bool, not the endpoint: a probe should learn whether spans are
+        // leaving this process, not where the collector lives.
         builder.set_route(AdminRoute::new(AdminState::new(
             config.listen_port,
             limits,
             startup,
+            telemetry.is_some(),
         )));
 
         builder.build()
@@ -342,6 +624,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     tracing::info!("shutting down services");
+
+    // Before the closing log lines, not after: the spans those lines open are
+    // the ones most likely to be sitting in the batch queue.
+    flush_traces(telemetry.as_ref());
 
     db.close().await?;
     grammers.close();
@@ -393,6 +679,7 @@ mod tests {
                 orphan_blobs: ReconcilerOutcome::Failed,
                 publish_intents: ReconcilerOutcome::Failed,
             },
+            true,
         );
 
         for response in [state.liveness(), state.readiness(), state.introspection()] {
@@ -444,6 +731,150 @@ mod tests {
     fn an_unknown_log_format_falls_back_to_text() {
         for raw in ["yaml", "1", ""] {
             assert_eq!(LogFormat::parse(raw), None, "{raw}");
+        }
+    }
+
+    /// The default, and the one that has to stay free: no endpoint means
+    /// export is off, so no exporter, no batching thread and no trace layer
+    /// are ever built.
+    ///
+    /// This is the whole zero-cost argument, so it is asserted on the decision
+    /// itself rather than on any side effect: [`TraceExport::from_env`] is
+    /// the only thing that reads the environment, and it returns nothing.
+    #[test]
+    fn trace_export_stays_off_without_a_configured_endpoint() {
+        assert_eq!(TraceExport::endpoint_from(None, None), None);
+        // A variable that is set to nothing is not a configuration either, and
+        // must not become an endpoint the exporter then chokes on.
+        assert_eq!(TraceExport::endpoint_from(Some(""), None), None);
+        assert_eq!(TraceExport::endpoint_from(Some("   \n"), None), None);
+        assert_eq!(TraceExport::endpoint_from(None, Some("")), None);
+
+        // The graceful-exit path is reached with no provider at all, and is a
+        // no-op rather than a panic.
+        flush_traces(None);
+    }
+
+    /// The crate's own variable works standalone; the standard one is honoured
+    /// when it is the only one set; and when both are set the crate's own
+    /// spelling wins, so an operator can override a cluster-wide default.
+    #[test]
+    fn the_crates_own_endpoint_variable_takes_precedence() {
+        let own = "http://collector.internal:4318/v1/traces";
+        let standard = "http://otel-collector:4318/v1/traces";
+
+        assert_eq!(
+            TraceExport::endpoint_from(Some(own), Some(standard)),
+            Some(own.to_string())
+        );
+        assert_eq!(
+            TraceExport::endpoint_from(None, Some(standard)),
+            Some(standard.to_string())
+        );
+        // A blank value falls through instead of shadowing the one below it.
+        assert_eq!(
+            TraceExport::endpoint_from(Some("  "), Some(standard)),
+            Some(standard.to_string())
+        );
+        // Surrounding whitespace is an operator's editor, not a hostname.
+        assert_eq!(
+            TraceExport::endpoint_from(Some(" http://a/v1/traces \n"), None),
+            Some("http://a/v1/traces".to_string())
+        );
+    }
+
+    /// A configured endpoint is enough to build the pipeline. Nothing is
+    /// exported and nothing is sent: the batching processor owns a queue and
+    /// only talks to the collector when a span arrives, so this needs no
+    /// collector and no network.
+    #[test]
+    fn a_configured_endpoint_initialises_the_pipeline() {
+        let settings = TraceExport {
+            endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
+            sample_ratio: DEFAULT_SAMPLE_RATIO,
+        };
+
+        let provider = settings
+            .build_pipeline()
+            .expect("a well-formed endpoint builds an exporter");
+
+        // And shutting it down is a no-op, not a panic: this is the graceful
+        // exit path, and it must survive an endpoint nobody is listening on.
+        flush_traces(Some(&provider));
+    }
+
+    /// Telemetry must never take the server down. A collector that is not
+    /// there is the ordinary case — the service starts before its collector
+    /// does — so the end of the graceful-exit path is exercised against a
+    /// port nothing is listening on.
+    ///
+    /// The export attempt fails on the exporter's own worker thread and is
+    /// reported to [`flush_traces`], which logs it and returns. No panic, and
+    /// no error handed back to the caller that is trying to shut down.
+    #[test]
+    fn an_unreachable_collector_cannot_break_shutdown() {
+        let settings = TraceExport {
+            // Port 1 on loopback: nothing listens there, and the connection is
+            // refused immediately rather than left to time out.
+            endpoint: "http://127.0.0.1:1/v1/traces".to_string(),
+            sample_ratio: DEFAULT_SAMPLE_RATIO,
+        };
+
+        let provider = settings.build_pipeline().expect(
+            "the exporter is built regardless; delivery is the background thread's problem",
+        );
+
+        flush_traces(Some(&provider));
+    }
+
+    /// The resource is what tells a collector which service a trace belongs
+    /// to. The version is the crate version, so it cannot drift from the
+    /// binary that produced the span.
+    #[test]
+    fn the_resource_carries_the_service_name_and_crate_version() {
+        let resource = TraceExport {
+            endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
+            sample_ratio: DEFAULT_SAMPLE_RATIO,
+        }
+        .resource();
+
+        let attributes: std::collections::HashMap<String, String> = resource
+            .iter()
+            .map(|(key, value)| (key.as_str().to_string(), value.as_str().to_string()))
+            .collect();
+
+        assert_eq!(
+            attributes.get("service.name").map(String::as_str),
+            Some(SERVICE_NAME)
+        );
+        assert_eq!(
+            attributes.get("service.version").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// Every trace is exported unless the operator says otherwise, and every
+    /// spelling of "otherwise" that a shell would produce is accepted.
+    #[test]
+    fn the_sample_ratio_defaults_to_every_trace() {
+        assert_eq!(DEFAULT_SAMPLE_RATIO, 1.0);
+
+        for (raw, expected) in [
+            ("1", Some(1.0)),
+            ("0.25", Some(0.25)),
+            (" 0.5 \n", Some(0.5)),
+            ("0", Some(0.0)),
+        ] {
+            assert_eq!(TraceExport::sample_ratio(raw), expected, "{raw}");
+        }
+    }
+
+    /// A ratio that cannot be used falls back to the documented default and
+    /// says so, rather than panicking or quietly meaning "export nothing".
+    #[test]
+    fn an_unusable_sample_ratio_falls_back_to_the_default() {
+        for raw in ["", "  ", "half", "1.5", "-0.1", "NaN", "inf"] {
+            assert_eq!(TraceExport::sample_ratio(raw), None, "{raw}");
         }
     }
 }

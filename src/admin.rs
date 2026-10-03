@@ -145,6 +145,7 @@ pub struct AdminState {
     listen_port: u16,
     limits: GrammersLimits,
     startup: StartupReport,
+    trace_export: bool,
 }
 
 impl AdminState {
@@ -152,11 +153,23 @@ impl AdminState {
     ///
     /// Takes the port and the limits by value rather than a `&Config` on
     /// purpose: there is no argument through which a credential could arrive.
-    pub fn new(listen_port: u16, limits: GrammersLimits, startup: StartupReport) -> Self {
+    ///
+    /// `trace_export` is a bool and not the endpoint itself, because the
+    /// endpoint is operator infrastructure — often an in-cluster address with
+    /// a hostname in it — and this document is served unauthenticated. What
+    /// an operator needs to know from a probe is whether spans are leaving
+    /// the process at all.
+    pub fn new(
+        listen_port: u16,
+        limits: GrammersLimits,
+        startup: StartupReport,
+        trace_export: bool,
+    ) -> Self {
         Self {
             listen_port,
             limits,
             startup,
+            trace_export,
         }
     }
 
@@ -216,6 +229,9 @@ impl AdminState {
                 "max_concurrent_requests": self.limits.max_concurrent_requests,
                 "io_timeout_ms": self.limits.io_timeout_ms(),
                 "max_attempts": self.limits.max_attempts,
+            },
+            "telemetry": {
+                "trace_export": self.trace_export,
             },
             "startup": self.startup_json(),
         }))
@@ -390,6 +406,7 @@ mod tests {
                 orphan_blobs: ReconcilerOutcome::Completed { affected: 2 },
                 publish_intents: ReconcilerOutcome::Completed { affected: 0 },
             },
+            true,
         )
     }
 
@@ -451,7 +468,7 @@ mod tests {
                 publish_intents: ReconcilerOutcome::Failed,
             },
         ] {
-            let state = AdminState::new(8000, GrammersLimits::default(), report);
+            let state = AdminState::new(8000, GrammersLimits::default(), report, false);
             let response = state.liveness();
             assert_eq!(response.status, StatusCode::OK);
             // Nothing about the reconcilers reaches a liveness answer.
@@ -468,6 +485,7 @@ mod tests {
                 orphan_blobs: ReconcilerOutcome::Failed,
                 publish_intents: ReconcilerOutcome::Completed { affected: 7 },
             },
+            false,
         );
 
         let response = degraded.readiness();
@@ -499,6 +517,7 @@ mod tests {
         assert_eq!(body["telegram"]["max_concurrent_requests"], 4);
         assert_eq!(body["telegram"]["io_timeout_ms"], 30_000);
         assert_eq!(body["telegram"]["max_attempts"], 3);
+        assert_eq!(body["telemetry"]["trace_export"], true);
         assert_eq!(
             body["startup"]["orphan_blob_reconciliation"],
             json!({ "outcome": "completed", "affected": 2 })
@@ -525,8 +544,19 @@ mod tests {
         top.sort_unstable();
         assert_eq!(
             top,
-            ["listen_port", "startup", "status", "telegram", "version"]
+            [
+                "listen_port",
+                "startup",
+                "status",
+                "telegram",
+                "telemetry",
+                "version"
+            ]
         );
+
+        let mut telemetry = keys(&body["telemetry"]);
+        telemetry.sort_unstable();
+        assert_eq!(telemetry, ["trace_export"]);
 
         let mut telegram = keys(&body["telegram"]);
         telegram.sort_unstable();
@@ -554,6 +584,10 @@ mod tests {
         fn assert_literal_or_number(value: &Value) {
             match value {
                 Value::Number(_) => {}
+                // The one boolean in the document: whether spans are leaving
+                // this process. It cannot have come from anywhere but this
+                // file.
+                Value::Bool(_) => {}
                 Value::String(text) => assert!(
                     matches!(
                         text.as_str(),
