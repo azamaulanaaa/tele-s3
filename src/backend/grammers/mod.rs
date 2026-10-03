@@ -26,7 +26,7 @@ use tokio_util::{
 };
 use tracing::{instrument, warn};
 
-use super::{Backend, BackendError, BoxedAsyncReader};
+use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome};
 
 mod session;
 
@@ -202,6 +202,59 @@ enum AttemptError {
     /// is not always safe — a timed-out `send_message` would duplicate the
     /// message.
     Timeout(Duration),
+}
+
+/// Why a [`Grammers`] key could not be turned into a message to fetch.
+///
+/// Split out of [`Grammers::read`] and given its own mapping into
+/// [`ReadOutcome`] so the decision is testable without a live Telegram
+/// session: the two facts here are all the classification depends on, and
+/// only obtaining them needs a client.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyFault {
+    /// The key is not a message id, so it is not one this backend minted.
+    /// A key from another backend lands here too.
+    Unaddressable,
+    /// The message exists but carries no media, so there is nothing to
+    /// stream. The object is present and unreadable, not absent.
+    NoMedia,
+}
+
+impl From<KeyFault> for ReadOutcome {
+    fn from(fault: KeyFault) -> Self {
+        match fault {
+            KeyFault::Unaddressable => ReadOutcome::Fault(BackendError::InvariantViolation {
+                detail: "key is not a message id this backend minted",
+            }),
+            KeyFault::NoMedia => ReadOutcome::Fault(BackendError::InvariantViolation {
+                detail: "the message a key names exists but carries no media",
+            }),
+        }
+    }
+}
+
+/// Resolve a key to the message id to fetch.
+///
+/// `Err` carries the [`ReadOutcome`] to report. A key this backend cannot
+/// address is [`ReadOutcome::Fault`] and never [`ReadOutcome::Missing`]:
+/// saying the object is absent would tell the operator it was deleted when
+/// in fact it was never one of ours to delete.
+///
+/// Pure, so the malformed-key decision is testable without a client.
+fn resolve_key(key: &str) -> Result<i32, ReadOutcome> {
+    key.parse::<i32>()
+        .map_err(|_| KeyFault::Unaddressable.into())
+}
+
+/// The message id a `delete` should target, or `None` when the key names
+/// nothing this backend wrote.
+///
+/// Deliberately the opposite of [`resolve_key`]: where `read` calls an
+/// unparseable key a fault, `delete` calls it absent, because the idempotency
+/// contract makes deleting something that is not there a success. Pure, so
+/// that half of the contract is testable without a client.
+fn delete_target(key: &str) -> Option<i32> {
+    key.parse::<i32>().ok()
 }
 
 impl AttemptError {
@@ -573,16 +626,13 @@ impl Backend for Grammers {
         key: String,
         offset: u64,
         limit: Option<u64>,
-    ) -> Result<Option<BoxedAsyncReader>, BackendError> {
-        let message_id = {
-            let numb_key = key.parse::<i32>();
-
-            match numb_key {
-                Ok(v) => v,
-                Err(_e) => {
-                    return Ok(None);
-                }
-            }
+    ) -> Result<ReadOutcome, BackendError> {
+        // A key this backend cannot address is a fault, not an absence:
+        // saying it is missing would tell the operator the object was
+        // deleted when it was never one of ours.
+        let message_id = match resolve_key(&key) {
+            Ok(message_id) => message_id,
+            Err(fault) => return Ok(fault),
         };
         let offset: usize = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
         let limit: Option<usize> = limit
@@ -602,14 +652,19 @@ impl Backend for Grammers {
             .await?;
         let media = {
             let mut messages = media;
+            // The peer has no message with this id: the object this key
+            // named is genuinely gone. The only case `read` answers
+            // `Missing`.
             let message = match messages.pop().flatten() {
                 Some(v) => v,
-                None => return Ok(None),
+                None => return Ok(ReadOutcome::Missing),
             };
 
+            // The message is there but holds nothing to stream: the object
+            // is unreadable, not absent.
             match message.media() {
                 Some(v) => v,
-                None => return Ok(None),
+                None => return Ok(KeyFault::NoMedia.into()),
             }
         };
 
@@ -666,20 +721,17 @@ impl Backend for Grammers {
             Box::pin(reader_compat)
         };
 
-        Ok(Some(reader))
+        Ok(ReadOutcome::Present(reader))
     }
 
     #[instrument(skip(self), level = "debug", err)]
     async fn delete(&self, key: String) -> Result<(), BackendError> {
-        let message_id = {
-            let numb_key = key.parse::<i32>();
-
-            match numb_key {
-                Ok(v) => v,
-                Err(_e) => {
-                    return Ok(());
-                }
-            }
+        let message_id = match delete_target(&key) {
+            Some(message_id) => message_id,
+            // Nothing this backend wrote can be named by a key it cannot
+            // parse, so there is nothing to delete and the idempotency
+            // contract makes that a success.
+            None => return Ok(()),
         };
 
         // Deleting a message that is already gone succeeds server-side, so
@@ -804,5 +856,57 @@ mod tests {
                 max_attempts: 5,
             }
         );
+    }
+
+    #[test]
+    fn a_well_formed_key_resolves_to_its_message_id() {
+        assert_eq!(resolve_key("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn a_malformed_key_is_a_fault_and_not_an_absence() {
+        // A key minted by another backend reaches `read` too, and it is a
+        // fault: nothing this backend wrote is absent.
+        let outcome = resolve_key("not-a-message-id").unwrap_err();
+
+        match outcome {
+            ReadOutcome::Fault(BackendError::InvariantViolation { detail }) => {
+                assert_eq!(detail, "key is not a message id this backend minted");
+            }
+            other => panic!("a malformed key must be a fault, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_without_media_is_a_fault_and_not_an_absence() {
+        // Reachable only with a live Telegram session, so the decision is
+        // covered here instead: the message exists, so its bytes cannot be
+        // reported missing.
+        assert!(matches!(
+            ReadOutcome::from(KeyFault::NoMedia),
+            ReadOutcome::Fault(BackendError::InvariantViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn delete_of_an_unparseable_key_has_nothing_to_target() {
+        // The `delete` half of the idempotency contract: a key this backend
+        // cannot parse names nothing it wrote, so it is already absent and
+        // deleting it succeeds without a request. Reachable only on a live
+        // session for the RPC that follows, so the decision is covered here.
+        assert_eq!(delete_target("42"), Some(42));
+        assert_eq!(delete_target("not-a-message-id"), None);
+    }
+
+    #[test]
+    fn a_fault_is_distinguishable_from_a_missing_object() {
+        // The whole point of the three-way answer: an operator must be able
+        // to tell a corrupt key from a deleted object in a log line.
+        let fault = ReadOutcome::from(KeyFault::NoMedia);
+        let missing = ReadOutcome::Missing;
+
+        assert_ne!(format!("{fault:?}"), format!("{missing:?}"));
+        assert!(matches!(fault, ReadOutcome::Fault(_)));
+        assert!(matches!(missing, ReadOutcome::Missing));
     }
 }

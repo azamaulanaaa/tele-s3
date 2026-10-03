@@ -23,7 +23,7 @@ use super::helpers::{
     ExpectedChecksums, StreamingBlobExt, build_put_condition, chrono_to_timestamp,
     metadata_to_json, tagging_header_to_json, verify_checksums,
 };
-use super::objects::checked_content_length;
+use super::objects::{checked_content_length, read_outcome_to_reader};
 use super::repo::{MultipartUploadStateUpdate, ObjectWrite};
 use super::types::{Metadata, MetadataItem, MultipartUploadPart};
 use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher};
@@ -640,8 +640,8 @@ impl<B: Backend> TeleS3<B> {
                 .await
                 .map_err(S3Error::from)?
                 .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError))?;
+                .map(read_outcome_to_reader)
+                .collect::<S3Result<Vec<_>>>()?;
 
             let hasher_md5 = Arc::new(Mutex::new(md5::Md5::new()));
             {

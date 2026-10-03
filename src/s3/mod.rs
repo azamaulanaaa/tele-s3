@@ -430,7 +430,7 @@ mod tests {
 
     use super::repo::entity;
     use super::*;
-    use crate::backend::{BoxedAsyncReader, Memory};
+    use crate::backend::{BoxedAsyncReader, Memory, ReadOutcome};
 
     /// A backend whose deletes can be made to fail on demand, so the
     /// release ordering is observable.
@@ -463,7 +463,7 @@ mod tests {
             key: String,
             offset: u64,
             limit: Option<u64>,
-        ) -> Result<Option<BoxedAsyncReader>, BackendError> {
+        ) -> Result<ReadOutcome, BackendError> {
             self.inner.read(key, offset, limit).await
         }
 

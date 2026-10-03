@@ -29,7 +29,26 @@ use super::helpers::{
 use super::repo::entity::object;
 use super::repo::{ObjectWrite, Repository};
 use super::types::{Metadata, MetadataItem};
-use crate::backend::{Backend, ChainReaders, IntegrityDigests, IntegrityReader};
+use crate::backend::{
+    Backend, BoxedAsyncReader, ChainReaders, IntegrityDigests, IntegrityReader, ReadOutcome,
+};
+
+/// Map one [`ReadOutcome`] to the reader this read path needs.
+///
+/// The metadata store resolved these blobs *before* the backend was asked
+/// for them, so both non-present variants are failures here: `Missing` means
+/// bytes that were promised are gone, and `Fault` means the backend cannot
+/// serve bytes it holds. Neither is a client error — the object was resolved,
+/// so it exists and a `NoSuchKey` would be a lie. Both answer
+/// [`S3ErrorCode::InternalError`], the fault keeping its own message so the
+/// log says which of the two it was.
+pub(super) fn read_outcome_to_reader(outcome: ReadOutcome) -> S3Result<BoxedAsyncReader> {
+    match outcome {
+        ReadOutcome::Present(reader) => Ok(reader),
+        ReadOutcome::Missing => Err(S3Error::new(S3ErrorCode::InternalError)),
+        ReadOutcome::Fault(err) => Err(S3Error::from(err)),
+    }
+}
 
 /// Upper bound the S3 API applies to `max-keys`; larger client values are
 /// silently clamped rather than rejected.
@@ -582,8 +601,8 @@ impl<B: Backend> TeleS3<B> {
             .await
             .map_err(S3Error::from)?
             .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError))?;
+            .map(read_outcome_to_reader)
+            .collect::<S3Result<Vec<_>>>()?;
 
         let chain_readers = ChainReaders::from_vec(readers);
 
@@ -1252,7 +1271,7 @@ fn delete_key_error(key: String, version_id: Option<String>, err: &S3Error) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Memory;
+    use crate::backend::{BackendError, Memory};
     use crate::s3::TeleS3;
     use sea_orm::ConnectionTrait;
 
@@ -1261,6 +1280,45 @@ mod tests {
             .await
             .expect("connect");
         TeleS3::init(Memory::default(), db).await.expect("init")
+    }
+
+    #[test]
+    fn a_present_read_outcome_yields_the_reader() {
+        let reader: BoxedAsyncReader = Box::pin(futures::io::Cursor::new(b"bytes".to_vec()));
+
+        assert!(read_outcome_to_reader(ReadOutcome::Present(reader)).is_ok());
+    }
+
+    #[test]
+    fn a_missing_read_outcome_is_an_internal_error_and_never_no_such_key() {
+        // The metadata row promised these bytes before the backend was
+        // called, so a genuine absence here is lost data, not a missing
+        // object. This is the behaviour the old `Option` had and must keep.
+        let err = match read_outcome_to_reader(ReadOutcome::Missing) {
+            Ok(_) => panic!("a missing blob must not yield a reader"),
+            Err(err) => err,
+        };
+
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn a_fault_read_outcome_is_an_internal_error_that_names_the_fault() {
+        let err =
+            match read_outcome_to_reader(ReadOutcome::Fault(BackendError::InvariantViolation {
+                detail: "key is not a message id this backend minted",
+            })) {
+                Ok(_) => panic!("a faulted blob must not yield a reader"),
+                Err(err) => err,
+            };
+
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+        // The message is the difference this scope bought: an operator can
+        // tell a corrupt key from a deleted object.
+        assert_eq!(
+            err.message(),
+            Some("Backend invariant violated: key is not a message id this backend minted")
+        );
     }
 
     fn get_req(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<GetObjectInput> {

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -56,6 +57,46 @@ pub enum BackendError {
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// What [`Backend::read`] found at a key.
+///
+/// An explicit three-way answer rather than `Option`, because "no object is
+/// there" and "there is something there I cannot read" are different facts
+/// and a caller must be forced to decide what each one means for it. `Option`
+/// made that impossible to express and let an `Option` answer carry a fault
+/// as easily as an absence.
+///
+/// The enum is exhaustive on purpose: a caller must handle every case
+/// deliberately, with no catch-all arm to hide a future case in. Adding a
+/// variant is therefore a breaking change, and is a decision to make
+/// deliberately rather than by accident.
+///
+/// A `Fault` carries a [`BackendError`] for the same reason: the detail is
+/// what tells an operator reading the logs whether the object was deleted or
+/// the storage is corrupt.
+pub enum ReadOutcome {
+    /// An object is stored at the key and the reader streams it.
+    Present(BoxedAsyncReader),
+    /// The backend holds no object at this key. The key is one the backend
+    /// itself minted and the object it named is gone.
+    Missing,
+    /// The key names something the backend cannot serve as bytes: it is not
+    /// a key this backend can address, or the record it resolves to carries
+    /// no payload. The object is *not* absent — reading it failed.
+    Fault(BackendError),
+}
+
+impl fmt::Debug for ReadOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // A reader has no useful `Debug`, and printing one would
+            // consume or reformat the stream it wraps.
+            ReadOutcome::Present(_) => f.write_str("Present(<reader>)"),
+            ReadOutcome::Missing => f.write_str("Missing"),
+            ReadOutcome::Fault(err) => write!(f, "Fault({err})"),
+        }
+    }
+}
+
 /// Storage for opaque byte objects, addressed by the opaque keys
 /// [`Backend::write`] mints.
 ///
@@ -95,8 +136,7 @@ pub trait Backend: Send + Sync + 'static {
     /// window as small as the backend allows.
     async fn write(&self, size: u64, reader: BoxedAsyncReader) -> Result<String, BackendError>;
 
-    /// Open a byte range of `key`, or report that no readable object is
-    /// there.
+    /// Open a byte range of `key`, or report what is — or is not — there.
     ///
     /// `offset` is absolute from the start of the object. `limit` is a byte
     /// count *relative to* `offset`, not an end offset. A range running past
@@ -105,19 +145,34 @@ pub trait Backend: Send + Sync + 'static {
     /// cannot address at all (`offset`/`limit` wider than its own
     /// arithmetic) is [`BackendError::OutOfRange`].
     ///
-    /// `Ok(None)` means *no readable object at this key*, and deliberately
-    /// does not separate the cases. The shipped backends answer `None` for a
-    /// key they cannot parse as one of their own — including a key some other
-    /// backend minted — for an object that is gone, and, for `Grammers`, for
-    /// a message that exists but carries no media. Callers cannot recover the
-    /// difference, so nothing else may be reported this way: a transient
-    /// failure, a refused permission, or a corrupt-but-present object belong
-    /// in `Err`. The layer resolves metadata before it calls, so it reads
-    /// `None` as bytes lost after they were promised and answers
-    /// `InternalError`, never `NoSuchKey`.
+    /// The three-way answer is [`ReadOutcome`], and which variant an
+    /// implementation must return is fixed:
+    ///
+    /// - [`ReadOutcome::Present`] — an object is stored at the key. The
+    ///   reader is returned as-is.
+    /// - [`ReadOutcome::Missing`] — the key is one this backend minted and
+    ///   the object it named is gone. Nothing else.
+    /// - [`ReadOutcome::Fault`] — the key is not one this backend can
+    ///   address (it cannot be parsed as one of its own, including a key
+    ///   minted by another backend), or the record it resolves to exists but
+    ///   carries no payload.
+    ///
+    /// What an implementor must never do is report a fault as an absence: a
+    /// corrupt or unrecognizable key, and an object that is present but
+    /// unreadable, are both [`ReadOutcome::Fault`]. Answering `Missing`
+    /// instead tells the operator the user deleted the object when the truth
+    /// is that the backend cannot serve it. Neither may be reported as
+    /// `Err` either — `Err` means *this call* failed (a transient fault, a
+    /// refused permission, an I/O error) and is a different claim from "this
+    /// object is broken".
+    ///
+    /// Note that [`ReadOutcome::Missing`] says nothing about what the S3
+    /// layer answers with it: the layer resolves metadata before it calls, so
+    /// a `Missing` on a key whose metadata promised bytes means bytes were
+    /// lost, and reaches the client as `InternalError`, never `NoSuchKey`.
     ///
     /// The returned reader is lazy: bytes are fetched as it is polled, so
-    /// `Ok(Some(_))` promises a stream, not content. A failure after the
+    /// [`ReadOutcome::Present`] promises a stream, not content. A failure after the
     /// response headers are already sent surfaces as an `std::io::Error`
     /// from the reader and reaches the client as a truncated body, which is
     /// why an implementation must propagate such an error instead of
@@ -127,21 +182,30 @@ pub trait Backend: Send + Sync + 'static {
         key: String,
         offset: u64,
         limit: Option<u64>,
-    ) -> Result<Option<BoxedAsyncReader>, BackendError>;
+    ) -> Result<ReadOutcome, BackendError>;
 
     /// Remove `key`, treating an already-absent key as success.
     ///
-    /// Idempotent by contract. Cleanup calls this from `DeleteObjects`, from
-    /// a publish that failed after the bytes were written, and from the
-    /// start-up reconciler — sometimes twice for one key, sometimes for a
-    /// key that is already gone. A backend that reported "not found" would
-    /// turn routine cleanup into a stream of logged errors and leave blob
-    /// rows behind forever, since the layer drops a row only on the answer it
-    /// confirmed.
+    /// The contract, stated in full because the callers depend on both
+    /// halves of it:
     ///
-    /// The converse obligation: `Ok(())` must mean the bytes are really
-    /// gone, because the bookkeeping row is deleted on that answer alone. An
-    /// object that outlives its `Ok` is unreachable through the S3 API and
-    /// nothing will ever retry it.
+    /// - **Idempotent.** Deleting a key that names nothing must succeed,
+    ///   every time. Cleanup calls this from `DeleteObjects`, from a publish
+    ///   that failed after the bytes were written, and from the start-up
+    ///   reconciler — sometimes twice for one key, sometimes for a key that
+    ///   is already gone. A backend that reported "not found" would turn
+    ///   routine cleanup into a stream of logged errors and leave blob rows
+    ///   behind forever, since the layer drops a row only on the answer it
+    ///   confirmed. A key this backend cannot parse is nothing it ever
+    ///   wrote, so it is absent by construction and deleting it succeeds —
+    ///   unlike [`Backend::read`], where the same key is a fault.
+    /// - **`Ok(())` means gone.** The bytes must really be gone, because
+    ///   the bookkeeping row is deleted on that answer alone. An object that
+    ///   outlives its `Ok` is unreachable through the S3 API and nothing will
+    ///   ever retry it.
+    ///
+    /// `Err` is reserved for the removal itself failing — a transport error,
+    /// a rate limit, a refusal. It must never be returned merely because the
+    /// key was already absent.
     async fn delete(&self, key: String) -> Result<(), BackendError>;
 }

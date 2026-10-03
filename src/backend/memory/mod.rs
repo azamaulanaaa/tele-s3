@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, RwLock};
 
-use super::{Backend, BackendError, BoxedAsyncReader};
+use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome};
 
 struct ObjectReader<const M: usize> {
     object: Arc<RwLock<Object<M>>>,
@@ -181,29 +181,40 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         key: String,
         offset: u64,
         limit: Option<u64>,
-    ) -> Result<Option<BoxedAsyncReader>, BackendError> {
+    ) -> Result<ReadOutcome, BackendError> {
         let offset = offset as usize;
         let limit = limit.map(|v| v as usize);
 
         let table = self.table.read().await;
 
+        // A key this backend cannot parse as one of its own names nothing it
+        // ever wrote, so the object is not absent — it is unreadable. Same
+        // rule `Grammers` applies, and deliberately opposite to `delete`,
+        // where an unparseable key is an absent key by construction.
         let key = match key.parse::<u128>() {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                return Ok(ReadOutcome::Fault(BackendError::InvariantViolation {
+                    detail: "key is not a key this backend minted",
+                }));
+            }
         };
 
         let object = match table.get(&key) {
             Some(v) => v.clone(),
-            None => return Ok(None),
+            None => return Ok(ReadOutcome::Missing),
         };
 
         let reader = ObjectReader::new(object, offset, limit);
         let boxpinreader = Box::pin(reader);
 
-        Ok(Some(boxpinreader))
+        Ok(ReadOutcome::Present(boxpinreader))
     }
 
     async fn delete(&self, key: String) -> Result<(), BackendError> {
+        // Idempotent by contract: a key that names nothing — including one
+        // this backend cannot parse, which names nothing it ever wrote — is
+        // deleted successfully.
         let key = match key.parse::<u128>() {
             Ok(v) => v,
             Err(_) => return Ok(()),
@@ -242,16 +253,54 @@ mod tests {
     use anyhow::anyhow;
     use futures::io::Cursor;
 
+    /// Assert that a `read` found the object and hand back its reader.
+    fn present(outcome: ReadOutcome) -> anyhow::Result<BoxedAsyncReader> {
+        match outcome {
+            ReadOutcome::Present(reader) => Ok(reader),
+            other => Err(anyhow!("expected a present object, got {other:?}")),
+        }
+    }
+
     #[tokio::test]
     async fn test_read_non_existing() -> anyhow::Result<()> {
         let backend = Memory::<1, 1>::default();
 
-        let key = "key".to_string();
+        // A well-formed key that was never written: genuinely missing, as
+        // opposed to a key this backend cannot address at all.
+        let key = u128::MAX.to_string();
         let result = backend.read(key, 0, None).await;
 
-        if !result.is_ok_and(|v| v.is_none()) {
-            return Err(anyhow!("should not be able to read non existing object"));
+        if !result.is_ok_and(|v| matches!(v, ReadOutcome::Missing)) {
+            return Err(anyhow!("should report an absent key as missing"));
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_key_is_a_fault_and_not_an_absence() -> anyhow::Result<()> {
+        let backend = Memory::<1, 1>::default();
+
+        let result = backend.read("key".to_string(), 0, None).await;
+
+        match result {
+            Ok(ReadOutcome::Fault(BackendError::InvariantViolation { detail })) => {
+                assert_eq!(detail, "key is not a key this backend minted");
+                Ok(())
+            }
+            other => Err(anyhow!("expected a fault, got {other:?}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_of_an_absent_key_succeeds() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+
+        // Never written, and twice, plus once under a key this backend
+        // cannot parse: the idempotency contract covers all of them.
+        backend.delete(u128::MAX.to_string()).await?;
+        backend.delete(u128::MAX.to_string()).await?;
+        backend.delete("key".to_string()).await?;
 
         Ok(())
     }
@@ -285,11 +334,7 @@ mod tests {
 
         let key = backend.write(content.len() as u64, content_reader).await?;
 
-        let mut reader = backend
-            .read(key, 0, None)
-            .await?
-            .expect("key should be exist after write");
-
+        let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
 
@@ -307,11 +352,7 @@ mod tests {
 
         let key = backend.write(content.len() as u64, content_reader).await?;
 
-        let mut reader = backend
-            .read(key, 1, None)
-            .await?
-            .expect("key should be exist after write");
-
+        let mut reader = present(backend.read(key, 1, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
 
@@ -329,11 +370,7 @@ mod tests {
 
         let key = backend.write(content.len() as u64, content_reader).await?;
 
-        let mut reader = backend
-            .read(key, 2, Some(5))
-            .await?
-            .expect("key should be exist after write");
-
+        let mut reader = present(backend.read(key, 2, Some(5)).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
 
@@ -351,11 +388,7 @@ mod tests {
 
         let key = backend.write(content.len() as u64, content_reader).await?;
 
-        let mut reader = backend
-            .read(key, 5, Some(3))
-            .await?
-            .expect("key should be exist after write");
-
+        let mut reader = present(backend.read(key, 5, Some(3)).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
 
@@ -373,11 +406,7 @@ mod tests {
 
         let key = backend.write(0, content_reader).await?;
 
-        let mut reader = backend
-            .read(key, 0, None)
-            .await?
-            .expect("key should be exist after write");
-
+        let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
 
@@ -437,8 +466,8 @@ mod tests {
 
         let result = backend.read(key, 0, None).await;
 
-        if !result.is_ok_and(|v| v.is_none()) {
-            return Err(anyhow!("should not be able to read non existing object"));
+        if !result.is_ok_and(|v| matches!(v, ReadOutcome::Missing)) {
+            return Err(anyhow!("should report a deleted key as missing"));
         }
 
         Ok(())
