@@ -36,10 +36,21 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 # `opentelemetry-otlp` is built with the HTTP/protobuf transport only: the
 # gRPC client would drag in a tonic/prost server stack for no benefit here.
 tracing-opentelemetry = "0.34"
-opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry = { version = "0.33", default-features = false, features = [
+    "trace",
+    "metrics",
+] }
+# `metrics` is requested explicitly rather than inherited from
+# `opentelemetry-otlp/http-proto`, which happens to enable it today. Relying on
+# another crate's feature choice couples this crate's build to a transport
+# detail that can change silently.
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "trace",
+    "metrics",
+] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
+    "metrics",
     "http-proto",
     "reqwest-client",
     "reqwest-rustls",

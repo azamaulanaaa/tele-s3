@@ -26,6 +26,11 @@ use tokio_util::{
 };
 use tracing::{instrument, warn};
 
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Histogram, Meter},
+};
+
 use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, ReclaimOutcome};
 
 mod session;
@@ -96,6 +101,157 @@ pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Attempts per retry loop, the first try included.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
+
+/// Scope every instrument below is registered under.
+///
+/// The same string as `SERVICE_NAME` in `main.rs`, which is what this crate's
+/// traces are scoped under. The constant cannot literally be shared: `main.rs`
+/// is the binary and this is the library, and a metric recorded under a
+/// different scope than its trace would not join up in a collector.
+const TELEMETRY_SCOPE: &str = "tele-s3";
+
+/// Rate limits this process hit, by Telegram's error name and by our own
+/// operation. A count is the number an operator can put next to the
+/// concurrency and timeout settings; the split by name is what separates an
+/// ordinary `FLOOD_WAIT` from a `FLOOD_PREMIUM_WAIT`, which is a different
+/// problem with a different fix.
+const FLOOD_LIMIT_COUNTER: &str = "tele_s3.telegram.flood_limits";
+
+/// How long each rate-limit window actually slept, in seconds.
+///
+/// The distribution, not the count: a single mean tells an operator nothing
+/// about whether the retry budget can absorb the waits Telegram is asking for.
+const FLOOD_WAIT_HISTOGRAM: &str = "tele_s3.telegram.flood_wait_duration";
+
+/// Outbound Telegram RPCs, by operation and outcome.
+const RPC_CALL_COUNTER: &str = "tele_s3.telegram.rpc_calls";
+
+/// Outbound Telegram RPC latency in seconds, by operation.
+const RPC_DURATION_HISTOGRAM: &str = "tele_s3.telegram.rpc_duration";
+
+/// How one outbound Telegram RPC ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcOutcome {
+    /// The server answered.
+    Ok,
+    /// The server answered with an error.
+    RpcError,
+    /// The request never got an answer inside the deadline.
+    Timeout,
+}
+
+impl RpcOutcome {
+    /// The wire value of an outcome attribute: a closed vocabulary, so a
+    /// collector can group on it without parsing prose.
+    fn as_str(self) -> &'static str {
+        match self {
+            RpcOutcome::Ok => "ok",
+            RpcOutcome::RpcError => "rpc_error",
+            RpcOutcome::Timeout => "timeout",
+        }
+    }
+}
+
+/// Attributes every rate-limit hit is recorded under.
+///
+/// Pure, so the vocabulary an operator queries by is testable without a meter,
+/// a reader or a collector behind it.
+fn flood_limit_attributes(telegram_error: &str, operation: &str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("telegram_error", telegram_error.to_owned()),
+        KeyValue::new("operation", operation.to_owned()),
+    ]
+}
+
+/// Attributes every rate-limit wait is recorded under.
+///
+/// The wait is attributed to the operation that had to sit through it and to
+/// the peer it was addressed to — the two facts that make a process-wide
+/// guard diagnosable — rather than to whichever request happened to hold the
+/// window open, which the guard deliberately does not remember.
+fn flood_wait_attributes(operation: &str, peer: &str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("operation", operation.to_owned()),
+        KeyValue::new("peer", peer.to_owned()),
+    ]
+}
+
+/// Attributes every outbound RPC is recorded under.
+fn rpc_attributes(operation: &str, outcome: RpcOutcome) -> [KeyValue; 2] {
+    [
+        KeyValue::new("operation", operation.to_owned()),
+        KeyValue::new("outcome", outcome.as_str()),
+    ]
+}
+
+/// The instruments this crate records through.
+///
+/// Built from the process-wide meter, which is a no-op meter until
+/// `main.rs` installs a meter provider — and it installs one only when an
+/// OTLP endpoint is configured. So the default, self-hosted deployment
+/// records nothing, exports nothing and starts no thread, and the calls below
+/// cost a no-op dispatch rather than an aggregation.
+#[derive(Clone)]
+struct TelegramMetrics {
+    flood_limits: Counter<u64>,
+    flood_wait_duration: Histogram<f64>,
+    rpc_calls: Counter<u64>,
+    rpc_duration: Histogram<f64>,
+}
+
+impl TelegramMetrics {
+    /// Build the instruments on `meter`.
+    fn from_meter(meter: &Meter) -> Self {
+        Self {
+            flood_limits: meter
+                .u64_counter(FLOOD_LIMIT_COUNTER)
+                .with_description("Telegram rate limits hit, by error name and operation")
+                .with_unit("{limit}")
+                .build(),
+            flood_wait_duration: meter
+                .f64_histogram(FLOOD_WAIT_HISTOGRAM)
+                .with_description("Seconds slept off a Telegram rate-limit window")
+                .with_unit("s")
+                .build(),
+            rpc_calls: meter
+                .u64_counter(RPC_CALL_COUNTER)
+                .with_description("Outbound Telegram RPCs, by operation and outcome")
+                .with_unit("{call}")
+                .build(),
+            rpc_duration: meter
+                .f64_histogram(RPC_DURATION_HISTOGRAM)
+                .with_description("Outbound Telegram RPC latency in seconds")
+                .with_unit("s")
+                .build(),
+        }
+    }
+
+    /// The process-wide instruments.
+    fn global() -> Self {
+        Self::from_meter(&opentelemetry::global::meter(TELEMETRY_SCOPE))
+    }
+
+    /// One rate limit was hit, whatever it turned into afterwards.
+    fn record_flood(&self, telegram_error: &str, operation: &str) {
+        self.flood_limits
+            .add(1, &flood_limit_attributes(telegram_error, operation));
+    }
+
+    /// One rate-limit window was slept off in full.
+    fn record_flood_wait(&self, operation: &str, peer: &str, elapsed: Duration) {
+        self.flood_wait_duration.record(
+            elapsed.as_secs_f64(),
+            &flood_wait_attributes(operation, peer),
+        );
+    }
+
+    /// One outbound Telegram RPC ended.
+    fn record_rpc(&self, operation: &str, outcome: RpcOutcome, elapsed: Duration) {
+        self.rpc_calls.add(1, &rpc_attributes(operation, outcome));
+        self.rpc_duration
+            .record(elapsed.as_secs_f64(), &rpc_attributes(operation, outcome));
+    }
+}
 
 type BoxedStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
@@ -176,6 +332,7 @@ pub struct Grammers {
     /// many callers the layer above fans out.
     inflight: Arc<Semaphore>,
     limits: GrammersLimits,
+    metrics: TelegramMetrics,
 }
 
 /// What a failed Telegram RPC means for the calling retry loop.
@@ -489,6 +646,55 @@ impl From<KeyFault> for ReadOutcome {
     }
 }
 
+/// The event a Telegram rate limit produces when it asked for a wait.
+///
+/// `telegram_error` is Telegram's own name for the failure — `FLOOD_WAIT_5`,
+/// `FLOOD_PREMIUM_WAIT_X` — and it is deliberately *not* `operation`:
+/// `operation` names which of ours was in flight, and overloading the two
+/// makes the query "was this a FLOOD_PREMIUM, or a write that got blocked?"
+/// unanswerable.
+///
+/// Pure, so the event's shape is testable without a `Grammers`, a client or a
+/// Telegram session behind it.
+fn log_flood_hit(operation: &str, peer: &str, telegram_error: &str, code: i32, wait: Duration) {
+    tracing::warn!(
+        operation,
+        telegram_error,
+        rpc_error_code = code,
+        peer,
+        duration_ms = wait.as_millis() as u64,
+        "hit a Telegram rate limit; blocking every outbound request for that window"
+    );
+}
+
+/// The event a Telegram rate limit produces when it named no wait at all.
+///
+/// The anomalous case: the server refused the request and would not say for
+/// how long, so there is nothing to sleep off and nothing to retry into. It
+/// used to produce no event at all, which left the operator with only the
+/// genericised `BackendError::Other` a caller sees.
+fn log_flood_without_duration(operation: &str, peer: &str, telegram_error: &str, code: i32) {
+    tracing::warn!(
+        operation,
+        telegram_error,
+        rpc_error_code = code,
+        peer,
+        error.type = "flood_without_duration",
+        "hit a Telegram rate limit that named no wait window; the request cannot be retried"
+    );
+}
+
+/// The event a flood-guard wait produces, inside [`Grammers::sleep_off_flood`]'s
+/// span.
+fn log_flood_wait(operation: &str, peer: &str, waited: Duration) {
+    tracing::warn!(
+        operation,
+        peer,
+        duration_ms = waited.as_millis() as u64,
+        "flood guard active; sleeping for the remaining rate-limit window"
+    );
+}
+
 /// The flood guard's mutex is poisoned, so its bookkeeping is of unknown
 /// consistency for the life of the process.
 ///
@@ -692,7 +898,19 @@ impl Grammers {
             flood_guard: Default::default(),
             inflight: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
             limits,
+            metrics: TelegramMetrics::global(),
         })
+    }
+
+    /// The chat every request this backend makes is addressed to, as
+    /// Telegram's own dialog id.
+    ///
+    /// The flood guard is one process-wide mutex, so a rate limit one request
+    /// draws holds up every *other* request too. That is what makes the peer
+    /// worth naming on a flood: an operator reading one chat's rate limit has
+    /// to be able to tell which chat drew it.
+    fn peer_name(&self) -> String {
+        self.peer.id.to_string()
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -700,7 +918,29 @@ impl Grammers {
         self.sender_pool_handle.quit();
     }
 
-    async fn check_flood_wait(&self) -> Result<(), BackendError> {
+    /// Sleep off whatever the flood guard is holding, and say so in its own
+    /// span.
+    ///
+    /// The span is the point: a wait is a thing that happened, with a
+    /// duration, and an operator tuning the concurrency and timeout knobs
+    /// needs to find one wait and read it rather than infer it from an event
+    /// riding whichever request span happened to be current.
+    #[instrument(
+        name = "telegram.flood_wait",
+        skip(self, peer),
+        fields(operation = operation, peer = %peer, duration_ms = duration.as_millis() as u64)
+    )]
+    async fn sleep_off_flood(&self, operation: &str, peer: &str, duration: Duration) {
+        self.metrics.record_flood_wait(operation, peer, duration);
+        log_flood_wait(operation, peer, duration);
+        tokio::time::sleep(duration).await;
+    }
+
+    /// Sleep off the remaining rate-limit window, if one is still in force.
+    ///
+    /// `operation` is the operation about to go out — the one that has to sit
+    /// through whatever window another request opened.
+    async fn check_flood_wait(&self, operation: &str) -> Result<(), BackendError> {
         let wait_time = {
             let guard = self
                 .flood_guard
@@ -716,11 +956,8 @@ impl Grammers {
         };
 
         if let Some(duration) = wait_time {
-            tracing::warn!(
-                duration_ms = duration.as_millis() as u64,
-                "flood guard active; sleeping for the remaining rate-limit window"
-            );
-            tokio::time::sleep(duration).await;
+            self.sleep_off_flood(operation, &self.peer_name(), duration)
+                .await;
 
             let mut guard = self
                 .flood_guard
@@ -732,10 +969,22 @@ impl Grammers {
         Ok(())
     }
 
-    async fn catch_flood_error(&self, err: &InvocationError) -> Result<bool, BackendError> {
+    /// Turn a server error into a retry decision, recording whatever it was.
+    ///
+    /// `operation` is the operation that was in flight when the server
+    /// answered, which is the fact that makes the process-wide guard
+    /// diagnosable: the same 420 means something quite different depending on
+    /// which request drew it.
+    async fn catch_flood_error(
+        &self,
+        err: &InvocationError,
+        operation: &str,
+    ) -> Result<bool, BackendError> {
         let InvocationError::Rpc(rpc_err) = err else {
             return Ok(false);
         };
+
+        let peer = self.peer_name();
 
         match classify_rpc_error(rpc_err.code, &rpc_err.name, rpc_err.value) {
             RpcFailure::FloodWait(duration) => {
@@ -747,17 +996,24 @@ impl Grammers {
                     *guard = Some(Instant::now() + duration);
                 }
 
-                tracing::warn!(
-                    operation = rpc_err.name,
-                    duration_ms = duration.as_millis() as u64,
-                    "hit a Telegram rate limit; blocking every outbound request for that window"
-                );
+                self.metrics.record_flood(&rpc_err.name, operation);
+                log_flood_hit(operation, &peer, &rpc_err.name, rpc_err.code, duration);
 
                 Ok(true)
             }
-            RpcFailure::FloodWithoutDuration { name } => Err(BackendError::Other(
-                format!("{name} without duration").into(),
-            )),
+            RpcFailure::FloodWithoutDuration { name } => {
+                // A rate limit the server would not put a duration on. This is
+                // the anomalous case and the one most worth seeing, and it used
+                // to produce no event at all: it became a `BackendError::Other`
+                // whose wording is genericised away before a client ever sees
+                // it. The request still fails exactly as it did.
+                self.metrics.record_flood(&name, operation);
+                log_flood_without_duration(operation, &peer, &name, rpc_err.code);
+
+                Err(BackendError::Other(
+                    format!("{name} without duration").into(),
+                ))
+            }
             RpcFailure::Fatal => Ok(false),
         }
     }
@@ -777,7 +1033,7 @@ impl Grammers {
     /// The deadline starts once the permit is held, so time spent queued
     /// behind other callers is never charged against a request that has not
     /// started yet.
-    async fn attempt<T, F>(&self, rpc: F) -> Result<T, AttemptError>
+    async fn attempt<T, F>(&self, operation: &str, rpc: F) -> Result<T, AttemptError>
     where
         F: Future<Output = Result<T, InvocationError>>,
     {
@@ -788,9 +1044,24 @@ impl Grammers {
             .await
             .expect("the concurrency limiter is never closed");
 
+        let started = Instant::now();
+
         match tokio::time::timeout(self.limits.io_timeout, rpc).await {
-            Ok(result) => result.map_err(|err| AttemptError::Rpc(Box::new(err))),
-            Err(_elapsed) => Err(AttemptError::Timeout(self.limits.io_timeout)),
+            Ok(Ok(value)) => {
+                self.metrics
+                    .record_rpc(operation, RpcOutcome::Ok, started.elapsed());
+                Ok(value)
+            }
+            Ok(Err(err)) => {
+                self.metrics
+                    .record_rpc(operation, RpcOutcome::RpcError, started.elapsed());
+                Err(AttemptError::Rpc(Box::new(err)))
+            }
+            Err(_elapsed) => {
+                self.metrics
+                    .record_rpc(operation, RpcOutcome::Timeout, started.elapsed());
+                Err(AttemptError::Timeout(self.limits.io_timeout))
+            }
         }
     }
 
@@ -816,7 +1087,7 @@ impl Grammers {
         let mut attempt: u32 = 0;
 
         loop {
-            self.check_flood_wait().await?;
+            self.check_flood_wait("download_chunk").await?;
             attempt += 1;
 
             let mut download_iter = self
@@ -825,13 +1096,13 @@ impl Grammers {
                 .chunk_size(MAX_CHUNK_SIZE)
                 .skip_chunks(skip_chunks as i32);
 
-            let outcome = self.attempt(download_iter.next()).await;
+            let outcome = self.attempt("download_chunk", download_iter.next()).await;
 
             match outcome {
                 Ok(Some(chunk)) => return Ok(Some(chunk)),
                 Ok(None) => return Ok(None),
                 Err(AttemptError::Rpc(err)) => {
-                    if !self.catch_flood_error(&err).await? {
+                    if !self.catch_flood_error(&err, "download_chunk").await? {
                         return Err(AttemptError::Rpc(err).into_backend_error());
                     }
 
@@ -892,14 +1163,14 @@ impl Grammers {
             // Not `retry_rpc`: that takes a `FnMut` closure, and a future
             // borrowing `messages` cannot escape one. The bound is applied
             // through `attempt` instead, which is the same request path.
-            self.check_flood_wait().await?;
+            self.check_flood_wait("iter_messages").await?;
 
-            let message = match self.attempt(messages.next()).await {
+            let message = match self.attempt("iter_messages", messages.next()).await {
                 Ok(Some(message)) => message,
                 Ok(None) => return Ok(None),
                 Err(AttemptError::Timeout(timeout)) => {
                     warn!(
-                        operation = "get_messages_by_id",
+                        operation = "iter_messages",
                         timeout_ms = timeout.as_millis() as u64,
                         error.type = "timeout",
                         "Telegram history request exceeded its deadline"
@@ -934,7 +1205,11 @@ impl Grammers {
     /// window a 420 asked for is always slept off in full before the
     /// request goes back out. The loop is bounded: a request that keeps
     /// failing now fails its caller instead of pinning it indefinitely.
-    async fn retry_rpc<T, F, Fut>(&self, mut rpc: F) -> Result<T, BackendError>
+    async fn retry_rpc<T, F, Fut>(
+        &self,
+        operation: &'static str,
+        mut rpc: F,
+    ) -> Result<T, BackendError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, InvocationError>>,
@@ -942,13 +1217,14 @@ impl Grammers {
         let mut attempt: u32 = 0;
 
         loop {
-            self.check_flood_wait().await?;
+            self.check_flood_wait(operation).await?;
             attempt += 1;
 
-            let err = match self.attempt(rpc()).await {
+            let err = match self.attempt(operation, rpc()).await {
                 Ok(value) => return Ok(value),
                 Err(AttemptError::Timeout(timeout)) => {
                     warn!(
+                        operation,
                         timeout_ms = timeout.as_millis() as u64,
                         error.type = "timeout",
                         "Telegram request exceeded its deadline"
@@ -958,11 +1234,12 @@ impl Grammers {
                 Err(AttemptError::Rpc(err)) => err,
             };
 
-            if !self.catch_flood_error(&err).await? {
+            if !self.catch_flood_error(&err, operation).await? {
                 return Err(AttemptError::Rpc(err).into_backend_error());
             }
 
             tracing::debug!(
+                operation,
                 attempts = attempt,
                 error.type = "rpc",
                 error.message = %err,
@@ -973,6 +1250,7 @@ impl Grammers {
                 Attempt::Retry => {}
                 Attempt::Exhausted { attempts } => {
                     warn!(
+                        operation,
                         attempts,
                         error.type = "rpc",
                         error.message = %err,
@@ -1001,14 +1279,17 @@ impl Grammers {
         loop {
             // Local fault: nothing has been dispatched, so nothing can have
             // been published.
-            self.check_flood_wait()
+            self.check_flood_wait("publish_message")
                 .await
                 .map_err(PublishFault::NotDispatched)?;
 
             attempt += 1;
 
             let err = match self
-                .attempt(self.client.send_message(self.peer, draft.clone()))
+                .attempt(
+                    "publish_message",
+                    self.client.send_message(self.peer, draft.clone()),
+                )
                 .await
             {
                 Ok(message) => return Ok(message),
@@ -1021,12 +1302,14 @@ impl Grammers {
             // may already have been created and MTProto has no idempotency key
             // for message creation, so re-sending would publish a duplicate.
             let retryable = match &err {
-                AttemptError::Rpc(err) => match self.catch_flood_error(err).await {
-                    Ok(retry) => retry,
-                    // A flood wait with no duration is still a rejection of
-                    // this request, so the failure keeps its own wording.
-                    Err(_) => return Err(PublishFault::Dispatched(failure)),
-                },
+                AttemptError::Rpc(err) => {
+                    match self.catch_flood_error(err, "publish_message").await {
+                        Ok(retry) => retry,
+                        // A flood wait with no duration is still a rejection of
+                        // this request, so the failure keeps its own wording.
+                        Err(_) => return Err(PublishFault::Dispatched(failure)),
+                    }
+                }
                 AttemptError::Timeout(timeout) => {
                     warn!(
                         operation = "publish_message",
@@ -1043,6 +1326,7 @@ impl Grammers {
             }
 
             tracing::debug!(
+                operation = "publish_message",
                 attempts = attempt,
                 error.type = "rpc",
                 error.message = ?failure,
@@ -1135,7 +1419,7 @@ impl Backend for Grammers {
         let name = publish_name(&publish_id).to_owned();
         let mut compat_reader = reader.compat();
 
-        self.check_flood_wait().await?;
+        self.check_flood_wait("write").await?;
 
         let plan = BodyPlan::for_size(size as usize);
         let total_parts = plan.total_parts;
@@ -1147,7 +1431,7 @@ impl Backend for Grammers {
                 // Retry the part through flood waits; re-uploading the same
                 // part index is idempotent on Telegram's side. Each attempt
                 // carries the same `file_id`/`file_part` and the same bytes.
-                self.retry_rpc(|| async {
+                self.retry_rpc("save_big_file_part", || async {
                     self.client
                         .invoke(&SaveBigFilePart {
                             file_id,
@@ -1224,7 +1508,7 @@ impl Backend for Grammers {
         // an RPC error; honor it, update the shared guard, and retry so a
         // read doesn't fail just because another operation tripped the limit.
         let media = self
-            .retry_rpc(|| async {
+            .retry_rpc("get_messages_by_id", || async {
                 self.client
                     .get_messages_by_id(self.peer, &[message_id])
                     .await
@@ -1324,7 +1608,7 @@ impl Backend for Grammers {
         // Deleting a message that is already gone succeeds server-side, so
         // every attempt carries the same request and the loop stays bounded
         // by the attempt budget.
-        self.retry_rpc(|| async {
+        self.retry_rpc("delete_messages", || async {
             self.client
                 .delete_messages(self.peer, &[message_id])
                 .await
@@ -2015,5 +2299,183 @@ mod body_contract {
             .expect_err("an over-long body must fail");
 
         assert!(matches!(err, BackendError::Other(_)), "{err:?}");
+    }
+}
+
+/// Rate-limit observability: the events a flood produces, and the attributes
+/// the instruments are recorded under.
+///
+/// The flood guard is process-wide, so an operator tuning
+/// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS` and
+/// `TELE_S3_MAX_ATTEMPTS` needs to know *which* request drew a 420, *what*
+/// Telegram called it and *which chat* it came from. Before this module those
+/// three facts were either absent or folded into `operation`, and a rate
+/// limit that named no wait produced no event at all.
+#[cfg(test)]
+mod flood_telemetry {
+    use super::*;
+
+    /// A `FLOOD_PREMIUM_WAIT_600` answered with no wait value: the anomalous
+    /// case that used to vanish into a genericised `BackendError::Other`.
+    #[test]
+    fn a_rate_limit_without_a_wait_window_is_still_logged() {
+        let log = capture_log(|| {
+            log_flood_without_duration(
+                "publish_message",
+                "-1001234567890",
+                "FLOOD_PREMIUM_WAIT_X",
+                420,
+            );
+        });
+
+        assert!(log.contains("WARN"), "{log}");
+        assert!(
+            log.contains("telegram_error=\"FLOOD_PREMIUM_WAIT_X\""),
+            "{log}"
+        );
+        assert!(log.contains("rpc_error_code=420"), "{log}");
+        assert!(log.contains("peer=\"-1001234567890\""), "{log}");
+        assert!(log.contains("operation=\"publish_message\""), "{log}");
+    }
+
+    /// The Telegram error name gets its own field. A query has to be able to
+    /// tell "we were blocked while writing" from "Telegram replied
+    /// FLOOD_PREMIUM_WAIT", and it cannot if both land in `operation`.
+    #[test]
+    fn the_telegram_error_name_is_never_the_operation_field() {
+        let log = capture_log(|| {
+            log_flood_hit(
+                "download_chunk",
+                "-1001234567890",
+                "FLOOD_PREMIUM_WAIT_600",
+                420,
+                Duration::from_secs(601),
+            );
+        });
+
+        assert!(log.contains("operation=\"download_chunk\""), "{log}");
+        assert!(
+            log.contains("telegram_error=\"FLOOD_PREMIUM_WAIT_600\""),
+            "{log}"
+        );
+        assert!(
+            !log.contains("operation=\"FLOOD_PREMIUM_WAIT_600\""),
+            "the Telegram error name must not be overloaded onto operation: {log}"
+        );
+    }
+
+    /// Both names at once, which is the whole point: an operator reading one
+    /// event sees that a *download* was blocked *by a premium wait*, not that
+    /// some operation happened to be called `FLOOD_PREMIUM_WAIT_600`.
+    #[test]
+    fn a_flood_event_names_the_in_flight_operation_and_the_peer() {
+        let log = capture_log(|| {
+            log_flood_hit(
+                "write",
+                "-1009876543210",
+                "FLOOD_WAIT_30",
+                420,
+                Duration::from_secs(31),
+            );
+        });
+
+        assert!(log.contains("operation=\"write\""), "{log}");
+        assert!(log.contains("peer=\"-1009876543210\""), "{log}");
+        assert!(log.contains("telegram_error=\"FLOOD_WAIT_30\""), "{log}");
+        assert!(log.contains("duration_ms=31000"), "{log}");
+    }
+
+    /// The wait an operation sits through is reported as an operation plus a
+    /// peer, so a trace shows *what was blocked*, not merely that something
+    /// was.
+    #[test]
+    fn a_flood_wait_names_what_it_delayed() {
+        let log = capture_log(|| {
+            log_flood_wait("delete_messages", "-1001234567890", Duration::from_secs(30));
+        });
+
+        assert!(log.contains("operation=\"delete_messages\""), "{log}");
+        assert!(log.contains("peer=\"-1001234567890\""), "{log}");
+        assert!(log.contains("duration_ms=30000"), "{log}");
+    }
+
+    /// The metric attribute sets, asserted directly. These are the names an
+    /// operator's collector binds to, so a rename here is a breaking change
+    /// and this test is what makes it a deliberate one.
+    #[test]
+    fn the_flood_counter_is_broken_down_by_error_name_and_operation() {
+        let ordinary = flood_limit_attributes("FLOOD_WAIT_30", "write");
+        let premium = flood_limit_attributes("FLOOD_PREMIUM_WAIT_600", "download_chunk");
+
+        assert_eq!(
+            ordinary[0],
+            KeyValue::new("telegram_error", "FLOOD_WAIT_30".to_owned())
+        );
+        assert_eq!(ordinary[1], KeyValue::new("operation", "write".to_owned()));
+
+        // A premium wait is a qualitatively different problem from an
+        // ordinary one, and the breakdown has to keep them apart.
+        assert_ne!(ordinary[0], premium[0]);
+        assert_ne!(ordinary[1], premium[1]);
+    }
+
+    #[test]
+    fn the_wait_histogram_is_broken_down_by_operation_and_peer() {
+        let attrs = flood_wait_attributes("delete_messages", "-1001234567890");
+
+        assert_eq!(
+            attrs[0],
+            KeyValue::new("operation", "delete_messages".to_owned())
+        );
+        assert_eq!(attrs[1], KeyValue::new("peer", "-1001234567890".to_owned()));
+    }
+
+    /// The RPC instruments are grouped by operation and outcome, so a
+    /// timeout on one operation cannot hide behind an `ok` on another.
+    #[test]
+    fn the_rpc_instruments_are_broken_down_by_operation_and_outcome() {
+        let ok = rpc_attributes("publish_message", RpcOutcome::Ok);
+        let timed_out = rpc_attributes("publish_message", RpcOutcome::Timeout);
+
+        assert_eq!(
+            ok[0],
+            KeyValue::new("operation", "publish_message".to_owned())
+        );
+        assert_eq!(ok[1], KeyValue::new("outcome", "ok".to_owned()));
+        assert_eq!(timed_out[1], KeyValue::new("outcome", "timeout".to_owned()));
+
+        // A closed vocabulary, so a collector can group on it.
+        assert_eq!(RpcOutcome::RpcError.as_str(), "rpc_error");
+    }
+
+    /// Instruments build on a plain meter, with no exporter, no reader and no
+    /// collector behind them — which is also what happens in a process with
+    /// telemetry configured off, where the meter is the no-op one.
+    #[test]
+    fn instruments_build_without_an_exporter() {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let noop = opentelemetry::metrics::NoopMeterProvider::new();
+        let metrics = TelegramMetrics::from_meter(&noop.meter(TELEMETRY_SCOPE));
+
+        // Recording through them is inert and must not panic: this is the path
+        // every request in a telemetry-less deployment takes.
+        metrics.record_flood("FLOOD_WAIT_30", "write");
+        metrics.record_flood_wait("write", "-1001234567890", Duration::from_secs(30));
+        metrics.record_rpc("write", RpcOutcome::Ok, Duration::from_millis(120));
+    }
+
+    /// Every instrument name is prefixed, so a shared collector cannot confuse
+    /// one of them with another library's.
+    #[test]
+    fn every_instrument_is_namespaced_to_this_crate() {
+        for name in [
+            FLOOD_LIMIT_COUNTER,
+            FLOOD_WAIT_HISTOGRAM,
+            RPC_CALL_COUNTER,
+            RPC_DURATION_HISTOGRAM,
+        ] {
+            assert!(name.starts_with("tele_s3."), "{name} is not namespaced");
+        }
     }
 }

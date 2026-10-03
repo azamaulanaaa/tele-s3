@@ -146,6 +146,7 @@ pub struct AdminState {
     limits: GrammersLimits,
     startup: StartupReport,
     trace_export: bool,
+    metrics_export: bool,
 }
 
 impl AdminState {
@@ -159,17 +160,27 @@ impl AdminState {
     /// a hostname in it — and this document is served unauthenticated. What
     /// an operator needs to know from a probe is whether spans are leaving
     /// the process at all.
+    ///
+    /// `metrics_export` answers the same question for the rate-limit and RPC
+    /// metrics, which is the pair an operator tuning
+    /// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS` and
+    /// `TELE_S3_MAX_ATTEMPTS` needs: without them they are tuning blind.
+    /// It tracks `trace_export` today — one endpoint turns both on — and is
+    /// published separately so a probe can tell which half of the pipeline a
+    /// future change left dark.
     pub fn new(
         listen_port: u16,
         limits: GrammersLimits,
         startup: StartupReport,
         trace_export: bool,
+        metrics_export: bool,
     ) -> Self {
         Self {
             listen_port,
             limits,
             startup,
             trace_export,
+            metrics_export,
         }
     }
 
@@ -232,6 +243,7 @@ impl AdminState {
             },
             "telemetry": {
                 "trace_export": self.trace_export,
+                "metrics_export": self.metrics_export,
             },
             "startup": self.startup_json(),
         }))
@@ -407,6 +419,7 @@ mod tests {
                 publish_intents: ReconcilerOutcome::Completed { affected: 0 },
             },
             true,
+            true,
         )
     }
 
@@ -468,7 +481,7 @@ mod tests {
                 publish_intents: ReconcilerOutcome::Failed,
             },
         ] {
-            let state = AdminState::new(8000, GrammersLimits::default(), report, false);
+            let state = AdminState::new(8000, GrammersLimits::default(), report, false, false);
             let response = state.liveness();
             assert_eq!(response.status, StatusCode::OK);
             // Nothing about the reconcilers reaches a liveness answer.
@@ -485,6 +498,7 @@ mod tests {
                 orphan_blobs: ReconcilerOutcome::Failed,
                 publish_intents: ReconcilerOutcome::Completed { affected: 7 },
             },
+            false,
             false,
         );
 
@@ -518,6 +532,7 @@ mod tests {
         assert_eq!(body["telegram"]["io_timeout_ms"], 30_000);
         assert_eq!(body["telegram"]["max_attempts"], 3);
         assert_eq!(body["telemetry"]["trace_export"], true);
+        assert_eq!(body["telemetry"]["metrics_export"], true);
         assert_eq!(
             body["startup"]["orphan_blob_reconciliation"],
             json!({ "outcome": "completed", "affected": 2 })
@@ -556,7 +571,7 @@ mod tests {
 
         let mut telemetry = keys(&body["telemetry"]);
         telemetry.sort_unstable();
-        assert_eq!(telemetry, ["trace_export"]);
+        assert_eq!(telemetry, ["metrics_export", "trace_export"]);
 
         let mut telegram = keys(&body["telegram"]);
         telegram.sort_unstable();

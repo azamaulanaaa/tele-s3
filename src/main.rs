@@ -10,9 +10,10 @@ use hyper_util::server::conn::auto::Builder;
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
+    metrics::{PeriodicReader, SdkMeterProvider},
     trace::{Sampler, SdkTracer, SdkTracerProvider},
 };
 
@@ -165,6 +166,13 @@ const TRACE_TRANSPORT: &str = "otlp_http_protobuf";
 /// Every trace is exported unless the operator says otherwise.
 const DEFAULT_SAMPLE_RATIO: f64 = 1.0;
 
+/// How often the meter provider pushes a collection to the collector.
+///
+/// Sixty seconds, the SDK's own default, stated here so the number is
+/// visible next to the interval operator reads in the exporter's own
+/// documentation.
+const METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// `error.type` for a telemetry setting that could not be read.
 const TELEMETRY_CONFIG_ERROR_TYPE: &str = "unparsable_telemetry_config";
 
@@ -295,6 +303,45 @@ impl TraceExport {
                 .build(),
         )
     }
+
+    /// Build the metric pipeline, or `None` if the exporter refuses.
+    ///
+    /// Same rule as [`TraceExport::build_pipeline`] and for the same reason:
+    /// an endpoint the exporter will not accept is a configuration error, not
+    /// a reason to refuse to serve S3. Metrics share the trace export
+    /// decision — one endpoint setting turns both on — so an operator never
+    /// has to work out which half of the pipeline is live.
+    fn build_meter_pipeline(&self) -> Option<SdkMeterProvider> {
+        let exporter = MetricExporter::builder()
+            .with_http()
+            .with_endpoint(self.endpoint.clone())
+            .build()
+            .inspect_err(|err| {
+                tracing::warn!(
+                    telemetry_endpoint = %self.endpoint,
+                    error.type = TELEMETRY_CONFIG_ERROR_TYPE,
+                    error.message = %err,
+                    "cannot build the OTLP metric exporter; continuing without metric export"
+                );
+            })
+            .ok()?;
+
+        // The reader wraps the exporter: it owns the interval and the worker
+        // thread the exporter itself does not have.
+        let reader = PeriodicReader::builder(exporter)
+            .with_interval(METRIC_EXPORT_INTERVAL)
+            .build();
+
+        Some(
+            SdkMeterProvider::builder()
+                .with_resource(self.resource())
+                // Periodic, like the trace pipeline: an operator tuning rate
+                // limits wants a distribution over minutes, not a synchronous
+                // HTTP round trip on the request path.
+                .with_reader(reader)
+                .build(),
+        )
+    }
 }
 
 /// Install the process-wide `tracing` subscriber.
@@ -365,7 +412,10 @@ impl TraceExport {
 /// | --- | --- |
 /// | `error.type` | Stable, machine-readable classification of the failure. Never changes meaning. |
 /// | `error.message` | Human-readable rendering of the error. |
-/// | `operation` | The Telegram RPC or S3 operation a failure belongs to. |
+/// | `operation` | The Telegram RPC or S3 operation a failure belongs to. Never the Telegram error name. |
+/// | `telegram_error` | Telegram's own name for a rate limit: `FLOOD_WAIT_X`, `FLOOD_PREMIUM_WAIT_X`, .... |
+/// | `rpc_error_code` | The integer RPC error code Telegram replied with (`420` for every rate limit). |
+/// | `peer` | Telegram dialog id the request was addressed to. |
 /// | `outcome` | Classification of a state a message may or may not be in. |
 /// | `lock` | Name of the poisoned mutex. |
 /// | `env_var` / `value` | An environment override and the raw text it was set to. |
@@ -378,28 +428,121 @@ impl TraceExport {
 /// They are also the OTLP span attributes. The [`tracing-opentelemetry`]
 /// layer binds to these same names, so a field is spelled once for both a log
 /// line and a trace.
-fn init_tracing() -> Option<SdkTracerProvider> {
+///
+/// # Metric vocabulary
+///
+/// The same names are the attributes on the metrics below, so one query
+/// joins a log line and a data point. The span `telegram.flood_wait` is the
+/// one span added for this vocabulary: it exists so an individual
+/// rate-limit wait is navigable with its own duration.
+///
+/// | Instrument | Kind | Unit | Attributes |
+/// | --- | --- | --- | --- |
+/// | `tele_s3.telegram.flood_limits` | counter | `{limit}` | `telegram_error`, `operation` |
+/// | `tele_s3.telegram.flood_wait_duration` | histogram | `s` | `operation`, `peer` |
+/// | `tele_s3.telegram.rpc_calls` | counter | `{call}` | `operation`, `outcome` |
+/// | `tele_s3.telegram.rpc_duration` | histogram | `s` | `operation`, `outcome` |
+///
+/// `outcome` is a closed set on the RPC instruments: `ok`, `rpc_error`,
+/// `timeout`. All four are named with the `tele_s3.` prefix, so they cannot
+/// collide with another library's metrics in a shared collector.
+///
+/// Metrics and traces are one decision: no endpoint means no meter provider,
+/// no periodic reader and no background thread, exactly as it means no
+/// tracer provider. Everything the crate records goes through the
+/// process-wide meter, so a later scope adds instruments without a second
+/// configuration surface.
+fn init_tracing() -> Telemetry {
     let format = LogFormat::from_env();
 
     let Some(settings) = TraceExport::from_env() else {
         init_log_subscriber(format);
-        return None;
+        return Telemetry::default();
     };
+
+    // The metric half is built from the same settings, so there is no
+    // configuration in which traces are leaving the process and metrics are
+    // not, or the reverse.
+    let metrics = settings.build_meter_pipeline();
 
     let Some(provider) = settings.build_pipeline() else {
         init_log_subscriber(format);
-        return None;
+        return Telemetry {
+            metrics,
+            ..Default::default()
+        };
     };
 
     tracing::info!(
         telemetry_endpoint = %settings.endpoint,
         transport = TRACE_TRANSPORT,
-        "exporting traces over OTLP"
+        "exporting traces and metrics over OTLP"
     );
 
     init_otel_subscriber(format, provider.tracer(SERVICE_NAME));
 
-    Some(provider)
+    // Set globally rather than threaded through every constructor: the
+    // backend resolves its instruments once at start-up, and the S3 and
+    // reconciler layers a later scope adds will do the same.
+    if let Some(metrics) = &metrics {
+        opentelemetry::global::set_meter_provider(metrics.clone());
+    }
+
+    Telemetry {
+        traces: Some(provider),
+        metrics,
+    }
+}
+
+/// The telemetry pipelines this process owns.
+///
+/// Either half is absent when telemetry is off, which is the default. An
+/// absent provider is not a stub: nothing was constructed for it, so nothing
+/// runs in the background and nothing is flushed on exit.
+#[derive(Default)]
+struct Telemetry {
+    traces: Option<SdkTracerProvider>,
+    metrics: Option<SdkMeterProvider>,
+}
+
+impl Telemetry {
+    /// Whether spans are leaving this process.
+    fn trace_export(&self) -> bool {
+        self.traces.is_some()
+    }
+
+    /// Whether metrics are leaving this process.
+    fn metrics_export(&self) -> bool {
+        self.metrics.is_some()
+    }
+
+    /// Drain both pipelines and stop their workers.
+    ///
+    /// Both halves are attempted even if the first fails: draining the queue
+    /// is what saves the data, and stopping the thread is what lets the
+    /// process exit rather than wait on a socket that is never going to
+    /// answer.
+    fn flush(&self) {
+        if let Some(traces) = &self.traces
+            && let Err(err) = traces.force_flush().and(traces.shutdown())
+        {
+            tracing::warn!(
+                error.type = TELEMETRY_EXPORT_ERROR_TYPE,
+                error.message = %err,
+                "could not flush traces on shutdown"
+            );
+        }
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.force_flush().and(metrics.shutdown())
+        {
+            tracing::warn!(
+                error.type = TELEMETRY_EXPORT_ERROR_TYPE,
+                error.message = %err,
+                "could not flush metrics on shutdown"
+            );
+        }
+    }
 }
 
 /// `RUST_LOG`, or the crate's own default when it is unset or unreadable.
@@ -462,26 +605,6 @@ fn init_otel_subscriber(format: LogFormat, tracer: SdkTracer) {
                 .with_filter(env_filter()),
         )
         .init();
-}
-
-/// Flush in-flight spans and stop the exporter's worker thread.
-///
-/// Called on the graceful-exit path, and a no-op when export is off. Both
-/// halves are attempted even if the first fails: draining the queue is what
-/// saves the spans, and stopping the thread is what lets the process exit
-/// rather than wait on a socket that is never going to answer.
-fn flush_traces(provider: Option<&SdkTracerProvider>) {
-    let Some(provider) = provider else {
-        return;
-    };
-
-    if let Err(err) = provider.force_flush().and(provider.shutdown()) {
-        tracing::warn!(
-            error.type = TELEMETRY_EXPORT_ERROR_TYPE,
-            error.message = %err,
-            "could not flush traces on shutdown"
-        );
-    }
 }
 
 #[tokio::main]
@@ -580,7 +703,8 @@ async fn main() -> anyhow::Result<()> {
             config.listen_port,
             limits,
             startup,
-            telemetry.is_some(),
+            telemetry.trace_export(),
+            telemetry.metrics_export(),
         )));
 
         builder.build()
@@ -627,7 +751,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Before the closing log lines, not after: the spans those lines open are
     // the ones most likely to be sitting in the batch queue.
-    flush_traces(telemetry.as_ref());
+    telemetry.flush();
 
     db.close().await?;
     grammers.close();
@@ -679,6 +803,7 @@ mod tests {
                 orphan_blobs: ReconcilerOutcome::Failed,
                 publish_intents: ReconcilerOutcome::Failed,
             },
+            true,
             true,
         );
 
@@ -751,8 +876,12 @@ mod tests {
         assert_eq!(TraceExport::endpoint_from(None, Some("")), None);
 
         // The graceful-exit path is reached with no provider at all, and is a
-        // no-op rather than a panic.
-        flush_traces(None);
+        // no-op rather than a panic. Neither half was ever built: the
+        // decision to build them lives in the `from_env` above.
+        let telemetry = Telemetry::default();
+        assert!(!telemetry.trace_export());
+        assert!(!telemetry.metrics_export());
+        telemetry.flush();
     }
 
     /// The crate's own variable works standalone; the standard one is honoured
@@ -785,7 +914,8 @@ mod tests {
 
     /// A configured endpoint is enough to build the pipeline. Nothing is
     /// exported and nothing is sent: the batching processor owns a queue and
-    /// only talks to the collector when a span arrives, so this needs no
+    /// only talks to the collector when a span arrives, and the periodic
+    /// reader only collects when an instrument records, so this needs no
     /// collector and no network.
     #[test]
     fn a_configured_endpoint_initialises_the_pipeline() {
@@ -797,10 +927,18 @@ mod tests {
         let provider = settings
             .build_pipeline()
             .expect("a well-formed endpoint builds an exporter");
+        let meter = settings
+            .build_meter_pipeline()
+            .expect("a well-formed endpoint builds a metric exporter");
 
-        // And shutting it down is a no-op, not a panic: this is the graceful
-        // exit path, and it must survive an endpoint nobody is listening on.
-        flush_traces(Some(&provider));
+        // And shutting both down is a no-op, not a panic: this is the
+        // graceful exit path, and it must survive an endpoint nobody is
+        // listening on.
+        Telemetry {
+            traces: Some(provider),
+            metrics: Some(meter),
+        }
+        .flush();
     }
 
     /// Telemetry must never take the server down. A collector that is not
@@ -809,8 +947,8 @@ mod tests {
     /// port nothing is listening on.
     ///
     /// The export attempt fails on the exporter's own worker thread and is
-    /// reported to [`flush_traces`], which logs it and returns. No panic, and
-    /// no error handed back to the caller that is trying to shut down.
+    /// reported to [`Telemetry::flush`], which logs it and returns. No panic,
+    /// and no error handed back to the caller that is trying to shut down.
     #[test]
     fn an_unreachable_collector_cannot_break_shutdown() {
         let settings = TraceExport {
@@ -824,7 +962,11 @@ mod tests {
             "the exporter is built regardless; delivery is the background thread's problem",
         );
 
-        flush_traces(Some(&provider));
+        Telemetry {
+            traces: Some(provider),
+            metrics: settings.build_meter_pipeline(),
+        }
+        .flush();
     }
 
     /// The resource is what tells a collector which service a trace belongs
