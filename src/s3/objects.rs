@@ -592,11 +592,7 @@ impl<B: Backend> TeleS3<B> {
         let object_metadata = json_to_metadata(&model.user_metadata);
         let stored_checksums = ExpectedChecksums::from_json(&model.checksums);
 
-        let versioning = self
-            .repo
-            .get_bucket_versioning(&req.input.bucket)
-            .await
-            .unwrap_or(None);
+        let versioning = self.repo.get_bucket_versioning(&req.input.bucket).await?;
         let response_version_id = if versioning.is_some() {
             Some(model.version_id.clone())
         } else {
@@ -644,11 +640,7 @@ impl<B: Backend> TeleS3<B> {
 
         let stored_checksums = ExpectedChecksums::from_json(&model.checksums);
 
-        let versioning = self
-            .repo
-            .get_bucket_versioning(&req.input.bucket)
-            .await
-            .unwrap_or(None);
+        let versioning = self.repo.get_bucket_versioning(&req.input.bucket).await?;
         let response_version_id = if versioning.is_some() {
             Some(model.version_id.clone())
         } else {
@@ -720,11 +712,16 @@ impl<B: Backend> TeleS3<B> {
         let mut deleted_objects: Vec<DeletedObject> = Vec::new();
         let mut all_blob_ids: Vec<String> = Vec::new();
         let mut errors: Vec<Error> = Vec::new();
-        let bucket_versioning = self
-            .repo
-            .get_bucket_versioning(&req.input.bucket)
-            .await
-            .unwrap_or(None);
+        // A missing bucket is a real S3 answer, not a database fault: it is
+        // reported per key below alongside every other per-key failure. Only a
+        // genuine repository error aborts the whole request -- letting one
+        // through as "unversioned" would take the destructive permanent-delete
+        // path and discard the previous versions.
+        let bucket_versioning = match self.repo.get_bucket_versioning(&req.input.bucket).await {
+            Ok(versioning) => versioning,
+            Err(err) if *err.code() == S3ErrorCode::NoSuchBucket => None,
+            Err(err) => return Err(err),
+        };
         let is_versioned = bucket_versioning.is_some();
 
         for obj in req.input.delete.objects.clone() {
@@ -1132,12 +1129,7 @@ impl<B: Backend> TeleS3<B> {
             return Ok(Some(vid.to_owned()));
         }
 
-        let versioned = self
-            .repo
-            .get_bucket_versioning(bucket)
-            .await
-            .unwrap_or(None)
-            .is_some();
+        let versioned = self.repo.get_bucket_versioning(bucket).await?.is_some();
 
         if versioned {
             self.repo.latest_version_id(bucket, key).await
@@ -1193,11 +1185,7 @@ impl<B: Backend> TeleS3<B> {
                 .await?
         };
         let version_id = {
-            let vs = self
-                .repo
-                .get_bucket_versioning(&req.input.bucket)
-                .await
-                .unwrap_or(None);
+            let vs = self.repo.get_bucket_versioning(&req.input.bucket).await?;
             if vs.is_some() {
                 Some(model.version_id.clone())
             } else {
@@ -1266,6 +1254,7 @@ mod tests {
     use super::*;
     use crate::backend::Memory;
     use crate::s3::TeleS3;
+    use sea_orm::ConnectionTrait;
 
     async fn test_service() -> TeleS3<Memory<1, 1>> {
         let db = sea_orm::Database::connect("sqlite::memory:")
@@ -1303,6 +1292,118 @@ mod tests {
             },
             method: http::Method::HEAD,
             uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn get_tagging_req(
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+    ) -> S3Request<GetObjectTaggingInput> {
+        S3Request {
+            input: GetObjectTaggingInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id,
+                ..Default::default()
+            },
+            method: http::Method::GET,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn put_tagging_req(
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+    ) -> S3Request<PutObjectTaggingInput> {
+        S3Request {
+            input: PutObjectTaggingInput {
+                bucket: bucket.to_string(),
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+                key: key.to_string(),
+                request_payer: None,
+                tagging: s3s::dto::Tagging {
+                    tag_set: vec![s3s::dto::Tag {
+                        key: Some("t".to_string()),
+                        value: Some("1".to_string()),
+                    }],
+                },
+                version_id,
+            },
+            method: http::Method::PUT,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn delete_tagging_req(
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+    ) -> S3Request<DeleteObjectTaggingInput> {
+        S3Request {
+            input: DeleteObjectTaggingInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id,
+                ..Default::default()
+            },
+            method: http::Method::DELETE,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn delete_objects_req(bucket: &str, keys: Vec<&str>) -> S3Request<DeleteObjectsInput> {
+        S3Request {
+            input: DeleteObjectsInput {
+                bucket: bucket.to_string(),
+                bypass_governance_retention: None,
+                checksum_algorithm: None,
+                delete: s3s::dto::Delete {
+                    objects: keys
+                        .into_iter()
+                        .map(|key| s3s::dto::ObjectIdentifier {
+                            e_tag: None,
+                            key: key.to_string(),
+                            last_modified_time: None,
+                            size: None,
+                            version_id: None,
+                        })
+                        .collect(),
+                    quiet: None,
+                },
+                expected_bucket_owner: None,
+                mfa: None,
+                request_payer: None,
+            },
+            method: http::Method::POST,
+            uri: format!("/{bucket}").parse().expect("uri"),
             headers: http::HeaderMap::new(),
             extensions: http::Extensions::default(),
             credentials: None,
@@ -1519,6 +1620,118 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    /// Make every `get_bucket_versioning` query fail while leaving the rest of
+    /// the schema readable.
+    ///
+    /// `get_bucket_versioning` reads `s3_bucket`, so renaming that table away
+    /// turns the versioning lookup into a hard SQL error while object reads
+    /// (which touch `s3_object`) keep succeeding. That isolates the exact
+    /// condition under test: the *query itself* fails, so a handler that
+    /// reports the bucket as unversioned is provably swallowing an error
+    /// rather than observing `Ok(None)`.
+    ///
+    /// The table is renamed rather than dropped because `s3_object` holds a
+    /// foreign key into it and SQLite refuses to drop a referenced parent.
+    async fn break_versioning_lookup(svc: &TeleS3<Memory<1, 1>>) {
+        svc.repo
+            .db
+            .execute_unprepared("ALTER TABLE s3_bucket RENAME TO s3_bucket_hidden")
+            .await
+            .expect("rename s3_bucket away");
+    }
+
+    /// A versioning lookup that fails must surface, not read as "unversioned".
+    ///
+    /// Before the fix each of these five sites did
+    /// `.unwrap_or(None)`, so a broken versioning query was indistinguishable
+    /// from a genuinely unversioned bucket -- and on the destructive paths
+    /// (bulk delete, tagging write) that meant silently discarding versions.
+    #[tokio::test]
+    async fn versioned_read_paths_propagate_versioning_lookup_failure() {
+        let svc = test_service().await;
+        seed_versions(&svc, &["k"]).await;
+        break_versioning_lookup(&svc).await;
+
+        let err = svc
+            .get_object_inner(get_req("b", "k", None))
+            .await
+            .expect_err("get must not swallow a failed versioning lookup");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        let err = svc
+            .head_object_inner(head_req("b", "k", None))
+            .await
+            .expect_err("head must not swallow a failed versioning lookup");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        let err = svc
+            .get_object_tagging_inner(get_tagging_req("b", "k", None))
+            .await
+            .expect_err("get tagging must not swallow a failed versioning lookup");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    }
+
+    /// The destructive sites: a failed versioning lookup must abort the whole
+    /// request rather than fall through to the non-versioned path.
+    #[tokio::test]
+    async fn destructive_paths_fail_closed_on_versioning_lookup_failure() {
+        let svc = test_service().await;
+        seed_versions(&svc, &["k"]).await;
+        break_versioning_lookup(&svc).await;
+
+        let err = svc
+            .delete_objects_inner(delete_objects_req("b", vec!["k"]))
+            .await
+            .expect_err("bulk delete must not fall through to the unversioned path");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        let err = svc
+            .put_object_tagging_inner(put_tagging_req("b", "k", None))
+            .await
+            .expect_err("tagging write must not swallow a failed versioning lookup");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        let err = svc
+            .delete_object_tagging_inner(delete_tagging_req("b", "k", None))
+            .await
+            .expect_err("tagging delete must not swallow a failed versioning lookup");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    }
+
+    /// The unversioned case must keep answering `Ok(None)`: the fix changes
+    /// error handling only, never a bucket that genuinely has no versioning.
+    #[tokio::test]
+    async fn unversioned_bucket_still_reports_no_version_id() {
+        let svc = test_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.repo
+            .cas_put_object(
+                "b".into(),
+                "k".into(),
+                super::super::repo::ObjectWrite {
+                    size: 0,
+                    content_type: None,
+                    etag: Some("e1".into()),
+                    content: serde_json::json!({"item": []}),
+                    user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                },
+                super::super::repo::PutCondition::None,
+            )
+            .await
+            .expect("put object");
+
+        let res = svc
+            .head_object_inner(head_req("b", "k", None))
+            .await
+            .expect("unversioned head must succeed");
+        assert_eq!(res.output.version_id, None);
     }
 
     /// Seed a versioned bucket with one version per key.
