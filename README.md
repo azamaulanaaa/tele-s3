@@ -178,6 +178,25 @@ Every event this service emits carries its data as named fields rather than pros
 TELE_S3_LOG_FORMAT=json RUST_LOG=tele_s3=debug cargo run -- --config config.toml
 ```
 
+### Admin endpoints
+
+Three JSON endpoints share the S3 listener and are answered before any request reaches the S3 handlers. They are **unauthenticated** — a probe that has to sign a request is a probe that stops working when the signature expires — so they publish no credential material: no access key, secret key, `api_hash`, `bot_token` or `database_uri`, and no error message that might quote one.
+
+| Path | Answers |
+|------|---------|
+| `/.tele-s3/healthz` | Liveness: the process is alive and serving HTTP. Always `200`, derived from nothing — not Telegram, not the database. A rate-limited upstream must never make a healthy server look dead to its supervisor. |
+| `/.tele-s3/readyz` | Readiness: start-up finished, so S3 traffic is being served. Always `200`, with the outcome of both start-up reconcilers in the body. |
+| `/.tele-s3/introspect` | Introspection: the effective runtime state — the three Telegram knobs in force (after environment overrides and clamping), the listen port, the version, and what each reconciler did. |
+
+The `/.tele-s3` prefix is reserved deliberately: an S3 bucket name must begin and end with a lowercase letter or a digit, so `.tele-s3` can never be a bucket and these paths can never shadow `/{bucket}/{key}` (a bare `/healthz` would have been read as bucket `healthz`). Anything else under the prefix is a `404`.
+
+Readiness does **not** fail when a start-up reconciler fails. Both passes are best-effort garbage collection: a failure leaves unreferenced rows that no listing shows and the next pass can still reclaim, while reads and writes are served either way. Reporting a failed pass as "not ready" would let an orchestrator stop routing traffic to a fully capable server, turning a garbage-collection nuisance into an outage. The outcome is reported in the readiness and introspection bodies, and logged at start-up.
+
+```bash
+curl -s localhost:8000/.tele-s3/healthz    # {"status":"ok"}
+curl -s localhost:8000/.tele-s3/introspect # {"status":"ok","version":"0.6.0","listen_port":8000,...}
+```
+
 ## Architecture
 
 ```

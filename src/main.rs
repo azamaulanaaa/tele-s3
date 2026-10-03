@@ -10,6 +10,10 @@ use hyper_util::server::conn::auto::Builder;
 use tracing_subscriber::{EnvFilter, fmt::Subscriber as FmtSubscriber};
 
 use tele_s3::{
+    admin::{
+        AdminRoute, AdminState, ORPHAN_BLOB_RECONCILER_ERROR_TYPE,
+        PUBLISH_INTENT_RECONCILER_ERROR_TYPE, ReconcilerOutcome, StartupReport,
+    },
     backend::{Grammers, GrammersConfig, GrammersLimits},
     s3::TeleS3,
 };
@@ -141,6 +145,7 @@ const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
 /// | `file_id` | Telegram file id of an uploaded part set. |
 /// | `name` | Telegram part/file name of an upload. |
 /// | `dc_id` | Telegram datacentre id. |
+/// | `endpoint` | Which admin endpoint answered a request. |
 ///
 /// ## Sizes, counts and durations
 ///
@@ -157,6 +162,7 @@ const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
 /// | `duration_ms` | Milliseconds waited on a Telegram rate limit. |
 /// | `timeout_ms` | Milliseconds an operation was allowed before its deadline. |
 /// | `port` | The listening TCP port. |
+/// | `status_code` | HTTP status an admin endpoint answered with. |
 ///
 /// ## Telegram tuning, echoed at start-up
 ///
@@ -213,6 +219,10 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Database::connect(config.database_uri).await?;
 
+    // Resolved once, here, so the admin endpoints publish the limits actually
+    // in force rather than a second reading of the environment.
+    let limits = telegram_limits();
+
     let grammers = {
         let config = GrammersConfig {
             app_id: config.api_id,
@@ -220,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
             bot_token: config.bot_token,
             db: db.clone(),
             username: config.username,
-            limits: telegram_limits(),
+            limits,
         };
 
         Grammers::init(config).await?
@@ -234,37 +244,62 @@ async fn main() -> anyhow::Result<()> {
         //
         // Blob rows left behind by an interrupted publish are invisible to
         // every listing and nothing else reclaims them.
-        match teles3.reconcile_orphan_blobs().await {
-            Ok(0) => {}
+        let orphan_blobs = match teles3.reconcile_orphan_blobs().await {
+            Ok(0) => ReconcilerOutcome::Completed { affected: 0 },
             Ok(reconciled) => {
                 tracing::info!(reconciled, "reconciled orphaned blob rows");
+                ReconcilerOutcome::Completed {
+                    affected: reconciled,
+                }
             }
-            Err(err) => tracing::warn!(
-                error.type = "blob_reconciliation",
-                error.message = %err,
-                "blob reconciliation failed"
-            ),
-        }
+            Err(err) => {
+                tracing::warn!(
+                    error.type = ORPHAN_BLOB_RECONCILER_ERROR_TYPE,
+                    error.message = %err,
+                    "blob reconciliation failed"
+                );
+                ReconcilerOutcome::Failed
+            }
+        };
 
         // Publishes that were never confirmed hold real bytes in the chat that
         // no key names, so no blob row points at them and the pass above
         // cannot see them.
-        match teles3.reconcile_publish_intents().await {
-            Ok(0) => {}
+        let publish_intents = match teles3.reconcile_publish_intents().await {
+            Ok(0) => ReconcilerOutcome::Completed { affected: 0 },
             Ok(cleared) => {
                 tracing::info!(cleared, "reconciled unconfirmed publish intents");
+                ReconcilerOutcome::Completed { affected: cleared }
             }
-            Err(err) => tracing::warn!(
-                error.type = "publish_intent_reconciliation",
-                error.message = %err,
-                "publish intent reconciliation failed"
-            ),
-        }
+            Err(err) => {
+                tracing::warn!(
+                    error.type = PUBLISH_INTENT_RECONCILER_ERROR_TYPE,
+                    error.message = %err,
+                    "publish intent reconciliation failed"
+                );
+                ReconcilerOutcome::Failed
+            }
+        };
+
+        // What the admin endpoints publish; the messages above stay in the
+        // log, where a reader already trusted to see them can find them.
+        let startup = StartupReport {
+            orphan_blobs,
+            publish_intents,
+        };
 
         let mut builder = S3ServiceBuilder::new(teles3);
 
         let auth = SimpleAuth::from_single(&config.auth_access_key, config.auth_secret_key);
         builder.set_auth(auth);
+
+        // Health, readiness and introspection, answered ahead of S3 and ahead
+        // of any signature check. See `admin` for what they publish and why.
+        builder.set_route(AdminRoute::new(AdminState::new(
+            config.listen_port,
+            limits,
+            startup,
+        )));
 
         builder.build()
     };
@@ -319,6 +354,73 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tele_s3::admin::ReconcilerOutcome;
+
+    /// The introspection document is built from the port, the Telegram limits
+    /// and two closed enums — no argument of [`AdminState::new`] can carry a
+    /// credential. Proved here against a real [`config::Config`], so the
+    /// guarantee is about the config an operator actually writes rather than
+    /// about a hypothetical one.
+    #[test]
+    fn admin_endpoints_publish_no_config_credentials() {
+        const SENTINELS: [&str; 5] = [
+            "AKIAEXAMPLEACCESSKEY",
+            "s3cr3t-signing-key-value",
+            "0123456789abcdef0123456789abcdef",
+            "12345678:telegram-bot-token-value",
+            "postgres://tele_s3:hunter2@db.internal/tele_s3",
+        ];
+
+        let config = config::Config {
+            api_id: 12345,
+            api_hash: SENTINELS[2].to_string(),
+            bot_token: SENTINELS[3].to_string(),
+            username: "tele_s3_channel".to_string(),
+            database_uri: SENTINELS[4].to_string(),
+            listen_port: 8000,
+            auth_access_key: SENTINELS[0].to_string(),
+            auth_secret_key: SENTINELS[1].to_string(),
+        };
+
+        // The worst case for the operator: start-up reconciliation failed, so
+        // the outcome is being published for a server that has something to
+        // report.
+        let state = tele_s3::admin::AdminState::new(
+            config.listen_port,
+            GrammersLimits::default(),
+            StartupReport {
+                orphan_blobs: ReconcilerOutcome::Failed,
+                publish_intents: ReconcilerOutcome::Failed,
+            },
+        );
+
+        for response in [state.liveness(), state.readiness(), state.introspection()] {
+            for secret in SENTINELS {
+                assert!(
+                    !response.body.contains(secret),
+                    "{secret:?} leaked into {}",
+                    response.status
+                );
+            }
+            // Nor the names of the fields that hold them.
+            for key in [
+                "auth_access_key",
+                "auth_secret_key",
+                "api_hash",
+                "bot_token",
+                "database_uri",
+                "password",
+                "secret",
+                "token",
+            ] {
+                assert!(
+                    !response.body.contains(key),
+                    "{key} leaked into introspection"
+                );
+            }
+        }
+    }
 
     /// The default has to stay the human-readable renderer: nothing about an
     /// operator's existing output changes unless they ask for it.

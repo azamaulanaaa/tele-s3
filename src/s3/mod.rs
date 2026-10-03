@@ -26,7 +26,9 @@ use tracing::instrument;
 use crate::backend::{Backend, BackendError, ReclaimOutcome};
 
 mod buckets;
-mod helpers;
+// Visible crate-wide so the admin endpoints can assert their reserved path
+// prefix against the real validator rather than a copy of the rule.
+pub(crate) mod helpers;
 mod multipart;
 mod objects;
 mod repo;
