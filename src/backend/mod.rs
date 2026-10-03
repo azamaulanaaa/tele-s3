@@ -122,8 +122,11 @@ pub trait Backend: Send + Sync + 'static {
     /// capacity accounting, the recorded `s3_blob.size`, and the range
     /// arithmetic every later `read` performs. The reader must yield exactly
     /// that many bytes — a short body is an error and the capacity is handed
-    /// back, never a silently truncated object. Bytes past `size` are neither
-    /// stored nor an error.
+    /// back, and an over-long body is an error too, never a silently
+    /// truncated object that reports success. A backend that cannot see the
+    /// end of the stream without reading past `size` should check for the
+    /// extra byte immediately afterwards, while it can still fail without
+    /// having published anything.
     ///
     /// The key must resolve for as long as the metadata store may reference
     /// it, which for a durable backend means across restarts; a key that

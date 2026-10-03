@@ -17,7 +17,7 @@ use grammers_mtsender::{InvocationError, SenderPool, SenderPoolFatHandle};
 use grammers_session::types::PeerRef;
 use sea_orm::DatabaseConnection;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt},
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::{
@@ -181,6 +181,77 @@ enum Attempt {
     Exhausted { attempts: u32 },
 }
 
+/// How a declared `size` is cut into Telegram parts.
+///
+/// The whole of the size accounting [`Grammers::write`] performs, with no
+/// reader and no client in it, so both sides of the "exactly `size` bytes"
+/// contract and the arithmetic at a [`PART_SIZE`] boundary are testable
+/// without a Telegram session.
+#[derive(Debug, PartialEq, Eq)]
+struct BodyPlan {
+    /// `file_total_parts` for the upload, and `parts` for the finished one.
+    total_parts: i32,
+    /// The declared length, kept so the over-long error can name the number
+    /// the body was measured against.
+    declared: u64,
+    /// The length of each part, in upload order. Empty for a zero-byte body,
+    /// which is uploaded as no parts at all.
+    lengths: Vec<usize>,
+}
+
+impl BodyPlan {
+    /// Cut `size` bytes into full parts plus at most one short trailing part.
+    ///
+    /// A `size` that is an exact multiple of [`PART_SIZE`] gets no short
+    /// part; one byte more gets a one-byte one. A zero `size` gets neither.
+    fn for_size(size: usize) -> Self {
+        let mut lengths = Vec::with_capacity(size.div_ceil(PART_SIZE));
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let len = PART_SIZE.min(remaining);
+            remaining -= len;
+            lengths.push(len);
+        }
+
+        Self {
+            total_parts: lengths.len() as i32,
+            declared: size as u64,
+            lengths,
+        }
+    }
+}
+
+/// The reader carried on past the `size` the write declared.
+///
+/// Deliberately *not* [`BackendError::ExceedLimitSize`]: that variant means
+/// "this object will not fit, send less", and it is the only one whose
+/// message reaches the client. The object the caller asked for fits — what
+/// disagrees is the body with its own declared length, and only a single byte
+/// past the end is ever read, so there is no honest `actual` to report and no
+/// advice that would help the caller.
+///
+/// It is also not claimed to be a client error. `write` cannot tell a client
+/// that overran its `Content-Length` from a caller above it that passed the
+/// wrong `size`, and attributing the fault would be a guess. So it is an
+/// ordinary backend failure and lands on `InternalError` through the existing
+/// catch-all mapping, which keeps the reason as the error's `source` for the
+/// logs. Logged here as well, because the response deliberately does not
+/// carry it and this is the one place both numbers are in hand.
+fn overlong_body(size: u64) -> BackendError {
+    tracing::error!(
+        declared = size,
+        "backend write fault: the body is longer than the declared size"
+    );
+
+    BackendError::Other(
+        std::io::Error::other(format!(
+            "write body is longer than the declared {size} bytes"
+        ))
+        .into(),
+    )
+}
+
 /// Account for the attempt that just failed. `attempt` is 1-based.
 ///
 /// Pure: the loop feeds it its own counter, so no clock is involved.
@@ -285,6 +356,69 @@ impl AttemptError {
 }
 
 impl Grammers {
+    /// Upload the parts `plan` describes from `reader`, then prove the reader
+    /// really ended.
+    ///
+    /// Split out of [`Grammers::write`] with the client reached only through
+    /// `upload_part`, so the size accounting and both directions of the
+    /// "exactly `size` bytes" contract are exercisable with a fake and no
+    /// Telegram session.
+    ///
+    /// The declared length is enforced on both sides. Short: a part is filled
+    /// with `read_exact`, so a body that ends early fails here. Long: once
+    /// the last planned part is in, one more byte is read — a body that still
+    /// has one is over-long and fails.
+    ///
+    /// That order is the whole point. The over-long check is only sound
+    /// *after* the parts are up, because a stream that has not been read past
+    /// its declared end cannot be shown to have ended there. In exchange the
+    /// check still runs before the message is sent, so nothing is published:
+    /// what is left behind is Telegram-side part state under a `file_id` no
+    /// message references, which the server reclaims on its own. No key is
+    /// ever returned for it, so the reconciler — which drops metadata *rows*,
+    /// not backend objects — has nothing to see and nothing to miss. The
+    /// residual window is that orphaned part state, and it holds no bytes the
+    /// caller can reach.
+    async fn upload_parts<R, F, Fut>(
+        reader: &mut R,
+        plan: &BodyPlan,
+        mut upload_part: F,
+    ) -> Result<(), BackendError>
+    where
+        R: AsyncRead + Unpin,
+        F: FnMut(i32, Vec<u8>) -> Fut,
+        Fut: Future<Output = Result<(), BackendError>>,
+    {
+        for (part_index, len) in plan.lengths.iter().copied().enumerate() {
+            let mut buffer = vec![0u8; len];
+
+            // `read_exact`, not `read`: a body that ends before `size` must
+            // fail here rather than publish a part padded with zeroes.
+            reader
+                .read_exact(&mut buffer)
+                .await
+                .map_err(|e| BackendError::Other(e.into()))?;
+
+            upload_part(part_index as i32, buffer).await?;
+        }
+
+        // The declared `size` is now uploaded. One byte more is all it takes
+        // to tell a body that ended at `size` from one that did not, and a
+        // byte here means the trailing bytes would otherwise be dropped with
+        // no error and a key returned for a short object.
+        let mut trailing = [0u8; 1];
+        let overlong = reader
+            .read(&mut trailing)
+            .await
+            .map_err(|e| BackendError::Other(e.into()))?;
+
+        if overlong != 0 {
+            return Err(overlong_body(plan.declared));
+        }
+
+        Ok(())
+    }
+
     #[instrument(skip(config), level = "debug", err)]
     pub async fn init(config: GrammersConfig) -> anyhow::Result<Self> {
         let limits = config.limits.sanitized();
@@ -565,48 +699,38 @@ impl Backend for Grammers {
 
         self.check_flood_wait().await?;
 
-        let mut part_index = 0;
-        let total_parts = size.div_ceil(PART_SIZE as u64) as i32;
-        let mut remaining = size as usize;
-        loop {
-            let mut buffer = vec![0u8; PART_SIZE.min(remaining)];
-            let n = compat_reader
-                .read_exact(&mut buffer)
+        let plan = BodyPlan::for_size(size as usize);
+        let total_parts = plan.total_parts;
+
+        Self::upload_parts(&mut compat_reader, &plan, |file_part, bytes| {
+            let bytes = bytes.clone();
+
+            async move {
+                // Retry the part through flood waits; re-uploading the same
+                // part index is idempotent on Telegram's side. Each attempt
+                // carries the same `file_id`/`file_part` and the same bytes.
+                self.retry_rpc(|| async {
+                    self.client
+                        .invoke(&SaveBigFilePart {
+                            file_id,
+                            file_part,
+                            file_total_parts: total_parts,
+                            // cloned so a failed attempt can be retried with
+                            // the same bytes
+                            bytes: bytes.clone(),
+                        })
+                        .await
+                })
                 .await
-                .map_err(|e| BackendError::Other(e.into()))?;
-            if n == 0 {
-                break;
+                .map(|_| ())
             }
-            remaining -= n;
-
-            // Retry the part through flood waits; re-uploading the same
-            // part index is idempotent on Telegram's side. Each attempt
-            // carries the same `file_id`/`file_part` and the same bytes.
-            self.retry_rpc(|| async {
-                self.client
-                    .invoke(&SaveBigFilePart {
-                        file_id,
-                        file_part: part_index,
-                        file_total_parts: total_parts,
-                        // cloned so a failed attempt can be retried with
-                        // the same bytes
-                        bytes: buffer.clone(),
-                    })
-                    .await
-            })
-            .await?;
-
-            part_index += 1;
-
-            if n < PART_SIZE {
-                break;
-            }
-        }
+        })
+        .await?;
 
         let uploaded = Uploaded::from_raw(
             InputFileBig {
                 id: file_id,
-                parts: part_index,
+                parts: total_parts,
                 name,
             }
             .into(),
@@ -932,5 +1056,148 @@ mod tests {
         assert_ne!(format!("{fault:?}"), format!("{missing:?}"));
         assert!(matches!(fault, ReadOutcome::Fault(_)));
         assert!(matches!(missing, ReadOutcome::Missing));
+    }
+}
+
+/// The `write` size contract, exercised through a fake part sink.
+#[cfg(test)]
+mod body_contract {
+    use std::future::Ready;
+
+    use super::*;
+
+    /// Drives [`Grammers::upload_parts`] against a body of `body`, recording
+    /// the length of every part it was handed and the concatenated bytes, so
+    /// the size accounting is checked end to end with no Telegram client in it.
+    #[derive(Debug)]
+    struct FakeUpload {
+        parts: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    impl FakeUpload {
+        /// The sink `upload_parts` drives, standing in for the Telegram RPC.
+        /// The future is immediate, so what the fake observes is exactly what
+        /// the caller was about to send.
+        fn sink(&mut self) -> impl FnMut(i32, Vec<u8>) -> Ready<Result<(), BackendError>> + '_ {
+            move |part_index, bytes| {
+                assert_eq!(
+                    part_index as usize,
+                    self.parts.len(),
+                    "parts must be numbered in order"
+                );
+                self.parts.push(bytes.len());
+                self.bytes.extend_from_slice(&bytes);
+
+                std::future::ready(Ok(()))
+            }
+        }
+    }
+
+    /// Upload `body` as a declared `size`-byte object.
+    async fn upload_body(body: &[u8], size: u64) -> Result<FakeUpload, BackendError> {
+        let plan = BodyPlan::for_size(size as usize);
+        let mut reader = std::io::Cursor::new(body.to_vec());
+        let mut fake = FakeUpload {
+            parts: Vec::new(),
+            bytes: Vec::new(),
+        };
+
+        Grammers::upload_parts(&mut reader, &plan, fake.sink()).await?;
+
+        Ok(fake)
+    }
+
+    #[test]
+    fn an_exact_multiple_of_the_part_size_uploads_no_short_part() {
+        let plan = BodyPlan::for_size(PART_SIZE * 2);
+
+        assert_eq!(plan.total_parts, 2);
+        assert_eq!(plan.lengths, vec![PART_SIZE, PART_SIZE]);
+    }
+
+    #[test]
+    fn one_byte_past_a_multiple_costs_a_one_byte_part() {
+        let plan = BodyPlan::for_size(PART_SIZE * 2 + 1);
+
+        assert_eq!(plan.total_parts, 3);
+        assert_eq!(plan.lengths, vec![PART_SIZE, PART_SIZE, 1]);
+    }
+
+    #[test]
+    fn a_zero_byte_body_is_uploaded_as_no_parts() {
+        let plan = BodyPlan::for_size(0);
+
+        assert_eq!(plan.total_parts, 0);
+        assert!(plan.lengths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_body_of_exactly_the_declared_size_uploads_every_byte() {
+        let body = vec![7u8; 64];
+        let fake = upload_body(&body, 64)
+            .await
+            .expect("a body of the declared size");
+
+        assert_eq!(fake.parts, vec![64]);
+        assert_eq!(fake.bytes, body);
+    }
+
+    #[tokio::test]
+    async fn a_body_one_byte_short_fails_and_uploads_nothing() {
+        let err = upload_body(&[7u8; 63], 64)
+            .await
+            .expect_err("a short body must fail");
+
+        assert!(matches!(err, BackendError::Other(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_declared_size_fails_and_is_not_truncated() {
+        // The silent-truncation case: 65 bytes declared as 64. Before the fix
+        // this returned a key naming a 64-byte object and said nothing.
+        let err = upload_body(&[7u8; 65], 64)
+            .await
+            .expect_err("an over-long body must fail");
+
+        assert!(matches!(err, BackendError::Other(_)), "{err:?}");
+        // The declared size must survive into the source chain, which is the
+        // only place the detail is written down.
+        let detail = std::error::Error::source(&err)
+            .expect("the io cause is kept as the error source")
+            .to_string();
+        assert!(detail.contains("64"), "logged detail: {detail}");
+    }
+
+    #[tokio::test]
+    async fn an_over_long_body_after_a_full_final_part_is_still_rejected() {
+        // The `PART_SIZE` boundary case: the plan is satisfied exactly, so only
+        // the post-upload probe can catch the extra byte.
+        let body = vec![7u8; PART_SIZE + 1];
+        let err = upload_body(&body, PART_SIZE as u64)
+            .await
+            .expect_err("an over-long body must fail");
+
+        assert!(matches!(err, BackendError::Other(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_one_byte_over_a_full_part_uploads_exactly_the_declared_bytes() {
+        let body: Vec<u8> = (0..(PART_SIZE + 1)).map(|i| i as u8).collect();
+        let fake = upload_body(&body, PART_SIZE as u64 + 1)
+            .await
+            .expect("a body of the declared size");
+
+        assert_eq!(fake.parts, vec![PART_SIZE, 1]);
+        assert_eq!(fake.bytes, body);
+    }
+
+    #[tokio::test]
+    async fn a_zero_byte_body_with_bytes_is_over_long() {
+        let err = upload_body(&[7u8; 1], 0)
+            .await
+            .expect_err("an over-long body must fail");
+
+        assert!(matches!(err, BackendError::Other(_)), "{err:?}");
     }
 }
