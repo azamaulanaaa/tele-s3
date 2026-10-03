@@ -353,6 +353,30 @@ impl<B: Backend> TeleS3<B> {
         Ok(res)
     }
 
+    /// The latest object a copy is about to replace, or `None` when the
+    /// destination key holds nothing to release.
+    ///
+    /// `get_object` reports absence as `Err(NoSuchKey)` rather than
+    /// `Ok(None)`, so "the key is empty" and "the read failed" arrive on the
+    /// same error channel. Folding both into the old `if let Ok(..)` skipped
+    /// the blob release on every repository failure, leaking the previous
+    /// object's blob references; propagating both, on the other hand, turns
+    /// every copy onto a fresh key into a client-visible error.
+    ///
+    /// Only `NoSuchKey` is folded into `None`. Every other error propagates,
+    /// aborting the request. Do NOT simplify this into a blanket `?`.
+    pub(crate) async fn replaced_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<Option<object::Model>> {
+        match self.repo.get_object(bucket, key).await {
+            Ok(model) => Ok(Some(model)),
+            Err(err) if *err.code() == S3ErrorCode::NoSuchKey => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     #[instrument(skip(self), err)]
     pub(crate) async fn copy_object_inner(
         &self,
@@ -401,13 +425,15 @@ impl<B: Backend> TeleS3<B> {
         let versioning_status = self.repo.get_bucket_versioning(&req.input.bucket).await?;
         let is_versioned = versioning_status.is_some();
 
+        // Absence is a normal outcome here (copying onto a key that does not
+        // exist yet) and must stay a silent no-op; a failed read must not.
+        let old_object = self
+            .replaced_object(&req.input.bucket, &req.input.key)
+            .await?;
+
         let delete_old_future = if is_versioned {
             None
-        } else if let Ok(old) = self
-            .repo
-            .get_object(&req.input.bucket, &req.input.key)
-            .await
-        {
+        } else if let Some(old) = old_object {
             let old_metadata: Metadata =
                 serde_json::from_value(old.content).map_err(S3Error::internal_error)?;
             Some(self.release_blobs(old_metadata.item.into_iter().map(|v| v.id).collect()))
@@ -2156,6 +2182,123 @@ mod tests {
 
         assert_eq!(listed_keys(&contents), vec!["a"]);
         assert_eq!(listed_prefixes(&prefixes), vec!["a/", "a/"]);
+    }
+
+    async fn seed_unversioned_object(svc: &TeleS3<Memory<1, 1>>, bucket: &str, key: &str) {
+        svc.repo
+            .create_bucket(bucket.to_string(), None)
+            .await
+            .expect("create bucket");
+        svc.repo
+            .cas_put_object(
+                bucket.to_string(),
+                key.to_string(),
+                ObjectWrite {
+                    size: 0,
+                    content_type: None,
+                    etag: Some("e1".into()),
+                    content: serde_json::json!({"item": []}),
+                    user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                },
+                super::super::repo::PutCondition::None,
+            )
+            .await
+            .expect("put object");
+    }
+
+    fn copy_req(bucket: &str, key: &str, src_key: &str) -> S3Request<CopyObjectInput> {
+        // `CopyObjectInput` has no `Default`, so build it through the dto
+        // builder rather than spelling out all thirty optional fields.
+        let mut builder = CopyObjectInput::builder();
+        builder
+            .set_bucket(bucket.to_string())
+            .set_key(key.to_string())
+            .set_copy_source(CopySource::Bucket {
+                bucket: bucket.to_string().into(),
+                key: src_key.to_string().into(),
+                version_id: None,
+            });
+        let input = builder.build().expect("copy request");
+
+        S3Request {
+            input,
+            method: http::Method::PUT,
+            uri: format!("/{bucket}/{key}").parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    /// A read failure on the object a copy is about to replace must abort the
+    /// request, not silently skip releasing the old object's blobs.
+    ///
+    /// Before the fix this lookup read `else if let Ok(old) = ...get_object()`,
+    /// so a repository failure was indistinguishable from "there is nothing to
+    /// replace" and the old object's blob references were never released.
+    ///
+    /// The assertion is made on `replaced_object` rather than on the whole
+    /// request because a table-level fault cannot be isolated to this lookup:
+    /// the copy's *source* read hits `s3_object` too, so a broken table fails
+    /// the request earlier no matter how this site is written. The helper is
+    /// the exact expression both write paths evaluate, and the end-to-end
+    /// absence test below pins the branch that follows it.
+    #[tokio::test]
+    async fn replaced_object_propagates_a_repository_read_failure() {
+        let svc = test_service().await;
+        seed_unversioned_object(&svc, "b", "old").await;
+        svc.repo
+            .db
+            .execute_unprepared("ALTER TABLE s3_object RENAME TO s3_object_hidden")
+            .await
+            .expect("rename s3_object away");
+
+        let err = svc
+            .replaced_object("b", "old")
+            .await
+            .expect_err("a failed replaced-object read must not be swallowed");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    }
+
+    /// The absent case, at both levels: a key with nothing to replace is `None`
+    /// from the helper and a successful copy at request level.
+    ///
+    /// `get_object` signals absence as `Err(NoSuchKey)`, so this is the guard
+    /// against over-correcting the fix into a blanket `?` that would break
+    /// copying onto a fresh key.
+    #[tokio::test]
+    async fn replaced_object_is_none_for_an_absent_key_and_copy_still_succeeds() {
+        let svc = test_service().await;
+        seed_unversioned_object(&svc, "b", "src").await;
+
+        assert!(
+            svc.replaced_object("b", "dst")
+                .await
+                .expect("an absent key is not an error")
+                .is_none()
+        );
+
+        let res = svc
+            .copy_object_inner(copy_req("b", "dst", "src"))
+            .await
+            .expect("copying onto a key that holds nothing is a normal first write");
+        assert!(
+            res.output.copy_object_result.is_some(),
+            "an embedded copy result marks a successful copy"
+        );
+
+        // The key now holds an object, so the same lookup reports it.
+        assert!(
+            svc.replaced_object("b", "dst")
+                .await
+                .expect("a present key is not an error")
+                .is_some()
+        );
     }
 
     #[test]

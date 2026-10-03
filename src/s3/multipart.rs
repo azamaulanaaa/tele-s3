@@ -289,20 +289,20 @@ impl<B: Backend> TeleS3<B> {
         let versioning_status = self.repo.get_bucket_versioning(&req.input.bucket).await?;
         let is_versioned = versioning_status.is_some();
 
+        // A multipart upload usually completes onto a key that does not exist
+        // yet, so absence is a silent no-op; a failed read must not be.
+        let previous_object = self
+            .replaced_object(&req.input.bucket, &req.input.key)
+            .await?;
+
         let delete_old_object_future = if is_versioned {
             None
+        } else if let Some(model) = previous_object {
+            let metadata: Metadata =
+                serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
+            Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
         } else {
-            let model = self
-                .repo
-                .get_object(&req.input.bucket, &req.input.key)
-                .await;
-            if let Ok(model) = model {
-                let metadata: Metadata =
-                    serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-                Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
-            } else {
-                None
-            }
+            None
         };
 
         let data = ObjectWrite {
@@ -712,6 +712,7 @@ mod tests {
     use super::*;
     use crate::backend::Memory;
     use crate::s3::TeleS3;
+    use sea_orm::ConnectionTrait;
 
     async fn test_service_with_upload() -> (TeleS3<Memory<1, 1>>, String) {
         let db = sea_orm::Database::connect("sqlite::memory:")
@@ -815,6 +816,107 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    fn complete_upload_req(upload_id: &str) -> S3Request<CompleteMultipartUploadInput> {
+        S3Request {
+            input: CompleteMultipartUploadInput {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                upload_id: upload_id.to_string(),
+                multipart_upload: Some(s3s::dto::CompletedMultipartUpload {
+                    parts: Some(vec![s3s::dto::CompletedPart {
+                        part_number: Some(1),
+                        ..Default::default()
+                    }]),
+                }),
+                ..Default::default()
+            },
+            method: http::Method::POST,
+            uri: "/b/k".parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn upload_one_byte_part_req(upload_id: &str) -> S3Request<UploadPartInput> {
+        let mut req = upload_part_req(upload_id, Some(1));
+        req.input.body = Some(s3s::dto::StreamingBlob::from_bytes(
+            bytes::Bytes::from_static(b"x"),
+        ));
+        req
+    }
+
+    /// Make `get_object` fail while everything the completion path touches
+    /// before it -- the upload state and its parts -- keeps working.
+    ///
+    /// `get_object` reads `s3_object`, so renaming that table away turns the
+    /// lookup into a hard SQL error. `s3_multipart_upload_state` and
+    /// `s3_blob` are untouched, so the request really does reach the
+    /// replaced-object lookup: the *query itself* fails there, which is
+    /// exactly the condition a handler that folds every error into "nothing
+    /// to release" cannot distinguish from an absent key.
+    ///
+    /// The table is renamed rather than dropped because `s3_object` holds a
+    /// foreign key into it and SQLite refuses to drop a referenced parent.
+    async fn break_object_lookup(svc: &TeleS3<Memory<1, 1>>) {
+        svc.repo
+            .db
+            .execute_unprepared("ALTER TABLE s3_object RENAME TO s3_object_hidden")
+            .await
+            .expect("rename s3_object away");
+    }
+
+    /// A failed read of the object being replaced must abort the completion,
+    /// not report success while silently skipping the blob release.
+    ///
+    /// Before the fix this site read `if let Ok(model) = ...get_object(...)`,
+    /// so a repository failure landed in the `else` arm and the previous
+    /// object's blob references were never released.
+    ///
+    /// This is the end-to-end contract check. It cannot isolate the lookup on
+    /// its own: `cas_put_object` writes the same `s3_object` table later in
+    /// the request, so a fault injected at table level surfaces there too
+    /// either way. `replaced_object_propagates_a_repository_read_failure` in
+    /// `s3::objects` pins the swallow itself against the shared helper both
+    /// write paths evaluate.
+    #[tokio::test]
+    async fn complete_multipart_propagates_object_read_failure() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("upload part");
+        break_object_lookup(&svc).await;
+
+        let err = svc
+            .complete_multipart_upload_inner(complete_upload_req(&upload_id))
+            .await
+            .expect_err("a failed replaced-object read must not be swallowed");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    }
+
+    /// The guard against over-correcting: a key that holds no object is the
+    /// normal outcome of a first completion, and must stay a silent no-op.
+    ///
+    /// `get_object` reports that absence as `Err(NoSuchKey)`, so propagating
+    /// every error -- rather than only `NoSuchKey` -- would break completing
+    /// an upload onto a fresh key.
+    #[tokio::test]
+    async fn complete_multipart_onto_absent_key_is_not_an_error() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("upload part");
+
+        let res = svc
+            .complete_multipart_upload_inner(complete_upload_req(&upload_id))
+            .await
+            .expect("completing onto an absent key is a normal first write");
+        assert_eq!(res.output.key.as_deref(), Some("k"));
     }
 
     #[tokio::test]
