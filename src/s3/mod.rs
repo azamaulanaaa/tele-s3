@@ -187,15 +187,21 @@ impl<B: Backend> TeleS3<B> {
     /// Delete backend blobs that were written but never recorded in the
     /// metadata store (a publish rejected before its transaction).
     ///
-    /// Best-effort by construction: there is no bookkeeping row to reconcile
-    /// against, so a failure is logged and the request keeps its original
-    /// error.
-    async fn discard_backend_blobs(&self, ids: Vec<String>) {
+    /// Returns true when every delete succeeded. A caller may clear a publish
+    /// intent only then: a failed delete leaves bytes with no metadata row,
+    /// and the pending intent is the only record that can lead the reclaim
+    /// pass back to them.
+    ///
+    /// Best-effort by construction: a failure is logged and the request keeps
+    /// its original error.
+    async fn discard_backend_blobs(&self, ids: Vec<String>) -> bool {
         let results =
             futures::future::join_all(ids.iter().map(|id| self.backend.delete(id.clone()))).await;
 
+        let mut all_deleted = true;
         for (id, result) in ids.iter().zip(results) {
             if let Err(err) = result {
+                all_deleted = false;
                 tracing::warn!(
                     blob_id = %id,
                     error.type = "backend_delete",
@@ -204,6 +210,8 @@ impl<B: Backend> TeleS3<B> {
                 );
             }
         }
+
+        all_deleted
     }
 
     /// Reconcile blob rows that no object version and no in-progress
@@ -1280,7 +1288,7 @@ mod tests {
         svc.repo
             .publish_object_with_new_blob(
                 "b2".into(),
-                1,
+                None,
                 "b".into(),
                 "k".into(),
                 super::repo::ObjectWrite {

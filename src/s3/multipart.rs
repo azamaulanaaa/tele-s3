@@ -99,6 +99,10 @@ impl<B: Backend> TeleS3<B> {
             body_stream.into_boxed_reader()
         };
 
+        // Captured outside the block so the failure paths below can clear it
+        // and the CAS update can resolve it.
+        let publish_id: String;
+
         let (id, hash_md5, computed_crc32, computed_crc32c, computed_sha1, computed_sha256) = {
             let state = Arc::new(Mutex::new(IntegrityDigests::default()));
 
@@ -106,25 +110,26 @@ impl<B: Backend> TeleS3<B> {
 
             // As in `put_object_inner`: the intent is durable before the
             // backend is called, and only a confirmed publish clears it.
-            let publish_id = new_publish_id();
+            let pid = new_publish_id();
             self.repo
                 .record_publish_intent(
-                    publish_id.clone(),
+                    pid.clone(),
                     req.input.bucket.clone(),
                     req.input.key.clone(),
                     size,
                 )
                 .await?;
 
+            publish_id = pid.clone();
+
             let id = self
                 .backend
-                .write(publish_id.clone(), size, reader_with_hasher)
+                .write(pid.clone(), size, reader_with_hasher)
                 .await
                 .map_err(S3Error::from)?;
 
-            self.repo
-                .resolve_publish_intent(&publish_id, id.clone())
-                .await?;
+            // Do NOT resolve the intent here: resolution commits with the
+            // multipart content update below.
 
             let mut guard = state
                 .lock()
@@ -164,22 +169,37 @@ impl<B: Backend> TeleS3<B> {
             &expected_checksums,
         ) {
             self.release_blobs(vec![id]).await?;
-
+            let _ = self
+                .repo
+                .clear_publish_intents(std::slice::from_ref(&publish_id))
+                .await;
             return Err(e);
         }
 
         if let Some(expected) = req.input.content_md5 {
             let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
                 Ok(v) => v,
-                Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
+                Err(_) => {
+                    self.release_blobs(vec![id]).await?;
+                    let _ = self
+                        .repo
+                        .clear_publish_intents(std::slice::from_ref(&publish_id))
+                        .await;
+                    return Err(S3Error::new(S3ErrorCode::InvalidDigest));
+                }
             };
 
             if expected_digest[..] != hash_md5[..] {
                 self.release_blobs(vec![id]).await?;
-
+                let _ = self
+                    .repo
+                    .clear_publish_intents(std::slice::from_ref(&publish_id))
+                    .await;
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
             }
         }
+
+        let blob_id = id.clone();
 
         let multipart_upload_part = MultipartUploadPart {
             hash: hex::encode(hash_md5),
@@ -190,11 +210,14 @@ impl<B: Backend> TeleS3<B> {
             }],
         };
 
-        self.repo
-            .cas_update_multipart_content(
+        if let Err(e) = self
+            .repo
+            .cas_update_multipart_content_and_resolve(
                 &req.input.bucket,
                 &req.input.key,
                 &req.input.upload_id,
+                &publish_id,
+                &blob_id,
                 |content| {
                     let mut parts: BTreeMap<i32, MultipartUploadPart> =
                         serde_json::from_value(content.take()).map_err(S3Error::internal_error)?;
@@ -206,7 +229,15 @@ impl<B: Backend> TeleS3<B> {
                     Ok(())
                 },
             )
-            .await?;
+            .await
+        {
+            // The release settled this publish, so no intent needs to remain.
+            let _ = self
+                .repo
+                .clear_publish_intents(std::slice::from_ref(&publish_id))
+                .await;
+            return Err(e);
+        }
 
         let res = S3Response::new(UploadPartOutput {
             e_tag: Some(ETag::Strong(multipart_upload_part.hash)),
@@ -730,7 +761,7 @@ mod tests {
     use super::*;
     use crate::backend::Memory;
     use crate::s3::TeleS3;
-    use sea_orm::ConnectionTrait;
+    use sea_orm::{ConnectionTrait, EntityTrait};
 
     async fn test_service_with_upload() -> (TeleS3<Memory<1, 1>>, String) {
         let db = sea_orm::Database::connect("sqlite::memory:")
@@ -755,6 +786,36 @@ mod tests {
             .await
             .expect("create upload state");
         (svc, upload_id)
+    }
+
+    async fn intents(
+        svc: &TeleS3<impl Backend>,
+    ) -> Vec<crate::s3::repo::entity::publish_intent::Model> {
+        crate::s3::repo::entity::publish_intent::Entity::find()
+            .all(&svc.repo.db)
+            .await
+            .expect("load publish intents")
+    }
+
+    async fn blob_rows(svc: &TeleS3<impl Backend>) -> Vec<crate::s3::repo::entity::blob::Model> {
+        crate::s3::repo::entity::blob::Entity::find()
+            .all(&svc.repo.db)
+            .await
+            .expect("load blob rows")
+    }
+
+    /// Make every update of a publish intent fail, so a resolve failure is
+    /// observable without a broken database connection.
+    async fn refuse_publish_intent_updates(svc: &TeleS3<impl Backend>) {
+        svc.repo
+            .db
+            .execute_unprepared(
+                "CREATE TRIGGER refuse_publish_intent_update \
+                 BEFORE UPDATE ON s3_publish_intent \
+                 BEGIN SELECT RAISE(ABORT, 'intent update refused'); END",
+            )
+            .await
+            .expect("create trigger");
     }
 
     fn list_parts_req(upload_id: &str, max_parts: Option<i32>) -> S3Request<ListPartsInput> {
@@ -1040,5 +1101,58 @@ mod tests {
             .await
             .expect_err("an undecodable crc32 must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::InvalidDigest);
+    }
+
+    #[tokio::test]
+    async fn a_successful_part_resolves_its_publish_intent() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("upload part");
+
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1, "exactly one intent per part: {rows:?}");
+        assert!(
+            rows[0].resolved_at.is_some(),
+            "a confirmed part must resolve its intent: {rows:?}"
+        );
+        assert!(
+            rows[0].blob_id.is_some(),
+            "a resolved intent must record the blob id: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_intent_resolve_keeps_the_part_out_of_the_upload() {
+        // The content update and the resolve commit together. Otherwise the
+        // upload would link a part whose intent stays pending, and the reclaim
+        // pass would later delete the bytes of that live part.
+        let (svc, upload_id) = test_service_with_upload().await;
+        refuse_publish_intent_updates(&svc).await;
+
+        let err = svc
+            .upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect_err("a failed resolve must fail the part upload");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        let state = svc
+            .repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("load upload state");
+        assert_eq!(
+            state.content,
+            serde_json::json!({}),
+            "the failed resolve must roll back the part"
+        );
+        assert!(
+            blob_rows(&svc).await.is_empty(),
+            "the failed part must not leave a blob row behind"
+        );
+        assert!(
+            intents(&svc).await.is_empty(),
+            "the released part settles its publish, so no intent must remain"
+        );
     }
 }

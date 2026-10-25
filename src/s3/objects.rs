@@ -183,6 +183,14 @@ impl<B: Backend> TeleS3<B> {
             body_stream.into_boxed_reader()
         };
 
+        // The publish identifier is captured in an outer option so that the
+        // intent can be resolved (or cleared) at the right point later on:
+        // resolution must wait until the metadata publish commits, and
+        // clearing happens on the checksum/content_md5/discard paths. A
+        // `None` here means a zero-size object, which never recorded an
+        // intent.
+        let mut publish_id: Option<String> = None;
+
         let (id, hash_md5, computed_crc32, computed_crc32c, computed_sha1, computed_sha256) = {
             let state = Arc::new(Mutex::new(IntegrityDigests::default()));
 
@@ -194,27 +202,29 @@ impl<B: Backend> TeleS3<B> {
                 // answer never arrives. If the row cannot be written the
                 // backend must not be called at all: a publish with no record
                 // of it is unrecoverable, so failing here is strictly safer.
-                let publish_id = new_publish_id();
+                let pid = new_publish_id();
                 self.repo
                     .record_publish_intent(
-                        publish_id.clone(),
+                        pid.clone(),
                         req.input.bucket.clone(),
                         req.input.key.clone(),
                         size,
                     )
                     .await?;
 
+                publish_id = Some(pid.clone());
+
                 let id = self
                     .backend
-                    .write(publish_id.clone(), size, reader_with_hasher)
+                    .write(pid.clone(), size, reader_with_hasher)
                     .await
                     .map_err(S3Error::from)?;
 
-                // Only a confirmed publish clears the intent; on failure the
-                // row stays pending, which is the whole point of writing it.
-                self.repo
-                    .resolve_publish_intent(&publish_id, id.clone())
-                    .await?;
+                // Do NOT resolve the intent here: a later failure (checksum
+                // mismatch, content_md5 mismatch, or a failed metadata
+                // publish) would otherwise leave a resolved row that the
+                // reconciler cannot reclaim. Resolution is deferred until the
+                // metadata publish commits (see below).
 
                 Some(id)
             } else {
@@ -248,8 +258,18 @@ impl<B: Backend> TeleS3<B> {
             &computed_sha256,
             &expected,
         ) {
-            if let Some(id) = id {
-                self.discard_backend_blobs(vec![id]).await;
+            let discarded = match id {
+                Some(id) => self.discard_backend_blobs(vec![id]).await,
+                None => true,
+            };
+            // Clear the intent only after a confirmed delete. If the delete
+            // failed, the pending row is the only record of the bytes that
+            // are still in the backend.
+            if discarded && let Some(pid) = &publish_id {
+                let _ = self
+                    .repo
+                    .clear_publish_intents(std::slice::from_ref(pid))
+                    .await;
             }
             return Err(e);
         }
@@ -259,12 +279,35 @@ impl<B: Backend> TeleS3<B> {
             // variations in the client header don't cause false mismatches.
             let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
                 Ok(v) => v,
-                Err(_) => return Err(S3Error::new(S3ErrorCode::InvalidDigest)),
+                Err(_) => {
+                    let discarded = match id {
+                        Some(id) => self.discard_backend_blobs(vec![id]).await,
+                        None => true,
+                    };
+                    if discarded && let Some(pid) = &publish_id {
+                        let _ = self
+                            .repo
+                            .clear_publish_intents(std::slice::from_ref(pid))
+                            .await;
+                    }
+                    return Err(S3Error::new(S3ErrorCode::InvalidDigest));
+                }
             };
 
             if expected_digest[..] != hash_md5[..] {
-                if let Some(id) = id {
-                    self.discard_backend_blobs(vec![id]).await;
+                let discarded = match id {
+                    Some(id) => self.discard_backend_blobs(vec![id]).await,
+                    None => true,
+                };
+
+                // Clear the intent only after a confirmed delete. If the
+                // delete failed, the pending row is the only record of the
+                // bytes that are still in the backend.
+                if discarded && let Some(pid) = &publish_id {
+                    let _ = self
+                        .repo
+                        .clear_publish_intents(std::slice::from_ref(pid))
+                        .await;
                 }
 
                 return Err(S3Error::new(S3ErrorCode::BadDigest));
@@ -330,25 +373,40 @@ impl<B: Backend> TeleS3<B> {
             let bucket = req.input.bucket.clone();
             let key = req.input.key.clone();
 
-            // Blob row and object row are published in ONE transaction: a
-            // failure rolls both back, so no orphaned `s3_blob` row can
-            // survive the write. The caller then drops the backend bytes the
-            // rolled-back row would have owned.
-            let result = match id.clone() {
-                Some(blob_id) => {
+            // The blob row, the object row and the resolved intent are
+            // published in ONE transaction: a failure rolls all of them back,
+            // so no orphaned `s3_blob` row and no pending intent for a live
+            // object can survive the write. The caller then drops the backend
+            // bytes the rolled-back row would have owned.
+            let result = match (publish_id.as_deref(), id.clone()) {
+                (Some(pid), Some(blob_id)) => {
                     self.repo
-                        .publish_object_with_new_blob(blob_id, size, bucket, key, data, condition)
+                        .publish_object_with_new_blob(
+                            blob_id,
+                            Some(pid),
+                            bucket,
+                            key,
+                            data,
+                            condition,
+                        )
                         .await
                 }
-                None => self.repo.cas_put_object(bucket, key, data, condition).await,
+                (None, None) => self.repo.cas_put_object(bucket, key, data, condition).await,
+                // The identifier and the blob are set together by the
+                // `size > 0` branch above.
+                _ => Err(S3Error::internal_error(std::io::Error::other(
+                    "a write with a blob must carry a publish intent",
+                ))),
             };
 
             match result {
                 Ok(vid) => vid,
                 Err(err) => {
                     if let Some(id) = id {
-                        self.discard_backend_blobs(vec![id]).await;
+                        let _ = self.discard_backend_blobs(vec![id]).await;
                     }
+                    // Leave the intent pending: the reconciler can reclaim
+                    // the (possibly published) backend blob. Do NOT clear it.
                     return Err(err);
                 }
             }
@@ -1336,11 +1394,17 @@ mod tests {
     struct FlakyWrite {
         inner: Memory<8, 8>,
         fail_write: std::sync::atomic::AtomicBool,
+        fail_delete: std::sync::atomic::AtomicBool,
     }
 
     impl FlakyWrite {
         fn fail_writes(&self, fail: bool) {
             self.fail_write
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn fail_deletes(&self, fail: bool) {
+            self.fail_delete
                 .store(fail, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -1370,6 +1434,9 @@ mod tests {
         }
 
         async fn delete(&self, key: String) -> Result<(), BackendError> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(BackendError::Other("delete refused".into()));
+            }
             self.inner.delete(key).await
         }
 
@@ -1389,6 +1456,7 @@ mod tests {
             FlakyWrite {
                 inner: Memory::default(),
                 fail_write: std::sync::atomic::AtomicBool::new(false),
+                fail_delete: std::sync::atomic::AtomicBool::new(false),
             },
             db,
         )
@@ -2127,6 +2195,32 @@ mod tests {
         }
     }
 
+    /// A `PutObject` carrying `body` and a client `x-amz-checksum-crc32`.
+    fn put_body_with_crc32_req(
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+        checksum_crc32: &str,
+    ) -> S3Request<PutObjectInput> {
+        let mut req = put_body_req(bucket, key, Some(body.len() as i64), body);
+        req.input.checksum_crc32 = Some(checksum_crc32.to_string());
+        req
+    }
+
+    /// Make every update of a publish intent fail, so a resolve failure is
+    /// observable without a broken database connection.
+    async fn refuse_publish_intent_updates(svc: &TeleS3<impl Backend>) {
+        svc.repo
+            .db
+            .execute_unprepared(
+                "CREATE TRIGGER refuse_publish_intent_update \
+                 BEFORE UPDATE ON s3_publish_intent \
+                 BEGIN SELECT RAISE(ABORT, 'intent update refused'); END",
+            )
+            .await
+            .expect("create trigger");
+    }
+
     #[tokio::test]
     async fn a_successful_write_records_and_resolves_a_publish_intent() {
         let svc = flaky_write_service().await;
@@ -2187,6 +2281,136 @@ mod tests {
         );
         assert_eq!(row.bucket_id, "b");
         assert_eq!(row.object_id, "k");
+    }
+
+    #[tokio::test]
+    async fn a_failed_intent_resolve_does_not_publish_the_object() {
+        // The resolve is part of the publish transaction. If it fails, the
+        // object must not commit while its intent stays pending: the reclaim
+        // pass would later delete the bytes of a live object.
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        refuse_publish_intent_updates(&svc).await;
+
+        let err = svc
+            .put_object_inner(put_body_req("b", "k", Some(3), b"abc".to_vec()))
+            .await
+            .expect_err("a failed resolve must fail the write");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        assert!(
+            !svc.repo.object_exists("b", "k").await.expect("exists"),
+            "the failed resolve must roll back the object row"
+        );
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1, "the intent row must survive: {rows:?}");
+        assert!(
+            rows[0].resolved_at.is_none(),
+            "a failed resolve must leave the intent pending: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checksum_failure_keeps_the_intent_when_the_backend_delete_fails() {
+        // A failed delete leaves bytes with no metadata row. The pending
+        // intent is then the only record that can lead the reclaim pass back
+        // to them, so it must not be cleared.
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.backend.fail_deletes(true);
+
+        let err = svc
+            .put_object_inner(put_body_with_crc32_req(
+                "b",
+                "k",
+                b"abc".to_vec(),
+                "AAAAAA==",
+            ))
+            .await
+            .expect_err("a mismatching checksum must fail the write");
+        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1, "the intent row must survive: {rows:?}");
+        assert!(
+            rows[0].resolved_at.is_none(),
+            "a failed delete must keep the intent pending: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_content_md5_keeps_the_intent_when_the_backend_delete_fails() {
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.backend.fail_deletes(true);
+
+        let mut req = put_body_req("b", "k", Some(3), b"abc".to_vec());
+        req.input.content_md5 = Some("not base64!".into());
+
+        let err = svc
+            .put_object_inner(req)
+            .await
+            .expect_err("an undecodable content-md5 must fail the write");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidDigest);
+
+        let rows = intents(&svc).await;
+        assert_eq!(rows.len(), 1, "the intent row must survive: {rows:?}");
+        assert!(
+            rows[0].resolved_at.is_none(),
+            "a failed delete must keep the intent pending: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checksum_failure_clears_the_intent_after_the_backend_delete() {
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        let err = svc
+            .put_object_inner(put_body_with_crc32_req(
+                "b",
+                "k",
+                b"abc".to_vec(),
+                "AAAAAA==",
+            ))
+            .await
+            .expect_err("a mismatching checksum must fail the write");
+        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+
+        assert!(
+            intents(&svc).await.is_empty(),
+            "a confirmed delete settles the publish, so no intent must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_size_write_records_no_intent() {
+        let svc = flaky_write_service().await;
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        svc.put_object_inner(put_req("b", "k", Some(0)))
+            .await
+            .expect("put an empty object");
+
+        assert!(
+            intents(&svc).await.is_empty(),
+            "an empty body never calls the backend, so it has no publish to record"
+        );
     }
 
     #[tokio::test]

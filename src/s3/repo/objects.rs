@@ -127,8 +127,9 @@ impl Repository {
         }
     }
 
-    /// Atomic publish: record the freshly written blob row *and* the object
-    /// row in one transaction.
+    /// Atomic publish: record the freshly written blob row, the object row
+    /// and — when `publish_id` is set — the resolved publish intent in one
+    /// transaction.
     ///
     /// `PutObject` used to run [`Self::cas_put_object`] as a second
     /// transaction after `register_new_blob`. The backend blob already
@@ -138,24 +139,37 @@ impl Repository {
     /// already-factored `cas_put_object_txn` closes the window — both rows
     /// appear together or not at all.
     ///
+    /// The intent resolves in the same transaction for the same reason. A
+    /// resolve that ran after the commit could fail and leave a pending row
+    /// for a live object, and the reclaim pass would then delete its bytes.
+    /// If the resolve fails here, the whole publish rolls back.
+    ///
     /// Error mapping is unchanged: the condition check, the versioning
     /// branches and their codes all come from `cas_put_object_txn`.
     #[instrument(skip(self, data, condition), level = "debug", err)]
     pub async fn publish_object_with_new_blob(
         &self,
         blob_id: String,
-        blob_size: u64,
+        publish_id: Option<&str>,
         bucket: String,
         key: String,
         data: ObjectWrite,
         condition: PutCondition,
     ) -> S3Result<String> {
         let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+        let blob_size = data.size;
 
         let result = async {
-            Self::insert_blob(&txn, blob_id, blob_size).await?;
-            self.cas_put_object_txn(&txn, bucket, key, data, condition)
-                .await
+            Self::insert_blob(&txn, blob_id.clone(), blob_size).await?;
+            let version_id = self
+                .cas_put_object_txn(&txn, bucket, key, data, condition)
+                .await?;
+
+            if let Some(publish_id) = publish_id {
+                Self::resolve_publish_intent_txn(&txn, publish_id, blob_id).await?;
+            }
+
+            Ok(version_id)
         }
         .await;
 
@@ -1844,7 +1858,7 @@ mod tests {
         let version_id = repo
             .publish_object_with_new_blob(
                 "blob-1".into(),
-                1,
+                None,
                 "b".into(),
                 "k".into(),
                 write_with_content(content_for("blob-1"), "e1"),
@@ -1861,6 +1875,72 @@ mod tests {
 
         let object = repo.get_object("b", "k").await.expect("published object");
         assert_eq!(object.content, content_for("blob-1"));
+    }
+
+    #[tokio::test]
+    async fn publish_resolves_the_publish_intent_with_the_blob_id() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        repo.record_publish_intent("pid".into(), "b".into(), "k".into(), 1)
+            .await
+            .expect("record intent");
+
+        repo.publish_object_with_new_blob(
+            "blob-1".into(),
+            Some("pid"),
+            "b".into(),
+            "k".into(),
+            write_with_content(content_for("blob-1"), "e1"),
+            PutCondition::None,
+        )
+        .await
+        .expect("publish");
+
+        let intent = entity::publish_intent::Entity::find_by_id("pid".to_string())
+            .one(&repo.db)
+            .await
+            .expect("load intent")
+            .expect("intent row");
+        assert!(
+            intent.resolved_at.is_some(),
+            "the publish must resolve its intent: {intent:?}"
+        );
+        assert_eq!(intent.blob_id.as_deref(), Some("blob-1"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_publish_intent_rolls_back_the_publish() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+
+        // The publish must not commit an object whose intent it could not
+        // resolve. Such an object has no pending row, so the reclaim pass
+        // cannot find it, and no live row would record its key.
+        let err = repo
+            .publish_object_with_new_blob(
+                "blob-1".into(),
+                Some("missing"),
+                "b".into(),
+                "k".into(),
+                write_with_content(content_for("blob-1"), "e1"),
+                PutCondition::None,
+            )
+            .await
+            .expect_err("a missing intent must fail the publish");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        assert!(
+            blob_rows(&repo).await.is_empty(),
+            "the rolled-back publish must not leave a blob row behind"
+        );
+        assert!(
+            !repo.object_exists("b", "k").await.expect("exists"),
+            "the rolled-back publish must not leave an object row behind"
+        );
     }
 
     #[tokio::test]
@@ -1884,7 +1964,7 @@ mod tests {
         let err = repo
             .publish_object_with_new_blob(
                 "blob-orphan".into(),
-                1,
+                None,
                 "b".into(),
                 "k".into(),
                 write_with_content(content_for("blob-orphan"), "e2"),
@@ -1912,7 +1992,7 @@ mod tests {
         let err = repo
             .publish_object_with_new_blob(
                 "blob-orphan".into(),
-                1,
+                None,
                 "no-such-bucket".into(),
                 "k".into(),
                 write_with_content(content_for("blob-orphan"), "e1"),
@@ -1947,7 +2027,7 @@ mod tests {
 
         repo.publish_object_with_new_blob(
             "blob-1".into(),
-            1,
+            None,
             "b".into(),
             "k".into(),
             write_with_content(content_for("blob-1"), "e1"),

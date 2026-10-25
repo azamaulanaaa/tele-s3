@@ -2,8 +2,8 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::prelude::Expr;
 use sea_orm::sea_query::{IntoCondition, OnConflict};
 use sea_orm::{
-    ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-    QueryTrait, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait, Set, TransactionTrait,
 };
 use tracing::instrument;
 
@@ -187,12 +187,21 @@ impl Repository {
         key: &str,
         upload_id: &str,
     ) -> S3Result<entity::multipart_upload_state::Model> {
+        Self::find_multipart_upload_state(&self.db, bucket, key, upload_id).await
+    }
+
+    async fn find_multipart_upload_state<C: ConnectionTrait>(
+        conn: &C,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> S3Result<entity::multipart_upload_state::Model> {
         let model = entity::multipart_upload_state::Entity::find_by_id((
             bucket.to_string(),
             key.to_string(),
             upload_id.to_string(),
         ))
-        .one(&self.db)
+        .one(conn)
         .await
         .map_err(S3Error::internal_error)?
         .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
@@ -225,6 +234,50 @@ impl Repository {
         bucket: &str,
         key: &str,
         upload_id: &str,
+        action: F,
+    ) -> S3Result<()>
+    where
+        F: FnMut(&mut serde_json::Value) -> S3Result<()>,
+    {
+        self.cas_update_multipart_content_inner(bucket, key, upload_id, None, action)
+            .await
+    }
+
+    /// Commit a part update and resolve its publish intent in one transaction.
+    ///
+    /// The content update and the resolved intent must commit together. A
+    /// resolve that ran after the commit could fail and leave a pending row
+    /// for a part that is already linked, and the reclaim pass would then
+    /// delete its bytes.
+    #[instrument(skip(self, action), level = "debug", err)]
+    pub async fn cas_update_multipart_content_and_resolve<F>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        publish_id: &str,
+        blob_id: &str,
+        action: F,
+    ) -> S3Result<()>
+    where
+        F: FnMut(&mut serde_json::Value) -> S3Result<()>,
+    {
+        self.cas_update_multipart_content_inner(
+            bucket,
+            key,
+            upload_id,
+            Some((publish_id, blob_id)),
+            action,
+        )
+        .await
+    }
+
+    async fn cas_update_multipart_content_inner<F>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        resolve: Option<(&str, &str)>,
         mut action: F,
     ) -> S3Result<()>
     where
@@ -233,32 +286,56 @@ impl Repository {
         const MAX_ATTEMPTS: usize = 8;
 
         for _ in 0..MAX_ATTEMPTS {
-            let model = self
-                .get_multipart_upload_state(bucket, key, upload_id)
-                .await?;
+            let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
 
-            let mut new_content = model.content.clone();
-            action(&mut new_content)?;
+            let result: S3Result<bool> = async {
+                let model = Self::find_multipart_upload_state(&txn, bucket, key, upload_id).await?;
 
-            if new_content == model.content {
-                return Ok(());
+                let mut new_content = model.content.clone();
+                action(&mut new_content)?;
+
+                if new_content != model.content {
+                    let result = entity::multipart_upload_state::Entity::update_many()
+                        .col_expr(
+                            entity::multipart_upload_state::Column::Content,
+                            Expr::value(new_content),
+                        )
+                        .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
+                        .filter(entity::multipart_upload_state::Column::ObjectId.eq(key))
+                        .filter(entity::multipart_upload_state::Column::UploadId.eq(upload_id))
+                        .filter(
+                            entity::multipart_upload_state::Column::Content
+                                .eq(model.content.clone()),
+                        )
+                        .exec(&txn)
+                        .await
+                        .map_err(S3Error::internal_error)?;
+
+                    if result.rows_affected != 1 {
+                        return Ok(false);
+                    }
+                }
+
+                if let Some((publish_id, blob_id)) = resolve {
+                    Self::resolve_publish_intent_txn(&txn, publish_id, blob_id.to_string()).await?;
+                }
+
+                Ok(true)
             }
+            .await;
 
-            let result = entity::multipart_upload_state::Entity::update_many()
-                .col_expr(
-                    entity::multipart_upload_state::Column::Content,
-                    Expr::value(new_content),
-                )
-                .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
-                .filter(entity::multipart_upload_state::Column::ObjectId.eq(key))
-                .filter(entity::multipart_upload_state::Column::UploadId.eq(upload_id))
-                .filter(entity::multipart_upload_state::Column::Content.eq(model.content.clone()))
-                .exec(&self.db)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            if result.rows_affected == 1 {
-                return Ok(());
+            match result {
+                Ok(true) => {
+                    txn.commit().await.map_err(S3Error::internal_error)?;
+                    return Ok(());
+                }
+                Ok(false) => {
+                    txn.rollback().await.map_err(S3Error::internal_error)?;
+                }
+                Err(err) => {
+                    txn.rollback().await.map_err(S3Error::internal_error)?;
+                    return Err(err);
+                }
             }
         }
 
@@ -470,5 +547,83 @@ mod tests {
             .expect("oversized max-uploads must be clamped, not rejected");
         assert_eq!(models.len(), 2);
         assert!(!is_truncated);
+    }
+
+    #[tokio::test]
+    async fn a_part_update_resolves_its_publish_intent_with_the_blob_id() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["k"], 1).await;
+        repo.record_publish_intent("pid".into(), "b".into(), "k".into(), 1)
+            .await
+            .expect("record intent");
+
+        repo.cas_update_multipart_content_and_resolve("b", "k", "u0", "pid", "blob-1", |content| {
+            *content = serde_json::json!({
+                "1": {"hash": "d", "metadata_items": [{"id": "blob-1", "offset": 0, "size": 1}]}
+            });
+            Ok(())
+        })
+        .await
+        .expect("update part");
+
+        let state = repo
+            .get_multipart_upload_state("b", "k", "u0")
+            .await
+            .expect("load state");
+        assert_eq!(
+            state.content["1"]["metadata_items"][0]["id"], "blob-1",
+            "the part must link the new blob: {:?}",
+            state.content
+        );
+
+        let intent = entity::publish_intent::Entity::find_by_id("pid".to_string())
+            .one(&repo.db)
+            .await
+            .expect("load intent")
+            .expect("intent row");
+        assert!(
+            intent.resolved_at.is_some(),
+            "the part update must resolve its intent: {intent:?}"
+        );
+        assert_eq!(intent.blob_id.as_deref(), Some("blob-1"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_publish_intent_rolls_back_the_part_update() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["k"], 1).await;
+        let before = repo
+            .get_multipart_upload_state("b", "k", "u0")
+            .await
+            .expect("load state")
+            .content;
+
+        // A part that commits while its intent cannot resolve would leave the
+        // reclaim pass a pending row for live bytes. The update must roll
+        // back instead.
+        let err = repo
+            .cas_update_multipart_content_and_resolve(
+                "b",
+                "k",
+                "u0",
+                "missing",
+                "blob-1",
+                |content| {
+                    *content = serde_json::json!({
+                        "1": {"hash": "d", "metadata_items": [{"id": "blob-1", "offset": 0, "size": 1}]}
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("a missing intent must fail the part update");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+
+        let after = repo
+            .get_multipart_upload_state("b", "k", "u0")
+            .await
+            .expect("load state")
+            .content;
+        assert_eq!(after, before, "the part update must roll back");
     }
 }

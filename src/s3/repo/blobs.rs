@@ -93,11 +93,33 @@ impl Repository {
     /// Only ever called on the success path. A failed write leaves the row
     /// pending on purpose — that pending row is the only record an
     /// unpublished-but-published-anyway object can be found by.
-    #[instrument(skip(self), level = "debug", err)]
+    ///
+    /// Test-only: every production success path resolves inside the publish
+    /// transaction, through [`Self::resolve_publish_intent_txn`].
+    #[cfg(test)]
     pub async fn resolve_publish_intent(&self, publish_id: &str, blob_id: String) -> S3Result<()> {
+        Self::resolve_publish_intent_txn(&self.db, publish_id, blob_id).await
+    }
+
+    /// Mark an intent resolved on any connection.
+    ///
+    /// The metadata publish passes its own transaction here. The object row,
+    /// the blob row and the resolved intent then commit together, so a
+    /// committed object can never leave its intent pending for the reclaim
+    /// pass to delete its live bytes.
+    ///
+    /// A missing or already-resolved row is an error. At this point the write
+    /// has already produced a backend blob, so continuing would create the
+    /// unrecorded publish that the intent exists to prevent.
+    #[instrument(skip(conn), level = "debug", err)]
+    pub(super) async fn resolve_publish_intent_txn<C: ConnectionTrait>(
+        conn: &C,
+        publish_id: &str,
+        blob_id: String,
+    ) -> S3Result<()> {
         let now = chrono::Local::now().to_utc();
 
-        entity::publish_intent::Entity::update_many()
+        let result = entity::publish_intent::Entity::update_many()
             .col_expr(
                 entity::publish_intent::Column::BlobId,
                 sea_orm::sea_query::Expr::value(blob_id),
@@ -108,9 +130,15 @@ impl Repository {
             )
             .filter(entity::publish_intent::Column::PublishId.eq(publish_id))
             .filter(entity::publish_intent::Column::ResolvedAt.is_null())
-            .exec(&self.db)
+            .exec(conn)
             .await
             .map_err(S3Error::internal_error)?;
+
+        if result.rows_affected != 1 {
+            return Err(S3Error::internal_error(std::io::Error::other(
+                "publish intent was not pending",
+            )));
+        }
 
         Ok(())
     }
