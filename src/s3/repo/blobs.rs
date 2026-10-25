@@ -4,12 +4,18 @@ use s3s::{S3Error, S3Result};
 use sea_orm::prelude::Expr;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
-    QuerySelect, QueryTrait, Set,
+    QuerySelect, QueryTrait, Set, TransactionTrait,
 };
 use tracing::instrument;
 
 use super::Repository;
 use super::entity;
+
+/// Reference count that marks a row as claimed for backend deletion.
+///
+/// The value is below any count an old underflow can produce. A row left
+/// negative by an old bug still reads as released, not as claimed.
+const BLOB_REF_DELETING: i64 = i64::MIN;
 
 impl Repository {
     /// Insert a blob row owned by a single reference.
@@ -164,36 +170,75 @@ impl Repository {
     /// concurrent acquirers cannot lose increments the way a
     /// check-then-insert can. A previously unknown blob is seeded with a
     /// single reference owned by the caller acquiring it.
+    ///
+    /// All increments commit together. If any id is claimed for deletion,
+    /// the transaction rolls back and the call fails: the backend bytes may
+    /// already be gone, so a reference must never be created for that id.
     #[instrument(skip(self, items), level = "debug", err)]
     pub async fn acquire_blob_refs(&self, items: &[(String, u64)]) -> S3Result<()> {
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
-        let backend = self.db.get_database_backend();
-        for (id, size) in items {
-            let size32 = Self::checked_size(*size)?;
-            let now = chrono::Local::now().to_utc();
-            let values = [
-                sea_orm::Value::from(id.clone()),
-                sea_orm::Value::from(size32),
-                sea_orm::Value::from(now),
-            ];
-            let sql = match backend {
-                DbBackend::MySql => "INSERT INTO `s3_blob` (`id`, `size`, `refs`, `created_at`) VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE `refs` = `refs` + 1".to_string(),
-                DbBackend::Postgres => "INSERT INTO \"s3_blob\" (\"id\", \"size\", \"refs\", \"created_at\") VALUES ($1, $2, 1, $3) ON CONFLICT (\"id\") DO UPDATE SET \"refs\" = \"s3_blob\".\"refs\" + 1".to_string(),
-                _ => "INSERT INTO \"s3_blob\" (\"id\", \"size\", \"refs\", \"created_at\") VALUES (?, ?, 1, ?) ON CONFLICT (\"id\") DO UPDATE SET \"refs\" = \"s3_blob\".\"refs\" + 1".to_string(),
-            };
-
-            self.db
-                .execute_raw(Statement::from_sql_and_values(backend, sql, values))
-                .await
-                .map_err(S3Error::internal_error)?;
+        if items.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        let backend = self.db.get_database_backend();
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result: S3Result<()> = async {
+            for (id, size) in items {
+                let size32 = Self::checked_size(*size)?;
+                let now = chrono::Local::now().to_utc();
+                let values = [
+                    sea_orm::Value::from(id.clone()),
+                    sea_orm::Value::from(size32),
+                    sea_orm::Value::from(now),
+                ];
+                let sql = match backend {
+                    DbBackend::MySql => "INSERT INTO `s3_blob` (`id`, `size`, `refs`, `created_at`) VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE `refs` = `refs` + 1".to_string(),
+                    DbBackend::Postgres => "INSERT INTO \"s3_blob\" (\"id\", \"size\", \"refs\", \"created_at\") VALUES ($1, $2, 1, $3) ON CONFLICT (\"id\") DO UPDATE SET \"refs\" = \"s3_blob\".\"refs\" + 1".to_string(),
+                    _ => "INSERT INTO \"s3_blob\" (\"id\", \"size\", \"refs\", \"created_at\") VALUES (?, ?, 1, ?) ON CONFLICT (\"id\") DO UPDATE SET \"refs\" = \"s3_blob\".\"refs\" + 1".to_string(),
+                };
+
+                txn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                let after = entity::blob::Entity::find_by_id(id.clone())
+                    .one(&txn)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                let acquired = matches!(after, Some(model) if model.refs > 0);
+                if !acquired {
+                    return Err(S3Error::internal_error(std::io::Error::other(format!(
+                        "blob {id} is claimed for deletion; the acquire was rolled back"
+                    ))));
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(())
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
     }
 
     /// Drop one reference for each listed blob id and return the ids whose
     /// count reached zero.
+    ///
+    /// Each id is decremented by one atomic statement. The update respects a
+    /// concurrent increment, clamps the count at zero, and only one caller
+    /// can report the id that reached zero.
     ///
     /// The rows of the returned ids are deliberately *kept*: the caller must
     /// attempt the backend delete first and only then call
@@ -215,31 +260,156 @@ impl Repository {
             *counts.entry(id.as_str()).or_default() += 1;
         }
 
-        for (id, n) in &counts {
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result: S3Result<Vec<String>> = async {
+            let mut distinct: Vec<&str> = counts.keys().copied().collect();
+            distinct.sort_unstable();
+
+            let mut released: Vec<String> = Vec::new();
+
+            for id in distinct {
+                let n = counts[id];
+
+                // One statement subtracts and clamps. A row that is already
+                // zero or negative is left alone, so a repeated release can
+                // never drive the count down again.
+                let updated = entity::blob::Entity::update_many()
+                    .col_expr(
+                        entity::blob::Column::Refs,
+                        Expr::case(
+                            Expr::col(entity::blob::Column::Refs).lte(n),
+                            Expr::value(0i64),
+                        )
+                        .finally(Expr::col(entity::blob::Column::Refs).sub(n))
+                        .into(),
+                    )
+                    .filter(entity::blob::Column::Id.eq(id))
+                    .filter(entity::blob::Column::Refs.gt(0))
+                    .exec(&txn)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if updated.rows_affected == 0 {
+                    // Absent, already released, or claimed for deletion.
+                    continue;
+                }
+
+                // The update holds the row until commit, so this read sees
+                // the value this call produced and no later writer.
+                let after = entity::blob::Entity::find_by_id(id.to_string())
+                    .one(&txn)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if after.is_none_or(|model| model.refs <= 0) {
+                    released.push(id.to_string());
+                }
+            }
+
+            released.sort_unstable();
+            Ok(released)
+        }
+        .await;
+
+        match result {
+            Ok(released) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(released)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Claim released rows for backend deletion.
+    ///
+    /// The claim moves `refs` to [`BLOB_REF_DELETING`], so only one caller
+    /// can own the delete. An acquirer that meets the sentinel fails and
+    /// rolls back instead of creating a reference to deleted bytes.
+    ///
+    /// Returns the ids this call claimed. A row that another caller already
+    /// claimed is not returned.
+    #[instrument(skip(self, ids), level = "debug", err)]
+    pub async fn claim_released_blob_rows(&self, ids: &[String]) -> S3Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result: S3Result<Vec<String>> = async {
+            let mut distinct: Vec<&str> = ids.iter().map(String::as_str).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+
+            let mut claimed: Vec<String> = Vec::new();
+
+            for id in distinct {
+                let updated = entity::blob::Entity::update_many()
+                    .col_expr(entity::blob::Column::Refs, Expr::value(BLOB_REF_DELETING))
+                    .filter(entity::blob::Column::Id.eq(id))
+                    .filter(entity::blob::Column::Refs.lte(0))
+                    .filter(entity::blob::Column::Refs.ne(BLOB_REF_DELETING))
+                    .exec(&txn)
+                    .await
+                    .map_err(S3Error::internal_error)?;
+
+                if updated.rows_affected > 0 {
+                    claimed.push(id.to_string());
+                }
+            }
+
+            claimed.sort_unstable();
+            Ok(claimed)
+        }
+        .await;
+
+        match result {
+            Ok(claimed) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(claimed)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Put claimed rows back into the released state.
+    ///
+    /// Call this when the backend delete fails. A later release can then try
+    /// the delete again.
+    #[instrument(skip(self, ids), level = "debug", err)]
+    pub async fn restore_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in ids.chunks(Self::BLOB_DELETE_CHUNK) {
             entity::blob::Entity::update_many()
-                .col_expr(
-                    entity::blob::Column::Refs,
-                    Expr::col(entity::blob::Column::Refs).sub(*n),
-                )
-                .filter(entity::blob::Column::Id.eq(*id))
+                .col_expr(entity::blob::Column::Refs, Expr::value(0i64))
+                .filter(entity::blob::Column::Id.is_in(chunk.to_vec()))
+                .filter(entity::blob::Column::Refs.eq(BLOB_REF_DELETING))
                 .exec(&self.db)
                 .await
                 .map_err(S3Error::internal_error)?;
         }
 
-        let mut distinct: Vec<String> = counts.keys().map(|s| s.to_string()).collect();
-        distinct.sort_unstable();
+        Ok(())
+    }
 
-        // Only report ids this call released; other zero-ref rows (if any)
-        // belong to other callers.
-        let released = entity::blob::Entity::find()
-            .filter(entity::blob::Column::Id.is_in(distinct))
-            .filter(entity::blob::Column::Refs.lte(0))
-            .all(&self.db)
+    /// Current reference count for a blob id (0 if the row is absent).
+    #[instrument(skip(self), level = "debug", err)]
+    pub async fn blob_ref_count(&self, id: &str) -> S3Result<i64> {
+        let model = entity::blob::Entity::find_by_id(id.to_string())
+            .one(&self.db)
             .await
             .map_err(S3Error::internal_error)?;
-
-        Ok(released.into_iter().map(|model| model.id).collect())
+        Ok(model.map(|m| m.refs).unwrap_or(0))
     }
 
     /// Delete blob rows whose backend data the caller has already removed.
@@ -613,6 +783,15 @@ mod tests {
         .unwrap_or_else(|e| panic!("seed blob {id}: {e:?}"));
     }
 
+    async fn set_blob_refs(repo: &Repository, id: &str, refs: i64) {
+        entity::blob::Entity::update_many()
+            .col_expr(entity::blob::Column::Refs, Expr::value(refs))
+            .filter(entity::blob::Column::Id.eq(id))
+            .exec(&repo.db)
+            .await
+            .unwrap_or_else(|e| panic!("set refs for {id}: {e:?}"));
+    }
+
     fn object_content(blob_id: &str) -> serde_json::Value {
         serde_json::json!({"item": [{"id": blob_id, "offset": 0, "size": 1}]})
     }
@@ -768,5 +947,167 @@ mod tests {
             .await
             .expect("no-op delete");
         assert_eq!(blob_ids(&repo).await, ["b2"]);
+    }
+
+    #[tokio::test]
+    async fn release_counts_duplicate_ids_and_clamps_at_zero() {
+        let repo = repo().await;
+        repo.register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+
+        // One call can name the same blob many times. It must drop all of
+        // its references and stop at zero.
+        let ids = vec!["b1".to_string(); 3];
+        let released = repo.release_blob_refs(&ids).await.expect("release");
+        assert_eq!(released, ["b1"]);
+        assert_eq!(
+            repo.blob_ref_count("b1").await.expect("count"),
+            0,
+            "three releases against one reference must not go negative"
+        );
+
+        let again = repo.release_blob_refs(&ids).await.expect("release again");
+        assert!(again.is_empty(), "a zero row is not released twice");
+        assert_eq!(repo.blob_ref_count("b1").await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn release_reports_only_the_call_that_reaches_zero() {
+        let repo = repo().await;
+        repo.register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+        set_blob_refs(&repo, "b1", 2).await;
+
+        let first = repo
+            .release_blob_refs(&["b1".to_string()])
+            .await
+            .expect("first release");
+        assert!(first.is_empty(), "one of two references still remains");
+        assert_eq!(repo.blob_ref_count("b1").await.expect("count"), 1);
+
+        let second = repo
+            .release_blob_refs(&["b1".to_string()])
+            .await
+            .expect("second release");
+        assert_eq!(second, ["b1"], "only the last release reports the blob");
+        assert_eq!(repo.blob_ref_count("b1").await.expect("count"), 0);
+
+        let third = repo
+            .release_blob_refs(&["b1".to_string()])
+            .await
+            .expect("third release");
+        assert!(third.is_empty(), "an already released row is not reported");
+    }
+
+    #[tokio::test]
+    async fn a_reacquired_blob_is_not_claimed_for_deletion() {
+        let repo = repo().await;
+        repo.register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+
+        let released = repo
+            .release_blob_refs(&["b1".to_string()])
+            .await
+            .expect("release");
+        assert_eq!(released, ["b1"]);
+
+        // A concurrent copy can take the row back after the count reached
+        // zero and before the caller claims it.
+        repo.acquire_blob_refs(&[("b1".to_string(), 1)])
+            .await
+            .expect("re-acquire");
+
+        let claimed = repo
+            .claim_released_blob_rows(&["b1".to_string()])
+            .await
+            .expect("claim");
+        assert!(
+            claimed.is_empty(),
+            "a live reference must keep the row out of the delete claim"
+        );
+        assert_eq!(repo.blob_ref_count("b1").await.expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_blob_cannot_be_acquired_until_it_is_restored() {
+        let repo = repo().await;
+        repo.register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+        repo.release_blob_refs(&["b1".to_string()])
+            .await
+            .expect("release");
+
+        let claimed = repo
+            .claim_released_blob_rows(&["b1".to_string()])
+            .await
+            .expect("claim");
+        assert_eq!(claimed, ["b1"]);
+        assert_eq!(
+            repo.blob_ref_count("b1").await.expect("count"),
+            BLOB_REF_DELETING
+        );
+
+        let again = repo
+            .claim_released_blob_rows(&["b1".to_string()])
+            .await
+            .expect("claim again");
+        assert!(again.is_empty(), "one caller owns the delete");
+
+        let err = repo
+            .acquire_blob_refs(&[("b1".to_string(), 1)])
+            .await
+            .expect_err("an acquire must not resurrect a claimed blob");
+        let cause = err.source().expect("the acquire cause is kept").to_string();
+        assert!(
+            cause.contains("claimed for deletion"),
+            "the error must name the cause: {cause}"
+        );
+        assert_eq!(
+            repo.blob_ref_count("b1").await.expect("count"),
+            BLOB_REF_DELETING,
+            "a failed acquire must roll back all of its increments"
+        );
+
+        repo.restore_released_blob_rows(&["b1".to_string()])
+            .await
+            .expect("restore");
+        assert_eq!(repo.blob_ref_count("b1").await.expect("count"), 0);
+
+        repo.acquire_blob_refs(&[("b1".to_string(), 1)])
+            .await
+            .expect("acquire after restore");
+        assert_eq!(repo.blob_ref_count("b1").await.expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_claim_takes_legacy_negative_rows_and_leaves_live_rows() {
+        let repo = repo().await;
+        repo.register_new_blob("live".into(), 1)
+            .await
+            .expect("register");
+        repo.register_new_blob("legacy".into(), 1)
+            .await
+            .expect("register");
+        set_blob_refs(&repo, "legacy", -3).await;
+
+        let claimed = repo
+            .claim_released_blob_rows(&["live".to_string(), "legacy".to_string()])
+            .await
+            .expect("claim");
+
+        assert_eq!(
+            claimed,
+            ["legacy"],
+            "a negative row from an old bug must still become collectable"
+        );
+        assert_eq!(repo.blob_ref_count("live").await.expect("count"), 1);
+        assert_eq!(
+            repo.blob_ref_count("legacy").await.expect("count"),
+            BLOB_REF_DELETING
+        );
     }
 }

@@ -123,22 +123,42 @@ impl<B: Backend> TeleS3<B> {
     /// the blob stays accounted for instead of becoming invisible data that
     /// nothing ever retries.
     ///
+    /// The claim before the backend call is atomic. A concurrent acquirer
+    /// either takes the blob first, in which case the claim fails, or meets
+    /// the claim and fails its own acquire. The bytes can never disappear
+    /// under a reference that was created after the delete.
+    ///
     /// Backend deletion failures never fail the user request (best-effort
     /// cleanup) but are logged; refcount bookkeeping failures propagate.
     async fn release_blobs(&self, ids: Vec<String>) -> S3Result<()> {
-        let zero_ids = self.repo.release_blob_refs(&ids).await?;
+        let released = self.repo.release_blob_refs(&ids).await?;
 
-        if zero_ids.is_empty() {
+        // Candidates are the ids this call released, plus any ids that were
+        // already at a zero refcount (e.g. a previous backend delete that
+        // failed and left the row behind) so a retry can finish the cleanup.
+        let mut candidates: Vec<String> = released.clone();
+        for id in &ids {
+            if !candidates.contains(id) && self.repo.blob_ref_count(id).await? <= 0 {
+                candidates.push(id.clone());
+            }
+        }
+
+        // Claiming the zero rows replaces the old count re-check. The claim
+        // and the acquire guard are atomic, so a re-acquired blob is never
+        // handed to the backend delete.
+        let claimed = self.repo.claim_released_blob_rows(&candidates).await?;
+
+        if claimed.is_empty() {
             return Ok(());
         }
 
         let results =
-            futures::future::join_all(zero_ids.iter().map(|id| self.backend.delete(id.clone())))
+            futures::future::join_all(claimed.iter().map(|id| self.backend.delete(id.clone())))
                 .await;
 
-        let mut deleted: Vec<String> = Vec::with_capacity(zero_ids.len());
-        let mut failed: Vec<String> = Vec::with_capacity(zero_ids.len());
-        for (id, result) in zero_ids.iter().zip(results) {
+        let mut deleted: Vec<String> = Vec::with_capacity(claimed.len());
+        let mut failed: Vec<String> = Vec::with_capacity(claimed.len());
+        for (id, result) in claimed.iter().zip(results) {
             match result {
                 Ok(()) => deleted.push(id.clone()),
                 Err(err) => {
@@ -148,7 +168,10 @@ impl<B: Backend> TeleS3<B> {
             }
         }
 
-        self.repo.delete_released_blob_rows(&deleted).await?;
+        let row_delete = self.repo.delete_released_blob_rows(&deleted).await;
+        let restore = self.repo.restore_released_blob_rows(&failed).await;
+        row_delete?;
+        restore?;
 
         if !failed.is_empty() {
             tracing::warn!(
@@ -624,6 +647,24 @@ mod tests {
         }
     }
 
+    /// A backend whose delete pauses until the test lets it finish, so the
+    /// delete claim is observable while it is in flight.
+    struct PausedDelete {
+        inner: Memory<8, 8>,
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl PausedDelete {
+        fn new() -> Self {
+            Self {
+                inner: Memory::default(),
+                started: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
     /// A backend whose answer to `reclaim_publish` is dictated by the test,
     /// so every arm of the sweep's decision is reachable without a Telegram
     /// session.
@@ -722,6 +763,40 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Backend for PausedDelete {
+        async fn write(
+            &self,
+            publish_id: String,
+            size: u64,
+            reader: BoxedAsyncReader,
+        ) -> Result<String, BackendError> {
+            self.inner.write(publish_id, size, reader).await
+        }
+
+        async fn read(
+            &self,
+            key: String,
+            offset: u64,
+            limit: Option<u64>,
+        ) -> Result<ReadOutcome, BackendError> {
+            self.inner.read(key, offset, limit).await
+        }
+
+        async fn delete(&self, key: String) -> Result<(), BackendError> {
+            self.started.notify_one();
+            self.resume.notified().await;
+            self.inner.delete(key).await
+        }
+
+        async fn reclaim_publish(
+            &self,
+            publish_id: String,
+        ) -> Result<ReclaimOutcome, BackendError> {
+            self.inner.reclaim_publish(publish_id).await
+        }
+    }
+
     async fn service(fail_delete: bool) -> TeleS3<FlakyDelete> {
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
@@ -729,6 +804,13 @@ mod tests {
         TeleS3::init(FlakyDelete::new(fail_delete), db)
             .await
             .expect("init")
+    }
+
+    async fn paused_service() -> TeleS3<PausedDelete> {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        TeleS3::init(PausedDelete::new(), db).await.expect("init")
     }
 
     /// A service over a scripted backend, so every reclaim arm is reachable.
@@ -962,7 +1044,7 @@ mod tests {
         );
     }
 
-    async fn blob_rows(svc: &TeleS3<FlakyDelete>) -> Vec<i64> {
+    async fn blob_rows<B: Backend>(svc: &TeleS3<B>) -> Vec<i64> {
         let mut rows: Vec<i64> = entity::blob::Entity::find()
             .all(&svc.repo.db)
             .await
@@ -1137,6 +1219,47 @@ mod tests {
         assert!(
             blob_rows(&svc).await.is_empty(),
             "a confirmed delete must drop the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acquire_fails_while_the_delete_of_its_blob_is_in_flight() {
+        let svc = std::sync::Arc::new(paused_service().await);
+        svc.repo
+            .register_new_blob("b1".into(), 1)
+            .await
+            .expect("register");
+
+        let release = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.release_blobs(vec!["b1".to_string()]).await })
+        };
+
+        // The delete is paused after the row was claimed.
+        svc.backend.started.notified().await;
+
+        let err = svc
+            .repo
+            .acquire_blob_refs(&[("b1".to_string(), 1)])
+            .await
+            .expect_err("a blob under deletion must not gain a reference");
+        assert!(
+            err.source()
+                .expect("the acquire cause is kept")
+                .to_string()
+                .contains("claimed for deletion"),
+            "the acquire must report the delete claim"
+        );
+
+        svc.backend.resume.notify_one();
+        release
+            .await
+            .expect("join release task")
+            .expect("release completes");
+
+        assert!(
+            blob_rows(&svc).await.is_empty(),
+            "the confirmed delete must drop the row"
         );
     }
 
