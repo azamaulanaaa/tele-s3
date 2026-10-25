@@ -193,15 +193,16 @@ impl Repository {
 
     /// Acquire one additional reference for each listed blob.
     ///
-    /// Implemented as a single atomic upsert
-    /// (`INSERT ... ON CONFLICT DO UPDATE SET refs = refs + 1`), so
-    /// concurrent acquirers cannot lose increments the way a
+    /// Each upsert is atomic (`INSERT ... ON CONFLICT DO UPDATE SET refs =
+    /// refs + 1`), so concurrent acquirers cannot lose increments the way a
     /// check-then-insert can. A previously unknown blob is seeded with a
     /// single reference owned by the caller acquiring it.
     ///
     /// All increments commit together. If any id is claimed for deletion,
     /// the transaction rolls back and the call fails: the backend bytes may
     /// already be gone, so a reference must never be created for that id.
+    /// A failure on any item therefore leaves no reference acquired by this
+    /// call, so the caller has nothing to release after it returns an error.
     #[instrument(skip(self, items), level = "debug", err)]
     pub async fn acquire_blob_refs(&self, items: &[(String, u64)]) -> S3Result<()> {
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
@@ -263,6 +264,8 @@ impl Repository {
 
     /// Drop one reference for each listed blob id and return the ids whose
     /// count reached zero.
+    /// Drop one reference for each listed blob id and return the ids whose
+    /// count reached zero.
     ///
     /// Each id is decremented by one atomic statement. The update respects a
     /// concurrent increment, clamps the count at zero, and only one caller
@@ -280,65 +283,8 @@ impl Repository {
             return Ok(Vec::new());
         }
 
-        // The same blob may back several slices of one object (e.g.
-        // repeated UploadPartCopy ranges); each slice holds its own
-        // reference, so count occurrences instead of decrementing once.
-        let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
-        for id in ids {
-            *counts.entry(id.as_str()).or_default() += 1;
-        }
-
         let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
-
-        let result: S3Result<Vec<String>> = async {
-            let mut distinct: Vec<&str> = counts.keys().copied().collect();
-            distinct.sort_unstable();
-
-            let mut released: Vec<String> = Vec::new();
-
-            for id in distinct {
-                let n = counts[id];
-
-                // One statement subtracts and clamps. A row that is already
-                // zero or negative is left alone, so a repeated release can
-                // never drive the count down again.
-                let updated = entity::blob::Entity::update_many()
-                    .col_expr(
-                        entity::blob::Column::Refs,
-                        Expr::case(
-                            Expr::col(entity::blob::Column::Refs).lte(n),
-                            Expr::value(0i64),
-                        )
-                        .finally(Expr::col(entity::blob::Column::Refs).sub(n))
-                        .into(),
-                    )
-                    .filter(entity::blob::Column::Id.eq(id))
-                    .filter(entity::blob::Column::Refs.gt(0))
-                    .exec(&txn)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-
-                if updated.rows_affected == 0 {
-                    // Absent, already released, or claimed for deletion.
-                    continue;
-                }
-
-                // The update holds the row until commit, so this read sees
-                // the value this call produced and no later writer.
-                let after = entity::blob::Entity::find_by_id(id.to_string())
-                    .one(&txn)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-
-                if after.is_none_or(|model| model.refs <= 0) {
-                    released.push(id.to_string());
-                }
-            }
-
-            released.sort_unstable();
-            Ok(released)
-        }
-        .await;
+        let result = Self::release_blob_refs_on(&txn, ids).await;
 
         match result {
             Ok(released) => {
@@ -350,6 +296,80 @@ impl Repository {
                 Err(err)
             }
         }
+    }
+
+    /// Drop one reference for each listed blob id on `conn` and return the
+    /// ids whose count reached zero.
+    ///
+    /// The caller owns the transaction. That lets a larger state change (such
+    /// as deleting a multipart upload) commit together with the reference
+    /// release, so a failure cannot separate the two.
+    ///
+    /// Each id is decremented by one atomic statement. The update respects a
+    /// concurrent increment, clamps the count at zero, and only one caller
+    /// can report the id that reached zero.
+    pub(super) async fn release_blob_refs_on<C: ConnectionTrait>(
+        conn: &C,
+        ids: &[String],
+    ) -> S3Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The same blob may back several slices of one object (e.g.
+        // repeated UploadPartCopy ranges); each slice holds its own
+        // reference, so count occurrences instead of decrementing once.
+        let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for id in ids {
+            *counts.entry(id.as_str()).or_default() += 1;
+        }
+
+        let mut distinct: Vec<&str> = counts.keys().copied().collect();
+        distinct.sort_unstable();
+
+        let mut released: Vec<String> = Vec::new();
+
+        for id in distinct {
+            let n = counts[id];
+
+            // One statement subtracts and clamps. A row that is already
+            // zero or negative is left alone, so a repeated release can
+            // never drive the count down again.
+            let updated = entity::blob::Entity::update_many()
+                .col_expr(
+                    entity::blob::Column::Refs,
+                    Expr::case(
+                        Expr::col(entity::blob::Column::Refs).lte(n),
+                        Expr::value(0i64),
+                    )
+                    .finally(Expr::col(entity::blob::Column::Refs).sub(n))
+                    .into(),
+                )
+                .filter(entity::blob::Column::Id.eq(id))
+                .filter(entity::blob::Column::Refs.gt(0))
+                .exec(conn)
+                .await
+                .map_err(S3Error::internal_error)?;
+
+            if updated.rows_affected == 0 {
+                // Absent, already released, or claimed for deletion.
+                continue;
+            }
+
+            // The update holds the row until the caller commits, so this
+            // read sees the value this call produced and no later writer.
+            let after = entity::blob::Entity::find_by_id(id.to_string())
+                .one(conn)
+                .await
+                .map_err(S3Error::internal_error)?;
+
+            if after.is_none_or(|model| model.refs <= 0) {
+                released.push(id.to_string());
+            }
+        }
+
+        released.sort_unstable();
+        Ok(released)
     }
 
     /// Claim released rows for backend deletion.
@@ -1136,6 +1156,34 @@ mod tests {
         assert_eq!(
             repo.blob_ref_count("legacy").await.expect("count"),
             BLOB_REF_DELETING
+        );
+    }
+
+    /// A failure on one item must roll back the references that earlier
+    /// items acquired.
+    ///
+    /// The caller cannot release them: it sees one error and no list of what
+    /// was acquired, so a partial loop would leak every increment before the
+    /// failing item.
+    #[tokio::test]
+    async fn acquire_is_all_or_nothing_when_an_item_fails() {
+        let repo = repo().await;
+        repo.db
+            .execute_unprepared(
+                "CREATE TRIGGER fail_bad_blob BEFORE INSERT ON s3_blob \
+                 WHEN NEW.id = 'bad' \
+                 BEGIN SELECT RAISE(ABORT, 'injected blob insert failure'); END",
+            )
+            .await
+            .expect("create insert failure trigger");
+
+        let result = repo
+            .acquire_blob_refs(&[("good".to_string(), 1), ("bad".to_string(), 1)])
+            .await;
+        assert!(result.is_err(), "the failing item must fail the call");
+        assert!(
+            blob_ids(&repo).await.is_empty(),
+            "no item may be acquired when a later item fails"
         );
     }
 }

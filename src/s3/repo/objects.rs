@@ -185,7 +185,7 @@ impl Repository {
         }
     }
 
-    async fn cas_put_object_txn(
+    pub(super) async fn cas_put_object_txn(
         &self,
         txn: &DatabaseTransaction,
         bucket: String,

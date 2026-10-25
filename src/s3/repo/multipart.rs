@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use sea_orm::prelude::Expr;
 use sea_orm::sea_query::{IntoCondition, OnConflict};
@@ -7,9 +9,10 @@ use sea_orm::{
 };
 use tracing::instrument;
 
-use super::Repository;
 use super::entity;
+use super::{ObjectWrite, PutCondition, Repository};
 use crate::s3::objects::checked_max_uploads;
+use crate::s3::types::MultipartUploadPart;
 
 /// Field bundle for writing an in-progress multipart upload's state row.
 ///
@@ -27,6 +30,22 @@ pub(crate) struct MultipartUploadStateUpdate {
     /// Object tag-set as a JSON array of {key, value}; empty array when none.
     pub(crate) tags: serde_json::Value,
     pub(crate) content: serde_json::Value,
+}
+
+/// Field bundle for completing one upload: the upload identity, the content
+/// the caller built the object from, the object write, and the references
+/// the completion retires.
+pub(crate) struct MultipartCompletion {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) upload_id: String,
+    /// Raw state content the object was built from.
+    pub(crate) expected_content: serde_json::Value,
+    pub(crate) data: ObjectWrite,
+    pub(crate) condition: PutCondition,
+    /// Parts left out of the object and, for an unversioned bucket, the
+    /// object it replaces.
+    pub(crate) release_ids: Vec<String>,
 }
 
 impl Repository {
@@ -209,6 +228,11 @@ impl Repository {
         Ok(model)
     }
 
+    /// Delete one upload state without changing its blob references.
+    ///
+    /// Callers that must keep the state and its references together use
+    /// [`Self::delete_multipart_upload_state_releasing_blobs`] instead.
+    #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
     pub async fn delete_multipart_upload_state(
         &self,
@@ -228,6 +252,271 @@ impl Repository {
         Ok(model)
     }
 
+    /// Delete one upload state and drop its blob references in one
+    /// transaction.
+    ///
+    /// `extract_ids` turns the stored content into the blob ids that the
+    /// upload owns. If the state is absent, the result is `None` and nothing
+    /// changes. If any step fails, the transaction rolls back, so the state
+    /// and its references stay together for a retry.
+    ///
+    /// The returned ids are the blobs whose count reached zero. The caller
+    /// must remove their backend bytes and rows.
+    #[instrument(skip(self, extract_ids), level = "debug", err)]
+    pub(crate) async fn delete_multipart_upload_state_releasing_blobs<F>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        extract_ids: F,
+    ) -> S3Result<Option<Vec<String>>>
+    where
+        F: FnOnce(&serde_json::Value) -> S3Result<Vec<String>>,
+    {
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result: S3Result<Option<Vec<String>>> = async {
+            let model = entity::multipart_upload_state::Entity::find_by_id((
+                bucket.to_string(),
+                key.to_string(),
+                upload_id.to_string(),
+            ))
+            .one(&txn)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+            let Some(model) = model else {
+                return Ok(None);
+            };
+
+            let ids = extract_ids(&model.content)?;
+            let released = Self::release_blob_refs_on(&txn, &ids).await?;
+
+            entity::multipart_upload_state::Entity::delete_by_id((
+                model.bucket_id,
+                model.object_id,
+                model.upload_id,
+            ))
+            .exec(&txn)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+            Ok(Some(released))
+        }
+        .await;
+
+        match result {
+            Ok(Some(released)) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok(Some(released))
+            }
+            Ok(None) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Ok(None)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Publish a completed object and delete its upload state in one
+    /// transaction.
+    ///
+    /// The caller builds the object from `expected_content`. The transaction
+    /// checks that the stored content still equals it, so the new object
+    /// owns every reference it names and no part added since the read is
+    /// deleted with the state. A missing or changed state rolls the object
+    /// write back.
+    ///
+    /// `release_ids` are the references the completion retires: the parts
+    /// left out of the object and, for an unversioned bucket, the object it
+    /// replaces. They are released in the same transaction, so a failure
+    /// cannot publish the object while leaving an old reference behind.
+    ///
+    /// Returns the new version id and the released ids whose count reached
+    /// zero. The caller must remove their backend bytes and rows.
+    #[instrument(skip(self, completion), level = "debug", err)]
+    pub(crate) async fn complete_multipart_upload(
+        &self,
+        completion: MultipartCompletion,
+    ) -> S3Result<(String, Vec<String>)> {
+        let MultipartCompletion {
+            bucket,
+            key,
+            upload_id,
+            expected_content,
+            data,
+            condition,
+            release_ids,
+        } = completion;
+
+        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+        let result: S3Result<(String, Vec<String>)> = async {
+            let model = entity::multipart_upload_state::Entity::find_by_id((
+                bucket.clone(),
+                key.clone(),
+                upload_id.clone(),
+            ))
+            .one(&txn)
+            .await
+            .map_err(S3Error::internal_error)?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+
+            if model.content != expected_content {
+                return Err(S3Error::new(S3ErrorCode::InternalError));
+            }
+
+            let version_id = self
+                .cas_put_object_txn(&txn, bucket, key, data, condition)
+                .await?;
+
+            let deleted = entity::multipart_upload_state::Entity::delete_by_id((
+                model.bucket_id,
+                model.object_id,
+                model.upload_id,
+            ))
+            .exec(&txn)
+            .await
+            .map_err(S3Error::internal_error)?;
+
+            if deleted.rows_affected != 1 {
+                return Err(S3Error::new(S3ErrorCode::InternalError));
+            }
+
+            let released = Self::release_blob_refs_on(&txn, &release_ids).await?;
+
+            Ok((version_id, released))
+        }
+        .await;
+
+        match result {
+            Ok((version_id, released)) => {
+                txn.commit().await.map_err(S3Error::internal_error)?;
+                Ok((version_id, released))
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(S3Error::internal_error)?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Store one part and release the references of the part it replaces in
+    /// one transaction.
+    ///
+    /// Re-uploading a part number replaces the old metadata. Without this
+    /// transaction the old blob would lose its holder but keep its reference,
+    /// so a retried or repeated upload would leak one blob per attempt.
+    ///
+    /// A concurrent content change retries the compare-and-swap. The returned
+    /// ids are the replaced part's blobs whose count reached zero; the caller
+    /// must remove their backend bytes and rows.
+    #[instrument(skip(self, part), level = "debug", err)]
+    pub(crate) async fn set_multipart_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        part: MultipartUploadPart,
+        resolve: Option<(&str, &str)>,
+    ) -> S3Result<Vec<String>> {
+        const MAX_ATTEMPTS: usize = 8;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+
+            let result: S3Result<Option<Vec<String>>> = async {
+                let model = entity::multipart_upload_state::Entity::find_by_id((
+                    bucket.to_string(),
+                    key.to_string(),
+                    upload_id.to_string(),
+                ))
+                .one(&txn)
+                .await
+                .map_err(S3Error::internal_error)?
+                .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
+
+                let mut parts: BTreeMap<i32, MultipartUploadPart> =
+                    serde_json::from_value(model.content.clone())
+                        .map_err(S3Error::internal_error)?;
+
+                let previous = parts.insert(part_number, part.clone());
+                let new_content = serde_json::to_value(&parts).map_err(S3Error::internal_error)?;
+
+                if new_content != model.content {
+                    let update = entity::multipart_upload_state::Entity::update_many()
+                        .col_expr(
+                            entity::multipart_upload_state::Column::Content,
+                            Expr::value(new_content),
+                        )
+                        .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
+                        .filter(entity::multipart_upload_state::Column::ObjectId.eq(key))
+                        .filter(entity::multipart_upload_state::Column::UploadId.eq(upload_id))
+                        .filter(
+                            entity::multipart_upload_state::Column::Content
+                                .eq(model.content.clone()),
+                        )
+                        .exec(&txn)
+                        .await
+                        .map_err(S3Error::internal_error)?;
+
+                    if update.rows_affected == 0 {
+                        // Another writer changed the content; retry from its
+                        // new value.
+                        return Ok(None);
+                    }
+                }
+
+                let released = match previous {
+                    Some(previous) => {
+                        let ids: Vec<String> = previous
+                            .metadata_items
+                            .into_iter()
+                            .map(|item| item.id)
+                            .collect();
+                        Self::release_blob_refs_on(&txn, &ids).await?
+                    }
+                    None => Vec::new(),
+                };
+
+                // The part update and its publish-intent resolution commit
+                // together. A resolve that ran after the commit could fail
+                // and leave a pending row for a part that is already linked,
+                // so the reclaim pass would then delete its bytes.
+                if let Some((publish_id, blob_id)) = resolve {
+                    Self::resolve_publish_intent_txn(&txn, publish_id, blob_id.to_string()).await?;
+                }
+
+                Ok(Some(released))
+            }
+            .await;
+
+            match result {
+                Ok(Some(released)) => {
+                    txn.commit().await.map_err(S3Error::internal_error)?;
+                    return Ok(released);
+                }
+                Ok(None) => {
+                    txn.rollback().await.map_err(S3Error::internal_error)?;
+                }
+                Err(err) => {
+                    txn.rollback().await.map_err(S3Error::internal_error)?;
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(S3Error::internal_error(std::io::Error::other(format!(
+            "multipart upload state changed concurrently {} times",
+            MAX_ATTEMPTS
+        ))))
+    }
+
+    #[allow(dead_code)]
     #[instrument(skip(self, action), level = "debug", err)]
     pub async fn cas_update_multipart_content<F>(
         &self,
@@ -249,6 +538,7 @@ impl Repository {
     /// resolve that ran after the commit could fail and leave a pending row
     /// for a part that is already linked, and the reclaim pass would then
     /// delete its bytes.
+    #[allow(dead_code)]
     #[instrument(skip(self, action), level = "debug", err)]
     pub async fn cas_update_multipart_content_and_resolve<F>(
         &self,

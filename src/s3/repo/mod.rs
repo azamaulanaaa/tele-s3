@@ -9,7 +9,7 @@ mod objects;
 
 pub mod entity;
 
-pub(crate) use multipart::MultipartUploadStateUpdate;
+pub(crate) use multipart::{MultipartCompletion, MultipartUploadStateUpdate};
 
 /// Precondition for a compare-and-swap object write.
 pub enum PutCondition {

@@ -24,7 +24,7 @@ use super::helpers::{
     metadata_to_json, tagging_header_to_json, verify_checksums,
 };
 use super::objects::{checked_content_length, read_outcome_to_reader};
-use super::repo::{MultipartUploadStateUpdate, ObjectWrite};
+use super::repo::{MultipartCompletion, MultipartUploadStateUpdate, ObjectWrite};
 use super::types::{Metadata, MetadataItem, MultipartUploadPart};
 use crate::backend::{
     Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher, new_publish_id,
@@ -152,11 +152,17 @@ impl<B: Backend> TeleS3<B> {
         // Registration stays a separate transaction here (unlike
         // `PutObject`, which publishes blob + object together): the state
         // update that links this blob is a bounded CAS retry loop
-        // (`cas_update_multipart_content`), and wrapping it would either
-        // hold a write lock across retries or change its retry semantics.
-        // An interrupted upload is therefore still reclaimable only by the
-        // start-up blob reconciler.
-        self.repo.register_new_blob(id.clone(), size).await?;
+        // (`cas_update_multipart_content`). The blob row exists before the
+        // state row, so a crash between the two leaves an unreferenced row
+        // that the start-up blob reconciler reclaims.
+        if let Err(e) = self.repo.register_new_blob(id.clone(), size).await {
+            // The backend blob was written but its bookkeeping row never
+            // landed; drop the bytes so they do not leak, then propagate
+            // the original error.
+            let _ = self.release_blobs(vec![id.clone()]).await;
+            let _ = self.discard_backend_blobs(vec![id]).await;
+            return Err(e);
+        }
 
         // `verify_checksums` distinguishes an undecodable client checksum
         // (`InvalidDigest`) from a genuine mismatch (`BadDigest`); both are
@@ -210,35 +216,36 @@ impl<B: Backend> TeleS3<B> {
             }],
         };
 
-        if let Err(e) = self
+        let replaced = match self
             .repo
-            .cas_update_multipart_content_and_resolve(
+            .set_multipart_part(
                 &req.input.bucket,
                 &req.input.key,
                 &req.input.upload_id,
-                &publish_id,
-                &blob_id,
-                |content| {
-                    let mut parts: BTreeMap<i32, MultipartUploadPart> =
-                        serde_json::from_value(content.take()).map_err(S3Error::internal_error)?;
-
-                    parts.insert(req.input.part_number, multipart_upload_part.clone());
-
-                    *content = serde_json::to_value(parts).map_err(S3Error::internal_error)?;
-
-                    Ok(())
-                },
+                req.input.part_number,
+                multipart_upload_part.clone(),
+                Some((&publish_id, &blob_id)),
             )
             .await
         {
-            // The release settled this publish, so no intent needs to remain.
-            let _ = self
-                .repo
-                .clear_publish_intents(std::slice::from_ref(&publish_id))
-                .await;
-            return Err(e);
-        }
+            Ok(replaced) => replaced,
+            Err(e) => {
+                // The blob was registered but never linked into the upload
+                // state; release it so it does not leak.
+                self.release_blobs(vec![blob_id.clone()]).await?;
+                // The release settled this publish, so no intent needs to
+                // remain.
+                let _ = self
+                    .repo
+                    .clear_publish_intents(std::slice::from_ref(&publish_id))
+                    .await;
+                return Err(e);
+            }
+        };
 
+        // The part row now owns the new blob. Remove any blob the replaced
+        // part was the last holder of.
+        self.release_blobs(replaced).await?;
         let res = S3Response::new(UploadPartOutput {
             e_tag: Some(ETag::Strong(multipart_upload_part.hash)),
             // Echo verified checksums back so SDKs can confirm the part
@@ -285,6 +292,9 @@ impl<B: Backend> TeleS3<B> {
             .get_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
             .await?;
 
+        // Keep the raw content so the commit below can prove the state did
+        // not change while the object metadata was built.
+        let state_content = model.content.clone();
         let mut content =
             serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
                 .map_err(S3Error::internal_error)?;
@@ -344,15 +354,24 @@ impl<B: Backend> TeleS3<B> {
             .replaced_object(&req.input.bucket, &req.input.key)
             .await?;
 
-        let delete_old_object_future = if is_versioned {
-            None
-        } else if let Some(model) = previous_object {
+        // References this completion retires: the parts left out of the
+        // object and, for an unversioned bucket, the object it replaces.
+        // They are released in the same transaction as the object write.
+        let mut release_ids: Vec<String> = if is_versioned {
+            Vec::new()
+        } else if let Some(previous_object) = previous_object {
             let metadata: Metadata =
-                serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-            Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
+                serde_json::from_value(previous_object.content).map_err(S3Error::internal_error)?;
+            metadata.item.into_iter().map(|v| v.id).collect()
         } else {
-            None
+            Vec::new()
         };
+        release_ids.extend(content.into_values().flat_map(|multipart_upload_part| {
+            multipart_upload_part
+                .metadata_items
+                .into_iter()
+                .map(|i| i.id)
+        }));
 
         let data = ObjectWrite {
             size,
@@ -365,34 +384,27 @@ impl<B: Backend> TeleS3<B> {
             tags: model.tags.clone().unwrap_or(serde_json::json!([])),
         };
 
-        let version_id = self
+        // The object row, the upload-state row and the retired references
+        // commit together. A failure at any step rolls all of them back, so
+        // a completed object can never share its part references with a
+        // state row that still owns them, and no old reference is lost.
+        let (version_id, released) = self
             .repo
-            .cas_put_object(
-                req.input.bucket.clone(),
-                req.input.key.clone(),
+            .complete_multipart_upload(MultipartCompletion {
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                upload_id: req.input.upload_id.clone(),
+                expected_content: state_content,
                 data,
                 condition,
-            )
-            .await?;
-
-        self.repo
-            .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
-            .await?;
-
-        if let Some(delete_old_object_future) = delete_old_object_future {
-            delete_old_object_future.await?;
-        }
-
-        let dangling_ids: Vec<String> = content
-            .into_values()
-            .flat_map(|multipart_upload_part| {
-                multipart_upload_part
-                    .metadata_items
-                    .into_iter()
-                    .map(|i| i.id)
+                release_ids,
             })
-            .collect();
-        self.release_blobs(dangling_ids).await?;
+            .await?;
+
+        // The bookkeeping is final. Remove the backend bytes of blobs whose
+        // count reached zero; a backend failure leaves their rows for a
+        // later retry.
+        self.release_blobs(released).await?;
 
         let response_version_id = if is_versioned { Some(version_id) } else { None };
 
@@ -412,27 +424,38 @@ impl<B: Backend> TeleS3<B> {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let model = self
+        // The state row and its references change together. If the release
+        // fails, the state stays, so the upload can be aborted again instead
+        // of leaving ownerless references behind.
+        let released = self
             .repo
-            .delete_multipart_upload_state(&req.input.bucket, &req.input.key, &req.input.upload_id)
+            .delete_multipart_upload_state_releasing_blobs(
+                &req.input.bucket,
+                &req.input.key,
+                &req.input.upload_id,
+                |content| {
+                    let content = serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(
+                        content.clone(),
+                    )
+                    .map_err(S3Error::internal_error)?;
+
+                    Ok(content
+                        .into_values()
+                        .flat_map(|multipart_upload_part| {
+                            multipart_upload_part
+                                .metadata_items
+                                .into_iter()
+                                .map(|i| i.id)
+                        })
+                        .collect())
+                },
+            )
             .await?
             .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchUpload))?;
 
-        let content = serde_json::from_value::<BTreeMap<i32, MultipartUploadPart>>(model.content)
-            .map_err(S3Error::internal_error)?;
-
-        // Released parts may be shared with other objects; only unreferenced
-        // blobs are removed from the backend.
-        let part_ids: Vec<String> = content
-            .into_values()
-            .flat_map(|multipart_upload_part| {
-                multipart_upload_part
-                    .metadata_items
-                    .into_iter()
-                    .map(|i| i.id)
-            })
-            .collect();
-        self.release_blobs(part_ids).await?;
+        // Released parts may be shared with other objects; only
+        // unreferenced blobs are removed from the backend.
+        self.release_blobs(released).await?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
@@ -679,7 +702,7 @@ impl<B: Backend> TeleS3<B> {
         // keeps real ETags on every part and preserves the combined
         // multipart ETag algorithm. Each slice is already a (blob, offset,
         // length) triple, so one ranged backend read per slice suffices.
-        let part_hash = {
+        let part_hash_result: S3Result<String> = async {
             let reader_futures = part_items.iter().map(|item| {
                 self.backend
                     .read(item.id.clone(), item.offset, Some(item.size))
@@ -717,7 +740,17 @@ impl<B: Backend> TeleS3<B> {
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?
                 .finalize_reset();
 
-            hex::encode(hash_md5)
+            Ok(hex::encode(hash_md5))
+        }
+        .await;
+
+        let part_hash = match part_hash_result {
+            Ok(hash) => hash,
+            Err(e) => {
+                let ids: Vec<String> = acquire_items.iter().map(|(id, _)| id.clone()).collect();
+                self.release_blobs(ids).await?;
+                return Err(e);
+            }
         };
 
         let multipart_upload_part = MultipartUploadPart {
@@ -725,23 +758,28 @@ impl<B: Backend> TeleS3<B> {
             metadata_items: part_items,
         };
 
-        self.repo
-            .cas_update_multipart_content(
+        let replaced = match self
+            .repo
+            .set_multipart_part(
                 &req.input.bucket,
                 &req.input.key,
                 &req.input.upload_id,
-                |content| {
-                    let mut parts: BTreeMap<i32, MultipartUploadPart> =
-                        serde_json::from_value(content.take()).map_err(S3Error::internal_error)?;
-
-                    parts.insert(req.input.part_number, multipart_upload_part.clone());
-
-                    *content = serde_json::to_value(parts).map_err(S3Error::internal_error)?;
-
-                    Ok(())
-                },
+                req.input.part_number,
+                multipart_upload_part,
+                None,
             )
-            .await?;
+            .await
+        {
+            Ok(replaced) => replaced,
+            Err(e) => {
+                let ids: Vec<String> = acquire_items.iter().map(|(id, _)| id.clone()).collect();
+                self.release_blobs(ids).await?;
+                return Err(e);
+            }
+        };
+        // The part row now owns the new references. Remove any blob the
+        // replaced part was the last holder of.
+        self.release_blobs(replaced).await?;
 
         let res = S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
@@ -759,11 +797,11 @@ impl<B: Backend> TeleS3<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Memory;
+    use crate::backend::{Memory, ReadOutcome};
     use crate::s3::TeleS3;
     use sea_orm::{ConnectionTrait, EntityTrait};
 
-    async fn test_service_with_upload() -> (TeleS3<Memory<1, 1>>, String) {
+    async fn test_service_with_upload() -> (TeleS3<Memory<2, 1>>, String) {
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("connect");
@@ -930,6 +968,75 @@ mod tests {
         req
     }
 
+    fn abort_upload_req(upload_id: &str) -> S3Request<AbortMultipartUploadInput> {
+        S3Request {
+            input: AbortMultipartUploadInput {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                upload_id: upload_id.to_string(),
+                ..Default::default()
+            },
+            method: http::Method::DELETE,
+            uri: "/b/k".parse().expect("uri"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    /// Return the blob ids that one stored upload content owns.
+    fn upload_blob_ids(content: &serde_json::Value) -> Vec<String> {
+        let parts: BTreeMap<i32, MultipartUploadPart> =
+            serde_json::from_value(content.clone()).expect("upload content");
+        parts
+            .into_values()
+            .flat_map(|part| part.metadata_items.into_iter().map(|item| item.id))
+            .collect()
+    }
+
+    /// Make every blob update fail, as a storage fault would.
+    async fn fail_blob_updates<B: crate::backend::Backend>(svc: &TeleS3<B>) {
+        svc.repo
+            .db
+            .execute_unprepared(
+                "CREATE TRIGGER fail_blob_release BEFORE UPDATE ON s3_blob \
+                 BEGIN SELECT RAISE(ABORT, 'injected blob release failure'); END",
+            )
+            .await
+            .expect("create blob failure trigger");
+    }
+
+    async fn allow_blob_updates<B: crate::backend::Backend>(svc: &TeleS3<B>) {
+        svc.repo
+            .db
+            .execute_unprepared("DROP TRIGGER fail_blob_release")
+            .await
+            .expect("drop blob failure trigger");
+    }
+
+    /// Make the upload-state row reject deletion, as a storage fault would.
+    async fn fail_state_delete<B: crate::backend::Backend>(svc: &TeleS3<B>) {
+        svc.repo
+            .db
+            .execute_unprepared(
+                "CREATE TRIGGER fail_upload_delete BEFORE DELETE ON s3_multipart_upload_state \
+                 BEGIN SELECT RAISE(ABORT, 'injected upload delete failure'); END",
+            )
+            .await
+            .expect("create upload delete trigger");
+    }
+
+    async fn allow_state_delete<B: crate::backend::Backend>(svc: &TeleS3<B>) {
+        svc.repo
+            .db
+            .execute_unprepared("DROP TRIGGER fail_upload_delete")
+            .await
+            .expect("drop upload delete trigger");
+    }
+
     /// Make `get_object` fail while everything the completion path touches
     /// before it -- the upload state and its parts -- keeps working.
     ///
@@ -942,7 +1049,7 @@ mod tests {
     ///
     /// The table is renamed rather than dropped because `s3_object` holds a
     /// foreign key into it and SQLite refuses to drop a referenced parent.
-    async fn break_object_lookup(svc: &TeleS3<Memory<1, 1>>) {
+    async fn break_object_lookup<B: crate::backend::Backend>(svc: &TeleS3<B>) {
         svc.repo
             .db
             .execute_unprepared("ALTER TABLE s3_object RENAME TO s3_object_hidden")
@@ -996,6 +1103,289 @@ mod tests {
             .await
             .expect("completing onto an absent key is a normal first write");
         assert_eq!(res.output.key.as_deref(), Some("k"));
+    }
+
+    /// A failed state delete must roll the object write back, so the upload
+    /// still owns its part references and a retry publishes usable bytes.
+    ///
+    /// Before the fix the object row was committed first and the state delete
+    /// ran in a second transaction. A retry then released the previous
+    /// object's references after deleting the state, which left the new
+    /// object pointing at a blob that no reference protected.
+    #[tokio::test]
+    async fn complete_multipart_keeps_the_upload_when_the_state_delete_fails() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("upload part");
+
+        let state = svc
+            .repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("read upload state");
+        let blob_id = upload_blob_ids(&state.content)
+            .into_iter()
+            .next()
+            .expect("part blob id");
+
+        fail_state_delete(&svc).await;
+        let err = svc
+            .complete_multipart_upload_inner(complete_upload_req(&upload_id))
+            .await
+            .expect_err("a failed state delete must fail the completion");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+        assert!(
+            svc.repo.get_object("b", "k").await.is_err(),
+            "a failed completion must not publish the object"
+        );
+        svc.repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("the upload must survive for a retry");
+        assert_eq!(
+            svc.repo.blob_ref_count(&blob_id).await.expect("ref count"),
+            1,
+            "the surviving upload must still own the part reference"
+        );
+
+        allow_state_delete(&svc).await;
+        svc.complete_multipart_upload_inner(complete_upload_req(&upload_id))
+            .await
+            .expect("retry completion");
+
+        assert_eq!(
+            svc.repo.blob_ref_count(&blob_id).await.expect("ref count"),
+            1,
+            "the completed object must own the part reference"
+        );
+        assert!(
+            matches!(
+                svc.backend
+                    .read(blob_id, 0, None)
+                    .await
+                    .expect("read completed blob"),
+                ReadOutcome::Present(_)
+            ),
+            "the completed bytes must survive the retry"
+        );
+    }
+
+    /// A repeated upload of one part number must release the blob that the
+    /// replaced part was the last holder of.
+    #[tokio::test]
+    async fn uploading_a_part_again_releases_the_replaced_blob() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("first upload part");
+
+        let state = svc
+            .repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("read upload state");
+        let first_blob = upload_blob_ids(&state.content)
+            .into_iter()
+            .next()
+            .expect("first blob id");
+
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("second upload part");
+
+        let state = svc
+            .repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("read upload state");
+        let second_blob = upload_blob_ids(&state.content)
+            .into_iter()
+            .next()
+            .expect("second blob id");
+        assert_ne!(first_blob, second_blob, "the retry must store new bytes");
+        assert_eq!(
+            svc.repo
+                .blob_ref_count(&first_blob)
+                .await
+                .expect("first ref count"),
+            0,
+            "the replaced blob must lose its reference"
+        );
+        assert!(
+            matches!(
+                svc.backend
+                    .read(first_blob, 0, None)
+                    .await
+                    .expect("read replaced blob"),
+                ReadOutcome::Missing
+            ),
+            "the replaced blob must be removed from the backend"
+        );
+        assert_eq!(
+            svc.repo
+                .blob_ref_count(&second_blob)
+                .await
+                .expect("second ref count"),
+            1,
+            "the stored part must own the new blob"
+        );
+    }
+
+    /// A failed release of the replaced object's references must roll the
+    /// completion back, so the old object keeps the bytes it still owns.
+    #[tokio::test]
+    async fn complete_multipart_keeps_the_old_object_when_the_release_fails() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("upload part");
+
+        let state = svc
+            .repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("read upload state");
+        let blob_id = upload_blob_ids(&state.content)
+            .into_iter()
+            .next()
+            .expect("part blob id");
+
+        // The old object shares the part blob, so completing it must drop
+        // only the old object's reference and keep the bytes.
+        svc.repo
+            .acquire_blob_refs(&[(blob_id.clone(), 1)])
+            .await
+            .expect("acquire old object reference");
+        svc.repo
+            .upsert_object(
+                "b".into(),
+                "k".into(),
+                ObjectWrite {
+                    size: 1,
+                    content_type: None,
+                    etag: Some("old-etag".into()),
+                    content: serde_json::json!({
+                        "item": [{"id": blob_id, "offset": 0, "size": 1}]
+                    }),
+                    user_metadata: serde_json::json!({}),
+                    checksums: serde_json::json!({}),
+                    tags: serde_json::json!([]),
+                },
+            )
+            .await
+            .expect("seed old object");
+
+        fail_blob_updates(&svc).await;
+        svc.complete_multipart_upload_inner(complete_upload_req(&upload_id))
+            .await
+            .expect_err("a failed release must fail the completion");
+        svc.repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("the upload must survive for a retry");
+        assert_eq!(
+            svc.repo.blob_ref_count(&blob_id).await.expect("ref count"),
+            2,
+            "the old object and the upload must keep their references"
+        );
+        assert_eq!(
+            svc.repo
+                .get_object("b", "k")
+                .await
+                .expect("old object")
+                .etag,
+            Some("old-etag".into()),
+            "the old object row must stay in place"
+        );
+        assert!(
+            matches!(
+                svc.backend
+                    .read(blob_id.clone(), 0, None)
+                    .await
+                    .expect("read shared blob"),
+                ReadOutcome::Present(_)
+            ),
+            "the old object's bytes must stay readable"
+        );
+
+        allow_blob_updates(&svc).await;
+        svc.complete_multipart_upload_inner(complete_upload_req(&upload_id))
+            .await
+            .expect("retry completion");
+
+        assert_eq!(
+            svc.repo.blob_ref_count(&blob_id).await.expect("ref count"),
+            1,
+            "the completed object must own the only remaining reference"
+        );
+        assert!(
+            matches!(
+                svc.backend
+                    .read(blob_id, 0, None)
+                    .await
+                    .expect("read shared blob"),
+                ReadOutcome::Present(_)
+            ),
+            "the shared bytes must survive the release of the old object"
+        );
+    }
+
+    /// A failed blob release must leave the upload in place, not delete the
+    /// only record of references that are still alive.
+    #[tokio::test]
+    async fn abort_multipart_keeps_the_upload_when_the_blob_release_fails() {
+        let (svc, upload_id) = test_service_with_upload().await;
+        svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
+            .await
+            .expect("upload part");
+
+        let state = svc
+            .repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("read upload state");
+        let blob_id = upload_blob_ids(&state.content)
+            .into_iter()
+            .next()
+            .expect("part blob id");
+
+        fail_blob_updates(&svc).await;
+        let err = svc
+            .abort_multipart_upload_inner(abort_upload_req(&upload_id))
+            .await
+            .expect_err("a failed release must fail the abort");
+        assert_eq!(*err.code(), S3ErrorCode::InternalError);
+        svc.repo
+            .get_multipart_upload_state("b", "k", &upload_id)
+            .await
+            .expect("the upload must survive for a retry");
+        assert_eq!(
+            svc.repo.blob_ref_count(&blob_id).await.expect("ref count"),
+            1,
+            "a rolled-back abort must not drop the part reference"
+        );
+
+        allow_blob_updates(&svc).await;
+        svc.abort_multipart_upload_inner(abort_upload_req(&upload_id))
+            .await
+            .expect("retry abort");
+
+        assert_eq!(
+            svc.repo.blob_ref_count(&blob_id).await.expect("ref count"),
+            0,
+            "a successful abort must release the part reference"
+        );
+        assert!(
+            matches!(
+                svc.backend
+                    .read(blob_id, 0, None)
+                    .await
+                    .expect("read aborted blob"),
+                ReadOutcome::Missing
+            ),
+            "a successful abort must remove unreferenced bytes"
+        );
     }
 
     #[tokio::test]
