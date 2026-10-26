@@ -260,19 +260,22 @@ impl<B: Backend> TeleS3<B> {
         if let Some(expected) = req.input.content_md5 {
             // Decode instead of comparing strings so padding/whitespace
             // variations in the client header don't cause false mismatches.
-            let expected_digest = if let Ok(v) = base64::prelude::BASE64_STANDARD.decode(expected.trim()) { v } else {
-                let discarded = match id {
-                    Some(id) => self.discard_backend_blobs(vec![id]).await,
-                    None => true,
+            let expected_digest =
+                if let Ok(v) = base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
+                    v
+                } else {
+                    let discarded = match id {
+                        Some(id) => self.discard_backend_blobs(vec![id]).await,
+                        None => true,
+                    };
+                    if discarded && let Some(pid) = &publish_id {
+                        let _ = self
+                            .repo
+                            .clear_publish_intents(std::slice::from_ref(pid))
+                            .await;
+                    }
+                    return Err(S3Error::new(S3ErrorCode::InvalidDigest));
                 };
-                if discarded && let Some(pid) = &publish_id {
-                    let _ = self
-                        .repo
-                        .clear_publish_intents(std::slice::from_ref(pid))
-                        .await;
-                }
-                return Err(S3Error::new(S3ErrorCode::InvalidDigest));
-            };
 
             if expected_digest[..] != hash_md5[..] {
                 let discarded = match id {

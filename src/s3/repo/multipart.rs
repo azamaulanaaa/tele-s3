@@ -125,11 +125,14 @@ impl Repository {
                             .add(entity::multipart_upload_state::Column::UploadId.gt(uid)),
                     )
                     .into_condition(),
-                (km, _) => km.map_or_else(|| Condition::all().into_condition(), |km| {
+                (km, _) => km.map_or_else(
+                    || Condition::all().into_condition(),
+                    |km| {
                         entity::multipart_upload_state::Column::ObjectId
                             .gt(km)
                             .into_condition()
-                    }),
+                    },
+                ),
             })
             .order_by_asc(entity::multipart_upload_state::Column::ObjectId)
             .order_by_asc(entity::multipart_upload_state::Column::UploadId)

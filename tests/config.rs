@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
+#![allow(clippy::expect_used, clippy::unwrap_used, missing_docs, dead_code)]
 use aws_config::{Region, SdkConfig};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::SharedCredentialsProvider;

@@ -143,9 +143,11 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         let mut chunks_data: Vec<[u8; M]> = Vec::with_capacity(chunks_needed);
         let mut taken: Vec<usize> = Vec::with_capacity(chunks_needed);
         for &idx in &drained {
-            let mut guard = self.storage[idx].lock().map_err(|_| BackendError::PoisonedLock {
-                lock: "memory storage slot",
-            })?;
+            let mut guard = self.storage[idx]
+                .lock()
+                .map_err(|_| BackendError::PoisonedLock {
+                    lock: "memory storage slot",
+                })?;
             match guard.take() {
                 Some(chunk) => {
                     chunks_idx.push(idx);
@@ -157,19 +159,21 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
                     // reserved indices, then report the fault.
                     drop(guard);
                     for &t in &taken {
-                        let mut g = self.storage[t].lock().map_err(|_| {
-                            BackendError::PoisonedLock {
-                                lock: "memory storage slot",
-                            }
-                        })?;
+                        let mut g =
+                            self.storage[t]
+                                .lock()
+                                .map_err(|_| BackendError::PoisonedLock {
+                                    lock: "memory storage slot",
+                                })?;
                         // best-effort: leave as-is; the slot was already taken
                         let _ = &mut g;
                     }
-                    let mut free = self.free_slots.lock().map_err(|_| {
-                        BackendError::PoisonedLock {
-                            lock: "memory free slots",
-                        }
-                    })?;
+                    let mut free =
+                        self.free_slots
+                            .lock()
+                            .map_err(|_| BackendError::PoisonedLock {
+                                lock: "memory free slots",
+                            })?;
                     for &idx in &drained {
                         free.push_back(idx);
                     }
@@ -210,11 +214,12 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
                 // Hand capacity back to the original slots.
                 let slots = std::mem::take(&mut object.slots);
                 let chunks = std::mem::take(&mut object.chunks);
-                let mut free = self.free_slots.lock().map_err(|_| {
-                    BackendError::PoisonedLock {
+                let mut free = self
+                    .free_slots
+                    .lock()
+                    .map_err(|_| BackendError::PoisonedLock {
                         lock: "memory free slots",
-                    }
-                })?;
+                    })?;
                 for (i, &slot_idx) in slots.iter().enumerate() {
                     if i < chunks.len() {
                         let mut guard = self.storage[slot_idx].lock().map_err(|_| {
@@ -300,15 +305,19 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
         // Reclaim capacity back to original slots. Readers keep their own
         // immutable copy of the chunks, so copying here is safe.
-        let mut free = self.free_slots.lock().map_err(|_| BackendError::PoisonedLock {
-            lock: "memory free slots",
-        })?;
-        for slot_idx in &object.slots {
-            let mut guard = self.storage[*slot_idx].lock().map_err(|_| {
-                BackendError::PoisonedLock {
-                    lock: "memory storage slot",
-                }
+        let mut free = self
+            .free_slots
+            .lock()
+            .map_err(|_| BackendError::PoisonedLock {
+                lock: "memory free slots",
             })?;
+        for slot_idx in &object.slots {
+            let mut guard =
+                self.storage[*slot_idx]
+                    .lock()
+                    .map_err(|_| BackendError::PoisonedLock {
+                        lock: "memory storage slot",
+                    })?;
             *guard = Some([0; M]);
             free.push_back(*slot_idx);
         }

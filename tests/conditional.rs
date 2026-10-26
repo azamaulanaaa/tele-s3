@@ -81,9 +81,7 @@ async fn test_conditional_get_etag() -> anyhow::Result<()> {
         // s3s 0.16+ returns bodyless 304 (RFC 9110), so the SDK has no
         // XML code to parse; fall back to the raw HTTP status.
         let status = e.raw_response().map(|r| r.status().as_u16());
-        println!(
-            "If-None-Match matching code: {code}, status: {status:?}"
-        );
+        println!("If-None-Match matching code: {code}, status: {status:?}");
         assert!(
             code.contains("NotModified") || code.contains("304") || status == Some(304),
             "expected NotModified, got {code} ({status:?})"
@@ -179,9 +177,7 @@ async fn test_conditional_get_modified_since() -> anyhow::Result<()> {
         // s3s 0.16+ returns bodyless 304 (RFC 9110), so the SDK has no
         // XML code to parse; fall back to the raw HTTP status.
         let status = e.raw_response().map(|r| r.status().as_u16());
-        println!(
-            "If-Modified-Since future code: {code}, status: {status:?}"
-        );
+        println!("If-Modified-Since future code: {code}, status: {status:?}");
         assert!(
             code.contains("NotModified") || code.contains("304") || status == Some(304),
             "expected NotModified, got {code} ({status:?})"

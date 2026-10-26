@@ -22,8 +22,8 @@ run = "cargo build --all-targets --all-features"
 
 [tasks.test]
 run = [
-  "cargo test --all-targets --all-features",
-  "cargo test --doc",
+  "cargo test --all-targets --all-features --locked",
+  "cargo test --doc --locked",
 ]
 
 [tasks.cov]
@@ -34,7 +34,7 @@ description = "Print a coverage summary for the test suite"
 run = "cargo fmt --all --check"
 
 [tasks.clippy]
-run = "cargo clippy --all-targets --all-features"
+run = "cargo clippy --all-targets --all-features --locked -- -D warnings"
 
 [tasks.lint]
 depends = ["fmt", "clippy"]
@@ -75,7 +75,23 @@ run = "dist plan"
 description = "List the artifacts a release would produce, without building"
 
 [tasks.dist-check]
-run = "dist plan --output-format=human > /dev/null"
+run = '''
+set -eu
+workflow=.github/workflows/release.yml
+
+if ! grep -q 'uses: ./.github/workflows/ci.yml' "$workflow"; then
+  echo "::error::$workflow no longer calls ci.yml; re-apply the 'checks' job"
+  exit 1
+fi
+
+if ! grep -A4 'build-local-artifacts:' "$workflow" | grep -q '^ *- checks$'; then
+  echo "::error::$workflow no longer waits for checks before building; re-apply it to build-local-artifacts needs"
+  exit 1
+fi
+
+echo "release workflow is gated on CI"
+dist plan --output-format=human > /dev/null
+'''
 description = "Check that the release plan resolves and the release workflow still gates on CI"
 
 [tasks.dist-build]

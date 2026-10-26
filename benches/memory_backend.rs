@@ -32,7 +32,8 @@ fn bench_memory_read(c: &mut Criterion) {
             },
             |(backend, key)| {
                 block_on(async {
-                    let mut reader = match backend.read(key, 0, None).await.expect("read succeeds") {
+                    let mut reader = match backend.read(key, 0, None).await.expect("read succeeds")
+                    {
                         tele_s3::backend::ReadOutcome::Present(r) => r,
                         _ => panic!("expected present"),
                     };

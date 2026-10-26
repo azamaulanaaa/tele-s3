@@ -90,7 +90,7 @@ fn intent_disposition(outcome: &Result<ReclaimOutcome, BackendError>) -> IntentD
 }
 
 impl<B: Backend> TeleS3<B> {
-/// Initialize the S3 service with a backend and database.
+    /// Initialize the S3 service with a backend and database.
     #[instrument(skip(backend, db), level = "debug", err)]
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
         let repo = repo::Repository::init(db).await?;
@@ -98,7 +98,7 @@ impl<B: Backend> TeleS3<B> {
         Ok(Self { backend, repo })
     }
 
-/// Release metadata references. Hard-delete blobs whose reference count reached zero.
+    /// Release metadata references. Hard-delete blobs whose reference count reached zero.
     ///
     /// The backend delete runs before the bookkeeping drops. The code observes its outcome. Only ids the backend confirms as removed lose their row. An id whose delete failed keeps its row. The blob stays accounted for. It does not become invisible data that nothing retries.
     ///

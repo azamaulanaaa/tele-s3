@@ -26,4 +26,4 @@ fi
 
 echo "pre-commit: cargo fmt --check && cargo clippy (mise not found)"
 cargo fmt --all --check
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features --locked -- -D warnings

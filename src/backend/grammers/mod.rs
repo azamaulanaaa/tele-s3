@@ -1578,7 +1578,9 @@ impl Backend for Grammers {
 
             // The message is there but holds nothing to stream. The object is
             // unreadable, not absent.
-            if let Some(v) = message.media() { v } else {
+            if let Some(v) = message.media() {
+                v
+            } else {
                 tracing::error!(
                     key = %key,
                     error.type = "no_media",

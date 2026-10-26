@@ -183,14 +183,17 @@ impl<B: Backend> TeleS3<B> {
         }
 
         if let Some(expected) = req.input.content_md5 {
-            let expected_digest = if let Ok(v) = base64::prelude::BASE64_STANDARD.decode(expected.trim()) { v } else {
-                self.release_blobs(vec![id]).await?;
-                let _ = self
-                    .repo
-                    .clear_publish_intents(std::slice::from_ref(&publish_id))
-                    .await;
-                return Err(S3Error::new(S3ErrorCode::InvalidDigest));
-            };
+            let expected_digest =
+                if let Ok(v) = base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
+                    v
+                } else {
+                    self.release_blobs(vec![id]).await?;
+                    let _ = self
+                        .repo
+                        .clear_publish_intents(std::slice::from_ref(&publish_id))
+                        .await;
+                    return Err(S3Error::new(S3ErrorCode::InvalidDigest));
+                };
 
             if expected_digest[..] != hash_md5[..] {
                 self.release_blobs(vec![id]).await?;

@@ -984,7 +984,8 @@ async fn test_list_objects_v2_with_continuation_token() -> anyhow::Result<()> {
             .context("list objects")?;
         (
             res.contents().to_owned(),
-            res.next_continuation_token().map(std::borrow::ToOwned::to_owned),
+            res.next_continuation_token()
+                .map(std::borrow::ToOwned::to_owned),
         )
     };
 

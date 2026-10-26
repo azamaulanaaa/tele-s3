@@ -119,7 +119,9 @@ impl LogFormat {
             return Self::Text;
         };
 
-        if let Some(parsed) = Self::parse(&raw) { parsed } else {
+        if let Some(parsed) = Self::parse(&raw) {
+            parsed
+        } else {
             tracing::warn!(
                 env_var = LOG_FORMAT_ENV,
                 value = %raw,

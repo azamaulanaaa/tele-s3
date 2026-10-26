@@ -93,7 +93,11 @@ impl Repository {
     /// success path resolves inside the publish transaction. See
     /// [`Self::resolve_publish_intent_txn`].
     #[cfg(test)]
-    pub(crate) async fn resolve_publish_intent(&self, publish_id: &str, blob_id: String) -> S3Result<()> {
+    pub(crate) async fn resolve_publish_intent(
+        &self,
+        publish_id: &str,
+        blob_id: String,
+    ) -> S3Result<()> {
         Self::resolve_publish_intent_txn(&self.db, publish_id, blob_id).await
     }
 
