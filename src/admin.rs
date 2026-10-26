@@ -117,8 +117,10 @@ fn is_reserved(path: &str) -> bool {
 pub enum ReconcilerOutcome {
     /// The pass ran. It reconciled or cleared `affected` rows. Zero is an
     /// ordinary result. Zero is not a failure.
-    #[allow(missing_docs)]
-    Completed { affected: usize },
+    Completed {
+        /// Number of rows reconciled or cleared.
+        affected: usize,
+    },
     /// The pass returned an error.
     ///
     /// The code does not carry the message. The message is free-form operator

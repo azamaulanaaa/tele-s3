@@ -95,15 +95,20 @@ pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BackendError {
+    /// The requested byte range is not satisfiable.
     #[error("Out of range")]
-    #[allow(missing_docs)]
     OutOfRange,
+    /// The backend asked the caller to slow down.
     #[error("Backend is rate limited")]
-    #[allow(missing_docs)]
     SlowDown,
+    /// The object is larger than the backend's size limit.
     #[error("Size {actual} exceeds limit {max}")]
-    #[allow(missing_docs)]
-    ExceedLimitSize { max: u64, actual: u64 },
+    ExceedLimitSize {
+        /// Maximum allowed size.
+        max: u64,
+        /// Actual size received.
+        actual: u64,
+    },
     /// A panic poisoned an internal `std::sync::Mutex` while it was held.
     /// The guarded state has unknown consistency.
     ///
@@ -111,17 +116,21 @@ pub enum BackendError {
     /// cannot clear a poisoned lock. This must never be reported as a
     /// retryable failure.
     #[error("Internal lock `{lock}` is poisoned")]
-    #[allow(missing_docs)]
-    PoisonedLock { lock: &'static str },
+    PoisonedLock {
+        /// Name of the poisoned lock.
+        lock: &'static str,
+    },
     /// The backend contradicted its own bookkeeping. `detail` says which
     /// invariant.
     /// This is not an I/O failure. This is not recoverable at runtime. The
     /// backend state is corrupt. The operation cannot be served correctly.
     #[error("Backend invariant violated: {detail}")]
-    #[allow(missing_docs)]
-    InvariantViolation { detail: &'static str },
+    InvariantViolation {
+        /// Which invariant was violated.
+        detail: &'static str,
+    },
+    /// An unrecognized backend error.
     #[error("Unrecognize error")]
-    #[allow(missing_docs)]
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 

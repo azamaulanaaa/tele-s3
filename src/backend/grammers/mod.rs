@@ -314,13 +314,12 @@ impl GrammersLimits {
 #[allow(missing_debug_implementations)]
 /// Telegram backend configuration.
 pub struct GrammersConfig {
-#[allow(missing_docs)]
+    /// Telegram API ID from my.telegram.org.
     pub app_id: i32,
-    #[allow(missing_docs)]
+    /// Telegram API hash from my.telegram.org.
     pub app_hash: String,
-    #[allow(missing_docs)]
+    /// Bot token used to log in to Telegram.
     pub bot_token: String,
-    #[allow(missing_docs)]
     /// Where the `MTProto` session (auth keys and DC state) is persisted.
     ///
     /// Not the object metadata store. `main` passes it the same connection.
