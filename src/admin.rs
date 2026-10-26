@@ -147,6 +147,7 @@ pub struct AdminState {
     startup: StartupReport,
     trace_export: bool,
     metrics_export: bool,
+    max_concurrent_connections: usize,
 }
 
 impl AdminState {
@@ -174,6 +175,7 @@ impl AdminState {
         startup: StartupReport,
         trace_export: bool,
         metrics_export: bool,
+        max_concurrent_connections: usize,
     ) -> Self {
         Self {
             listen_port,
@@ -181,6 +183,7 @@ impl AdminState {
             startup,
             trace_export,
             metrics_export,
+            max_concurrent_connections,
         }
     }
 
@@ -234,6 +237,7 @@ impl AdminState {
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
             "listen_port": self.listen_port,
+            "max_concurrent_connections": self.max_concurrent_connections,
             "telegram": {
                 // The same names `init_tracing` publishes, so a log line and
                 // this document can be read with one vocabulary.
@@ -420,6 +424,7 @@ mod tests {
             },
             true,
             true,
+            128,
         )
     }
 
@@ -481,7 +486,7 @@ mod tests {
                 publish_intents: ReconcilerOutcome::Failed,
             },
         ] {
-            let state = AdminState::new(8000, GrammersLimits::default(), report, false, false);
+            let state = AdminState::new(8000, GrammersLimits::default(), report, false, false, 128);
             let response = state.liveness();
             assert_eq!(response.status, StatusCode::OK);
             // Nothing about the reconcilers reaches a liveness answer.
@@ -500,6 +505,7 @@ mod tests {
             },
             false,
             false,
+            128,
         );
 
         let response = degraded.readiness();
@@ -527,6 +533,7 @@ mod tests {
         let body = body_of(&state().introspection());
 
         assert_eq!(body["listen_port"], 8000);
+        assert_eq!(body["max_concurrent_connections"], 128);
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["telegram"]["max_concurrent_requests"], 4);
         assert_eq!(body["telegram"]["io_timeout_ms"], 30_000);
@@ -561,6 +568,7 @@ mod tests {
             top,
             [
                 "listen_port",
+                "max_concurrent_connections",
                 "startup",
                 "status",
                 "telegram",

@@ -1,9 +1,9 @@
-use std::{env, path::Path, time::Duration};
+use std::{env, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use sea_orm::Database;
-use tokio::{net::TcpListener, signal};
+use tokio::{net::TcpListener, signal, sync::Semaphore};
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -607,6 +607,83 @@ fn init_otel_subscriber(format: LogFormat, tracer: SdkTracer) {
         .init();
 }
 
+/// The response sent to a connection that arrives when no permit is free.
+///
+/// `Content-Length: 0` keeps the response framing unambiguous.
+/// `Connection: close` tells the client that this socket carries one response.
+const SERVICE_UNAVAILABLE_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Length: 0\r\n\
+    Connection: close\r\n\r\n";
+
+/// Hold the permits that bound inbound S3 connections.
+///
+/// One connection holds one permit until the connection ends. When no permit
+/// is free, the accept loop sends `503 Service Unavailable` and closes the
+/// socket. It does not queue the connection, so a slow client cannot exhaust
+/// the listener.
+#[derive(Debug)]
+struct ConnectionLimiter {
+    semaphore: Arc<Semaphore>,
+}
+
+impl ConnectionLimiter {
+    /// Create a limiter with `max` permits.
+    ///
+    /// The value is clamped to at least 1, because a limiter with no permits
+    /// would refuse every connection.
+    fn new(max: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max.clamp(1, Semaphore::MAX_PERMITS))),
+        }
+    }
+
+    /// Try to take one permit without waiting.
+    ///
+    /// `Err` means that no permit is free. The accept loop answers such a
+    /// connection with `503 Service Unavailable`.
+    fn try_acquire(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.semaphore.clone().try_acquire_owned()
+    }
+}
+
+/// Environment variable that overrides `max_concurrent_connections`.
+const CONNECTION_LIMIT_ENV: &str = "TELE_S3_MAX_CONCURRENT_CONNECTIONS";
+
+/// Resolve the inbound connection limit.
+///
+/// Read [`CONNECTION_LIMIT_ENV`] when it is set. An unset or unparsable value
+/// uses `config_value`, and a warning names the bad value. The result is
+/// clamped to `1..=Semaphore::MAX_PERMITS`.
+fn inbound_connection_limit(config_value: usize) -> usize {
+    connection_limit_from(env::var(CONNECTION_LIMIT_ENV).ok().as_deref(), config_value)
+}
+
+/// Resolve a connection limit from a raw environment value.
+///
+/// Pure, so the parsing rule can be tested without changing the process
+/// environment, which every test in the binary shares.
+fn connection_limit_from(raw: Option<&str>, config_value: usize) -> usize {
+    let fallback = config_value.clamp(1, Semaphore::MAX_PERMITS);
+    let Some(raw) = raw else {
+        return fallback;
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(parsed) => parsed.clamp(1, Semaphore::MAX_PERMITS),
+        Err(_) => {
+            tracing::warn!(
+                env_var = CONNECTION_LIMIT_ENV,
+                value = %raw,
+                error.type = "unparsable_env_override",
+                "ignoring unparsable environment override"
+            );
+            fallback
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let telemetry = init_tracing();
@@ -624,6 +701,10 @@ async fn main() -> anyhow::Result<()> {
     // Resolved once, here, so the admin endpoints publish the limits actually
     // in force rather than a second reading of the environment.
     let limits = telegram_limits();
+
+    // Inbound S3 connections are bounded separately from Telegram I/O, so a
+    // slow client cannot exhaust the listener.
+    let max_concurrent_connections = inbound_connection_limit(config.max_concurrent_connections);
 
     let grammers = {
         let config = GrammersConfig {
@@ -705,6 +786,7 @@ async fn main() -> anyhow::Result<()> {
             startup,
             telemetry.trace_export(),
             telemetry.metrics_export(),
+            max_concurrent_connections,
         )));
 
         builder.build()
@@ -713,24 +795,42 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", config.listen_port)).await?;
     tracing::info!(port = config.listen_port, "listening for S3 connections");
 
+    let connection_limiter = ConnectionLimiter::new(max_concurrent_connections);
+
     loop {
         tokio::select! {
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((stream, _)) => {
-                        let io = TokioIo::new(stream);
-                        let svc = s3_service.clone();
+                        match connection_limiter.try_acquire() {
+                            Ok(permit) => {
+                                let io = TokioIo::new(stream);
+                                let svc = s3_service.clone();
 
-                        tokio::spawn(async move {
-                            let builder = Builder::new(TokioExecutor::new());
-                            if let Err(err) = builder.serve_connection(io, svc).await {
-                                tracing::error!(
-                                    error.type = "serve_connection",
-                                    error.message = %err,
-                                    "error serving connection"
-                                );
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let builder = Builder::new(TokioExecutor::new());
+                                    if let Err(err) = builder.serve_connection(io, svc).await {
+                                        tracing::error!(
+                                            error.type = "serve_connection",
+                                            error.message = %err,
+                                            "error serving connection"
+                                        );
+                                    }
+                                });
                             }
-                        });
+                            Err(_) => {
+                                // Bound reached: answer 503 and close. The
+                                // write runs in its own task, so a client that
+                                // does not read cannot stall the accept loop.
+                                let mut stream = stream;
+                                tokio::spawn(async move {
+                                    use tokio::io::AsyncWriteExt;
+                                    let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+                                    let _ = stream.shutdown().await;
+                                });
+                            }
+                        }
                     }
                     Err(err) => {
                         tracing::error!(
@@ -791,6 +891,7 @@ mod tests {
             listen_port: 8000,
             auth_access_key: SENTINELS[0].to_string(),
             auth_secret_key: SENTINELS[1].to_string(),
+            max_concurrent_connections: 128,
         };
 
         // The worst case for the operator: start-up reconciliation failed, so
@@ -805,6 +906,7 @@ mod tests {
             },
             true,
             true,
+            config.max_concurrent_connections,
         );
 
         for response in [state.liveness(), state.readiness(), state.introspection()] {
@@ -832,6 +934,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The limiter refuses the second connection until the first permit is
+    /// free.
+    ///
+    /// A limit of 0 is not a valid configuration, so it resolves to one
+    /// permit instead of refusing every connection.
+    #[test]
+    fn the_connection_limiter_refuses_a_connection_when_no_permit_is_free() {
+        for limiter in [ConnectionLimiter::new(1), ConnectionLimiter::new(0)] {
+            let first = limiter.try_acquire().expect("the first permit is free");
+            assert!(limiter.try_acquire().is_err());
+            drop(first);
+            assert!(limiter.try_acquire().is_ok());
+        }
+    }
+
+    /// A valid override wins over the config value. An unset or unparsable
+    /// value falls back to the config value. Both ends are clamped to at
+    /// least one.
+    #[test]
+    fn the_connection_limit_override_falls_back_and_clamps() {
+        assert_eq!(connection_limit_from(None, 128), 128);
+        assert_eq!(connection_limit_from(Some("16"), 128), 16);
+        assert_eq!(connection_limit_from(Some(" 16 \n"), 128), 16);
+        assert_eq!(connection_limit_from(Some("many"), 128), 128);
+        assert_eq!(connection_limit_from(Some(""), 128), 128);
+        assert_eq!(connection_limit_from(Some("0"), 128), 1);
+        assert_eq!(connection_limit_from(None, 0), 1);
+    }
+
+    /// The rejection is a complete HTTP/1.1 response with no body.
+    ///
+    /// A client must be able to parse it without a second read.
+    #[test]
+    fn the_rejection_is_a_complete_http_response() {
+        let response =
+            std::str::from_utf8(SERVICE_UNAVAILABLE_RESPONSE).expect("the response is ASCII");
+
+        assert_eq!(
+            response,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
     }
 
     /// The default has to stay the human-readable renderer: nothing about an

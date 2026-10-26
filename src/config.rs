@@ -33,6 +33,17 @@ pub struct Config {
     pub listen_port: u16,
     pub auth_access_key: String,
     pub auth_secret_key: String,
+
+    /// Maximum number of inbound S3 connections served at once.
+    ///
+    /// An excess connection receives `503 Service Unavailable` rather than
+    /// queueing, so a single slow client cannot exhaust the listener.
+    #[serde(default = "default_max_concurrent_connections")]
+    pub max_concurrent_connections: usize,
+}
+
+fn default_max_concurrent_connections() -> usize {
+    128
 }
 
 impl TryFrom<&Path> for Config {
