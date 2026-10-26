@@ -219,7 +219,7 @@ Readiness does **not** fail when a start-up reconciler fails. Both passes are be
 
 ```bash
 curl -s localhost:8000/.tele-s3/healthz    # {"status":"ok"}
-curl -s localhost:8000/.tele-s3/introspect # {"status":"ok","version":"0.6.0","listen_port":8000,...}
+curl -s localhost:8000/.tele-s3/introspect # {"status":"ok","version":"0.7.0","listen_port":8000,...}
 ```
 
 ## Architecture
