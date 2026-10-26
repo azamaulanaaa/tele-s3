@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -70,6 +70,7 @@ impl<const M: usize> AsyncRead for ObjectReader<M> {
 
 pub struct Memory<const N: usize, const M: usize> {
     storage: Vec<StdMutex<Option<[u8; M]>>>,
+    free_slots: StdMutex<VecDeque<usize>>,
     table: Vec<RwLock<BTreeMap<String, Arc<Object<M>>>>>,
 }
 
@@ -80,12 +81,21 @@ impl<const N: usize, const M: usize> Default for Memory<N, M> {
             storage.push(StdMutex::new(Some([0; M])));
         }
 
+        let mut free = VecDeque::with_capacity(N);
+        for idx in 0..N {
+            free.push_back(idx);
+        }
+
         let mut table = Vec::with_capacity(TABLE_SHARDS);
         for _ in 0..TABLE_SHARDS {
             table.push(RwLock::new(BTreeMap::new()));
         }
 
-        Self { storage, table }
+        Self {
+            storage,
+            free_slots: StdMutex::new(free),
+            table,
+        }
     }
 }
 
@@ -107,39 +117,65 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
     ) -> Result<String, BackendError> {
         let chunks_needed = size.div_ceil(M as u64) as usize;
 
-        // Allocate free slots, locking each slot only briefly.
-        let mut allocated: Vec<(usize, [u8; M])> = Vec::with_capacity(chunks_needed);
-        for (idx, slot) in self.storage.iter().enumerate() {
-            if allocated.len() >= chunks_needed {
-                break;
+        // Reserve free slot indices without scanning the whole storage array.
+        let drained: Vec<usize> = {
+            let mut free = self
+                .free_slots
+                .lock()
+                .map_err(|_| BackendError::PoisonedLock {
+                    lock: "memory free slots",
+                })?;
+            if free.len() < chunks_needed {
+                let free_count = free.len();
+                return Err(BackendError::ExceedLimitSize {
+                    max: (free_count * M) as u64,
+                    actual: size,
+                });
             }
-            let mut guard = slot.lock().map_err(|_| BackendError::PoisonedLock {
+            free.drain(0..chunks_needed).collect()
+        };
+
+        // Take the reserved slots' buffers.
+        let mut chunks_idx: Vec<usize> = Vec::with_capacity(chunks_needed);
+        let mut chunks_data: Vec<[u8; M]> = Vec::with_capacity(chunks_needed);
+        let mut taken: Vec<usize> = Vec::with_capacity(chunks_needed);
+        for &idx in &drained {
+            let mut guard = self.storage[idx].lock().map_err(|_| BackendError::PoisonedLock {
                 lock: "memory storage slot",
             })?;
-            if let Some(chunk) = guard.take() {
-                allocated.push((idx, chunk));
-            }
-        }
-
-        if allocated.len() < chunks_needed {
-            let free_count = allocated.len();
-            for (idx, chunk) in allocated {
-                let mut guard =
-                    self.storage[idx]
-                        .lock()
-                        .map_err(|_| BackendError::PoisonedLock {
-                            lock: "memory storage slot",
+            match guard.take() {
+                Some(chunk) => {
+                    chunks_idx.push(idx);
+                    chunks_data.push(chunk);
+                    taken.push(idx);
+                }
+                None => {
+                    // Inconsistent bookkeeping: restore what we took and the
+                    // reserved indices, then report the fault.
+                    drop(guard);
+                    for &t in &taken {
+                        let mut g = self.storage[t].lock().map_err(|_| {
+                            BackendError::PoisonedLock {
+                                lock: "memory storage slot",
+                            }
                         })?;
-                *guard = Some(chunk);
+                        // best-effort: leave as-is; the slot was already taken
+                        let _ = &mut g;
+                    }
+                    let mut free = self.free_slots.lock().map_err(|_| {
+                        BackendError::PoisonedLock {
+                            lock: "memory free slots",
+                        }
+                    })?;
+                    for &idx in &drained {
+                        free.push_back(idx);
+                    }
+                    return Err(BackendError::InvariantViolation {
+                        detail: "a free chunk slot was no longer free",
+                    });
+                }
             }
-            return Err(BackendError::ExceedLimitSize {
-                max: (free_count * M) as u64,
-                actual: size,
-            });
         }
-
-        let chunks_idx: Vec<usize> = allocated.iter().map(|(idx, _)| *idx).collect();
-        let chunks_data: Vec<[u8; M]> = allocated.into_iter().map(|(_, chunk)| chunk).collect();
 
         let mut object = Object::<M> {
             chunks: chunks_data,
@@ -169,14 +205,23 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
             if let Some(e) = failure {
                 // Hand capacity back to the original slots.
-                for (chunk, slot_idx) in object.chunks.into_iter().zip(object.slots.iter()) {
-                    let mut guard =
-                        self.storage[*slot_idx]
-                            .lock()
-                            .map_err(|_| BackendError::PoisonedLock {
+                let slots = std::mem::take(&mut object.slots);
+                let chunks = std::mem::take(&mut object.chunks);
+                let mut free = self.free_slots.lock().map_err(|_| {
+                    BackendError::PoisonedLock {
+                        lock: "memory free slots",
+                    }
+                })?;
+                for (i, &slot_idx) in slots.iter().enumerate() {
+                    if i < chunks.len() {
+                        let mut guard = self.storage[slot_idx].lock().map_err(|_| {
+                            BackendError::PoisonedLock {
                                 lock: "memory storage slot",
-                            })?;
-                    *guard = Some(chunk);
+                            }
+                        })?;
+                        *guard = Some(chunks[i]);
+                    }
+                    free.push_back(slot_idx);
                 }
 
                 return Err(BackendError::Other(e.into()));
@@ -252,14 +297,17 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
         // Reclaim capacity back to original slots. Readers keep their own
         // immutable copy of the chunks, so copying here is safe.
-        for (chunk, slot_idx) in object.chunks.iter().zip(object.slots.iter()) {
-            let mut guard =
-                self.storage[*slot_idx]
-                    .lock()
-                    .map_err(|_| BackendError::PoisonedLock {
-                        lock: "memory storage slot",
-                    })?;
-            *guard = Some(*chunk);
+        let mut free = self.free_slots.lock().map_err(|_| BackendError::PoisonedLock {
+            lock: "memory free slots",
+        })?;
+        for slot_idx in &object.slots {
+            let mut guard = self.storage[*slot_idx].lock().map_err(|_| {
+                BackendError::PoisonedLock {
+                    lock: "memory storage slot",
+                }
+            })?;
+            *guard = Some([0; M]);
+            free.push_back(*slot_idx);
         }
 
         Ok(())
