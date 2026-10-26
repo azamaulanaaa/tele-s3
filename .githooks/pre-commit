@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# Runs the fast checks on every commit, so a lint failure shows up while the
+# change is still in the editor's memory rather than in a CI log afterwards.
+#
+# Enable with:  git config core.hooksPath .githooks
+#
+# Bypass for a commit that genuinely cannot pass yet:  git commit --no-verify
+
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Nothing staged: nothing to check.
+if git diff --cached --quiet; then
+    exit 0
+fi
+
+# The lint levels live in Cargo.toml under `[lints]`, so a bare clippy already
+# fails on a violation. mise is the task runner this project uses, but the
+# fallback keeps the hook useful for anyone who has not installed it.
+if command -v mise >/dev/null 2>&1; then
+    echo "pre-commit: mise run lint"
+    exec mise run lint
+fi
+
+echo "pre-commit: cargo fmt --check && cargo clippy (mise not found)"
+cargo fmt --all --check
+cargo clippy --all-targets --all-features

@@ -1,11 +1,83 @@
-[tools]
-cargo-binstall = "latest"
-"cargo:cargo-dist" = "latest"
-"cargo:cargo-zigbuild" = "latest"
-rust = { version = "latest", components = "rust-analyzer" }
-zig = "latest"
+# Toolchain and task aliases, so every check is one word and the versions are
+# pinned in one place:
+#
+#   mise install     # fetch the tools below
+#   mise run check   # everything
+#
+# Tasks are named after the CI jobs that run the same check, so a failure in CI
+# is reproducible locally with `mise run <name>`.
 
-[tasks]
-test = { run = "cargo-zigbuild test" }
-build = { run = "cargo-zigbuild build" }
-run = { run = "cargo-zigbuild run" }
+[tools]
+rust = { version = "stable", components = "rust-analyzer" }
+# Coverage: llvm-cov instruments the test binary rather than sampling, so the
+# numbers are exact and reproducible.
+"cargo:cargo-llvm-cov" = "latest"
+# Advisories, licences and duplicate-version checks over the resolved graph.
+"cargo:cargo-deny" = "latest"
+# Release artifacts: builds the platform archives and drives the release CI.
+"cargo:cargo-dist" = "latest"
+
+[tasks.build]
+run = "cargo build --all-targets --all-features"
+
+[tasks.test]
+run = [
+  "cargo test --all-targets --all-features",
+  "cargo test --doc",
+]
+
+[tasks.cov]
+run = "cargo llvm-cov --all-features --summary-only"
+description = "Print a coverage summary for the test suite"
+
+[tasks.fmt]
+run = "cargo fmt --all --check"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets --all-features"
+
+[tasks.lint]
+depends = ["fmt", "clippy"]
+
+[tasks.licenses]
+run = "cargo deny check licenses"
+description = "Every locked dependency's licence must be compatible with GPL-2.0-only"
+
+[tasks.advisories]
+run = "cargo deny check advisories"
+description = "Known vulnerabilities and yanked releases in the resolved graph"
+
+[tasks.bans]
+run = "cargo deny check bans"
+description = "Wildcard dependencies and duplicate versions"
+
+[tasks.deps]
+depends = ["licenses", "advisories", "bans"]
+
+[tasks.msrv]
+run = '''
+floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+echo "building against the declared floor: $floor"
+cargo "+$floor" check --all-targets --all-features --locked
+'''
+description = "Build against the declared minimum supported Rust version"
+
+[tasks.doc]
+run = "cargo doc --no-deps --all-features"
+env = { RUSTDOCFLAGS = "-D warnings" }
+
+[tasks.check]
+depends = ["lint", "test", "deps", "msrv", "doc", "dist-check"]
+description = "Run every check CI runs"
+
+[tasks.dist-plan]
+run = "dist plan"
+description = "List the artifacts a release would produce, without building"
+
+[tasks.dist-check]
+run = "dist plan --output-format=human > /dev/null"
+description = "Check that the release plan resolves and the release workflow still gates on CI"
+
+[tasks.dist-build]
+run = "dist build --artifacts=local --target=\"$(rustc -vV | sed -n 's/^host: //p')\""
+description = "Build the release archive for this machine into target/distrib"
