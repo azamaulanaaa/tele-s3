@@ -451,6 +451,7 @@ impl Repository {
     }
 
     /// Current reference count for a blob id (0 if the row is absent).
+    #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
     pub async fn blob_ref_count(&self, id: &str) -> S3Result<i64> {
         let model = entity::blob::Entity::find_by_id(id.to_string())
@@ -458,6 +459,30 @@ impl Repository {
             .await
             .map_err(S3Error::internal_error)?;
         Ok(model.map(|m| m.refs).unwrap_or(0))
+    }
+
+    /// Reference counts for several blob ids in one query.
+    #[instrument(skip(self, ids), level = "debug", err)]
+    pub async fn blob_ref_counts(
+        &self,
+        ids: &[String],
+    ) -> S3Result<std::collections::HashMap<String, i64>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let models = entity::blob::Entity::find()
+            .filter(entity::blob::Column::Id.is_in(ids.to_vec()))
+            .all(&self.db)
+            .await
+            .map_err(S3Error::internal_error)?;
+        let mut counts = std::collections::HashMap::new();
+        for model in models {
+            counts.insert(model.id, model.refs);
+        }
+        for id in ids {
+            counts.entry(id.clone()).or_insert(0);
+        }
+        Ok(counts)
     }
 
     /// Delete blob rows whose backend data the caller has already removed.

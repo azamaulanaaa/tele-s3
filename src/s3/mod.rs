@@ -137,8 +137,15 @@ impl<B: Backend> TeleS3<B> {
         // already at a zero refcount (e.g. a previous backend delete that
         // failed and left the row behind) so a retry can finish the cleanup.
         let mut candidates: Vec<String> = released.clone();
-        for id in &ids {
-            if !candidates.contains(id) && self.repo.blob_ref_count(id).await? <= 0 {
+        let candidate_set: std::collections::HashSet<String> = released.iter().cloned().collect();
+        let to_check: Vec<String> = ids
+            .iter()
+            .filter(|id| !candidate_set.contains(*id))
+            .cloned()
+            .collect();
+        let counts = self.repo.blob_ref_counts(&to_check).await?;
+        for id in &to_check {
+            if counts.get(id).copied().unwrap_or(0) <= 0 {
                 candidates.push(id.clone());
             }
         }
@@ -352,11 +359,11 @@ impl<B: Backend> TeleS3<B> {
             return Ok(());
         }
 
-        let exists = self.repo.object_exists(bucket, key).await?;
-        let current_etag: Option<String> = if exists {
-            self.repo.get_object(bucket, key).await?.etag
-        } else {
-            None
+        // One latest-row read carries both the existence flag and the etag.
+        let current_etag: Option<String> = match self.repo.get_object(bucket, key).await {
+            Ok(model) => model.etag,
+            Err(err) if *err.code() == s3s::S3ErrorCode::NoSuchKey => None,
+            Err(err) => return Err(err),
         };
 
         match condition {

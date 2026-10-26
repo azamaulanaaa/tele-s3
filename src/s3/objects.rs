@@ -337,23 +337,16 @@ impl<B: Backend> TeleS3<B> {
         let delete_old_future = if is_versioned {
             None
         } else {
-            let is_exists = self
-                .repo
-                .object_exists(&req.input.bucket, &req.input.key)
-                .await?;
-
-            if is_exists {
-                let model = self
-                    .repo
-                    .get_object(&req.input.bucket, &req.input.key)
-                    .await?;
-
-                let metadata: Metadata =
-                    serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-
-                Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
-            } else {
-                None
+            match self
+                .replaced_object(&req.input.bucket, &req.input.key)
+                .await?
+            {
+                Some(model) => {
+                    let metadata: Metadata =
+                        serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
+                    Some(self.release_blobs(metadata.item.into_iter().map(|v| v.id).collect()))
+                }
+                None => None,
             }
         };
 
@@ -627,20 +620,14 @@ impl<B: Backend> TeleS3<B> {
             return Ok(model);
         }
 
-        match self.repo.get_object(bucket, key).await {
-            Ok(model) => Ok(model),
-            Err(err) if *err.code() == S3ErrorCode::NoSuchKey => {
-                if let Some(marker) = self.repo.get_latest_raw(bucket, key).await?
-                    && marker.is_delete_marker
-                {
-                    return Err(delete_marker_error(
-                        &marker.version_id,
-                        S3ErrorCode::NoSuchKey,
-                    ));
-                }
-                Err(err)
-            }
-            Err(err) => Err(err),
+        // One latest-row read covers both the object and the delete-marker case.
+        match self.repo.get_latest_raw(bucket, key).await? {
+            Some(model) if !model.is_delete_marker => Ok(model),
+            Some(marker) if marker.is_delete_marker => Err(delete_marker_error(
+                &marker.version_id,
+                S3ErrorCode::NoSuchKey,
+            )),
+            _ => Err(S3Error::new(S3ErrorCode::NoSuchKey)),
         }
     }
 

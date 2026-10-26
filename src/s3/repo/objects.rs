@@ -485,6 +485,7 @@ impl Repository {
         }
     }
 
+    #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
     pub async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
         let m = self.get_latest_model(bucket, key).await?;
