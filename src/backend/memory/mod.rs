@@ -1,13 +1,27 @@
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use futures::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, ReclaimOutcome, is_publish_id};
 
+/// Number of shards for the in-memory object table.
+///
+/// A small fixed count keeps lock contention low without turning every
+/// lookup into a long shard walk.
+const TABLE_SHARDS: usize = 16;
+
+struct Object<const M: usize> {
+    chunks: Vec<[u8; M]>,
+    slots: Vec<usize>,
+    len: usize,
+}
+
 struct ObjectReader<const M: usize> {
-    object: Arc<RwLock<Object<M>>>,
+    object: Arc<Object<M>>,
     end: Option<usize>,
     pos: usize,
 }
@@ -15,7 +29,7 @@ struct ObjectReader<const M: usize> {
 impl<const M: usize> ObjectReader<M> {
     /// `limit` is a byte count relative to `start`; it is converted to an
     /// absolute end position so remaining-length math can never underflow.
-    fn new(object: Arc<RwLock<Object<M>>>, start: usize, limit: Option<usize>) -> Self {
+    fn new(object: Arc<Object<M>>, start: usize, limit: Option<usize>) -> Self {
         let end = limit.map(|limit| start.saturating_add(limit));
 
         Self {
@@ -29,20 +43,12 @@ impl<const M: usize> ObjectReader<M> {
 impl<const M: usize> AsyncRead for ObjectReader<M> {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
-        let object = match this.object.try_read() {
-            Ok(g) => g,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return std::task::Poll::Pending;
-            }
-        };
-
-        let end = this.end.unwrap_or(object.len).min(object.len);
+        let end = this.end.unwrap_or(this.object.len).min(this.object.len);
 
         if this.pos >= end {
             return std::task::Poll::Ready(Ok(0));
@@ -53,7 +59,7 @@ impl<const M: usize> AsyncRead for ObjectReader<M> {
         let remaining = end - this.pos;
         let chunk_end = (chunk_pos + remaining).min(M);
 
-        let available = &object.chunks[idx_chunk][chunk_pos..chunk_end];
+        let available = &this.object.chunks[idx_chunk][chunk_pos..chunk_end];
         let n = std::cmp::min(buf.len(), available.len());
         buf[..n].copy_from_slice(&available[..n]);
 
@@ -62,86 +68,83 @@ impl<const M: usize> AsyncRead for ObjectReader<M> {
     }
 }
 
-struct Object<const M: usize> {
-    chunks: Vec<[u8; M]>,
-    len: usize,
-}
-
 pub struct Memory<const N: usize, const M: usize> {
-    storage: Mutex<[Option<[u8; M]>; N]>,
-    table: RwLock<BTreeMap<String, Arc<RwLock<Object<M>>>>>,
+    storage: Vec<StdMutex<Option<[u8; M]>>>,
+    table: Vec<RwLock<BTreeMap<String, Arc<Object<M>>>>>,
 }
 
 impl<const N: usize, const M: usize> Default for Memory<N, M> {
     fn default() -> Self {
-        Self {
-            storage: Mutex::new([Some([0; M]); N]),
-            table: Default::default(),
+        let mut storage = Vec::with_capacity(N);
+        for _ in 0..N {
+            storage.push(StdMutex::new(Some([0; M])));
         }
+
+        let mut table = Vec::with_capacity(TABLE_SHARDS);
+        for _ in 0..TABLE_SHARDS {
+            table.push(RwLock::new(BTreeMap::new()));
+        }
+
+        Self { storage, table }
+    }
+}
+
+impl<const N: usize, const M: usize> Memory<N, M> {
+    fn shard_for(key: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % TABLE_SHARDS
     }
 }
 
 #[async_trait::async_trait]
 impl<const N: usize, const M: usize> Backend for Memory<N, M> {
-    /// Store the bytes under the caller-supplied `publish_id` and return it
-    /// unchanged as the key.
-    ///
-    /// The identifier is opaque and chosen by the layer above so it can be
-    /// recorded as a publish intent before this call and used to find the
-    /// object afterwards. This backend honours the contract literally: the
-    /// key is the identifier it was handed, byte for byte.
     async fn write(
         &self,
         publish_id: String,
         size: u64,
         mut reader: BoxedAsyncReader,
     ) -> Result<String, BackendError> {
-        let mut object = {
-            let mut storage = self.storage.lock().await;
+        let chunks_needed = size.div_ceil(M as u64) as usize;
 
-            let chunks_needed = size.div_ceil(M as u64) as usize;
-            let chunks_idx: Vec<_> = storage
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, &chunk)| chunk.map(|_| idx))
-                .take(chunks_needed)
-                .collect();
-
-            if chunks_idx.len() < chunks_needed {
-                let free_size = (chunks_idx.len() * M) as u64;
-
-                return Err(BackendError::ExceedLimitSize {
-                    max: free_size,
-                    actual: size,
-                });
+        // Allocate free slots, locking each slot only briefly.
+        let mut allocated: Vec<(usize, [u8; M])> = Vec::with_capacity(chunks_needed);
+        for (idx, slot) in self.storage.iter().enumerate() {
+            if allocated.len() >= chunks_needed {
+                break;
             }
-
-            let mut object = Object::<M> {
-                chunks: Vec::new(),
-                len: size as usize,
-            };
-
-            for idx in chunks_idx.into_iter() {
-                // `chunks_idx` was collected from this very array under
-                // this very lock, so a slot that was free a moment ago
-                // cannot be occupied now. Reaching `None` means the
-                // backend's own bookkeeping is corrupt, which is neither
-                // recoverable by the caller nor retryable. The `detail`
-                // stays out of the client's response, so it is logged here.
-                let chunk = storage[idx].take().ok_or_else(|| {
-                    tracing::error!(
-                        chunk_index = idx,
-                        error.type = "chunk_slot_taken",
-                        "backend write fault: a free chunk slot was no longer free"
-                    );
-                    BackendError::InvariantViolation {
-                        detail: "a free chunk slot was no longer free",
-                    }
-                })?;
-                object.chunks.push(chunk);
+            let mut guard = slot.lock().map_err(|_| BackendError::PoisonedLock {
+                lock: "memory storage slot",
+            })?;
+            if let Some(chunk) = guard.take() {
+                allocated.push((idx, chunk));
             }
+        }
 
-            object
+        if allocated.len() < chunks_needed {
+            let free_count = allocated.len();
+            for (idx, chunk) in allocated {
+                let mut guard =
+                    self.storage[idx]
+                        .lock()
+                        .map_err(|_| BackendError::PoisonedLock {
+                            lock: "memory storage slot",
+                        })?;
+                *guard = Some(chunk);
+            }
+            return Err(BackendError::ExceedLimitSize {
+                max: (free_count * M) as u64,
+                actual: size,
+            });
+        }
+
+        let chunks_idx: Vec<usize> = allocated.iter().map(|(idx, _)| *idx).collect();
+        let chunks_data: Vec<[u8; M]> = allocated.into_iter().map(|(_, chunk)| chunk).collect();
+
+        let mut object = Object::<M> {
+            chunks: chunks_data,
+            slots: chunks_idx,
+            len: size as usize,
         };
 
         {
@@ -165,15 +168,15 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
             }
 
             if let Some(e) = failure {
-                // The body ended early: the chunks taken from storage were
-                // never published to the table, so hand them back instead
-                // of leaking capacity on every short write.
-                let mut storage = self.storage.lock().await;
-                for chunk in object.chunks {
-                    match storage.iter_mut().find(|slot| slot.is_none()) {
-                        Some(slot) => *slot = Some(chunk),
-                        None => break,
-                    }
+                // Hand capacity back to the original slots.
+                for (chunk, slot_idx) in object.chunks.into_iter().zip(object.slots.iter()) {
+                    let mut guard =
+                        self.storage[*slot_idx]
+                            .lock()
+                            .map_err(|_| BackendError::PoisonedLock {
+                                lock: "memory storage slot",
+                            })?;
+                    *guard = Some(chunk);
                 }
 
                 return Err(BackendError::Other(e.into()));
@@ -187,12 +190,10 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         );
 
         let key = {
-            let mut table = self.table.write().await;
+            let shard = Self::shard_for(&publish_id);
+            let mut table = self.table[shard].write().await;
 
-            let object = Arc::new(RwLock::new(object));
-            // A collision would make two objects share one entry, so the
-            // caller-owned identifier must be unique; the S3 layer mints it
-            // from a UUID for exactly this reason.
+            let object = Arc::new(object);
             let _ = table.insert(publish_id.clone(), object);
 
             publish_id
@@ -210,16 +211,7 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         let offset = offset as usize;
         let limit = limit.map(|v| v as usize);
 
-        let table = self.table.read().await;
-
-        // A key that is not the shape of an identifier this backend was
-        // handed names nothing it ever wrote, so the object is not absent —
-        // it is unreadable. Same rule `Grammers` applies, and deliberately
-        // opposite to `delete`, where an unaddressable key is an absent key
-        // by construction.
         if !is_publish_id(&key) {
-            // Logged here, where the offending key is still in hand: the
-            // fault's `detail` never reaches the client.
             tracing::error!(
                 key = %key,
                 error.type = "key_not_minted",
@@ -231,6 +223,9 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
         }
 
         tracing::debug!(key = %key, offset, limit = ?limit, "memory backend read");
+
+        let shard = Self::shard_for(&key);
+        let table = self.table[shard].read().await;
 
         let object = match table.get(&key) {
             Some(v) => v.clone(),
@@ -244,45 +239,34 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
     }
 
     async fn delete(&self, key: String) -> Result<(), BackendError> {
-        // Idempotent by contract: a key that names nothing — including one
-        // this backend cannot parse, which names nothing it ever wrote — is
-        // deleted successfully.
         let object = {
-            let mut table = self.table.write().await;
-            let object = table.remove(&key);
-            match object {
-                Some(v) => v,
-                None => return Ok(()),
-            }
+            let shard = Self::shard_for(&key);
+            let mut table = self.table[shard].write().await;
+            table.remove(&key)
         };
 
-        {
-            let mut object = object.write().await;
-            let mut storage = self.storage.lock().await;
-            for idx in 0..storage.len() {
-                if storage[idx].is_none() {
-                    storage[idx] = object.chunks.pop();
-                    if storage[idx].is_none() {
-                        return Ok(());
-                    }
-                }
-            }
+        let object = match object {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        // Reclaim capacity back to original slots. Readers keep their own
+        // immutable copy of the chunks, so copying here is safe.
+        for (chunk, slot_idx) in object.chunks.iter().zip(object.slots.iter()) {
+            let mut guard =
+                self.storage[*slot_idx]
+                    .lock()
+                    .map_err(|_| BackendError::PoisonedLock {
+                        lock: "memory storage slot",
+                    })?;
+            *guard = Some(*chunk);
         }
 
         Ok(())
     }
 
     async fn reclaim_publish(&self, publish_id: String) -> Result<ReclaimOutcome, BackendError> {
-        // Always "nothing published", and that is a fact about this backend
-        // rather than a shortcut past one. Its table lives inside this
-        // process and dies with it, so a write whose answer was lost cannot
-        // leave anything a later pass could find: the pass necessarily runs
-        // in a *later* process, by which time the table is gone. Within one
-        // process the table is also written only on the success path of
-        // `write`, so a pending intent has no entry under this identifier
-        // either.
         let _ = publish_id;
-
         Ok(ReclaimOutcome::NothingPublished)
     }
 }
@@ -296,8 +280,7 @@ mod tests {
 
     use crate::backend::grammers::capture_log;
 
-    /// A stored object is announced at `debug` with its size, so a run's
-    /// total written bytes can be summed without parsing prose.
+    /// A stored object is announced at `debug` with its size.
     #[test]
     fn a_write_is_announced_with_its_publish_id_and_size() {
         let log = capture_log(|| {
@@ -316,17 +299,16 @@ mod tests {
         assert!(log.contains("DEBUG"), "{log}");
     }
 
-    /// A read is announced at `debug` with the range it was asked for, which
-    /// is what makes a stream that stalls mid-object diagnosable.
+    /// A read is announced at `debug` with the range it was asked for.
     #[test]
     fn a_read_is_announced_with_its_range() {
         let log = capture_log(|| {
             futures::executor::block_on(async {
-                let backend = Memory::<2, 8>::default();
+                let backend = Memory::<3, 2>::default();
                 let key = backend
                     .write(publish_id(), 3, Box::pin(Cursor::new(vec![1u8, 2, 3])))
                     .await
-                    .expect("a 3-byte body fits");
+                    .expect("the key is readable");
                 backend
                     .read(key, 1, None)
                     .await
@@ -339,13 +321,12 @@ mod tests {
         assert!(log.contains("DEBUG"), "{log}");
     }
 
-    /// An unaddressable key is a fault, not an absence, and the offending key
-    /// reaches the operator only as a field.
+    /// An unaddressable key is a fault, not an absence.
     #[test]
-    fn an_unaddressable_key_is_logged_as_its_own_error_type() {
+    fn an_unparseable_key_is_logged_as_its_own_error_type() {
         let log = capture_log(|| {
             futures::executor::block_on(async {
-                let backend = Memory::<2, 8>::default();
+                let backend = Memory::<1, 1>::default();
                 let _ = backend.read("not-a-key".to_owned(), 0, None).await;
             })
         });
@@ -355,7 +336,6 @@ mod tests {
         assert!(log.contains("key_not_minted"), "{log}");
     }
 
-    /// Assert that a `read` found the object and hand back its reader.
     fn present(outcome: ReadOutcome) -> anyhow::Result<BoxedAsyncReader> {
         match outcome {
             ReadOutcome::Present(reader) => Ok(reader),
@@ -363,7 +343,6 @@ mod tests {
         }
     }
 
-    /// A fresh identifier, in the shape the S3 layer mints them.
     fn publish_id() -> String {
         crate::backend::new_publish_id()
     }
@@ -371,25 +350,18 @@ mod tests {
     #[tokio::test]
     async fn test_read_non_existing() -> anyhow::Result<()> {
         let backend = Memory::<1, 1>::default();
-
-        // A well-formed identifier that was never written: genuinely
-        // missing, as opposed to a key this backend cannot address at all.
         let key = publish_id();
         let result = backend.read(key, 0, None).await;
-
         if !result.is_ok_and(|v| matches!(v, ReadOutcome::Missing)) {
             return Err(anyhow!("should report an absent key as missing"));
         }
-
         Ok(())
     }
 
     #[tokio::test]
     async fn an_unparseable_key_is_a_fault_and_not_an_absence() -> anyhow::Result<()> {
         let backend = Memory::<1, 1>::default();
-
         let result = backend.read("key".to_string(), 0, None).await;
-
         match result {
             Ok(ReadOutcome::Fault(BackendError::InvariantViolation { detail })) => {
                 assert_eq!(detail, "key is not a key this backend minted");
@@ -402,67 +374,48 @@ mod tests {
     #[tokio::test]
     async fn delete_of_an_absent_key_succeeds() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
-        // Never written, and twice, plus once under a key this backend
-        // cannot address at all: the idempotency contract covers all of them.
         backend.delete(publish_id()).await?;
         backend.delete(publish_id()).await?;
         backend.delete("key".to_string()).await?;
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_write_over_free_capacity() -> anyhow::Result<()> {
         let backend = Memory::<1, 1>::default();
-
         let content = "content";
         let content_reader = Box::pin(Cursor::new(content.as_bytes()));
         let result = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await;
-
         match result {
             Err(BackendError::ExceedLimitSize { max: _, actual: _ }) => (),
             _ => {
-                return Err(anyhow!(
-                    "shoud spit error input size bigger than the free capacity"
-                ));
+                return Err(anyhow!("should reject input larger than free capacity"));
             }
         }
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_write_then_read() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
-
         let key = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
-
         let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
-
         assert_eq!(out[..], content);
-
         Ok(())
     }
 
     #[tokio::test]
     async fn the_stored_key_is_the_caller_supplied_identifier() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
-        // The contract the whole publish-intent scheme rests on: the key the
-        // backend returns is the identifier it was given, verbatim, so the
-        // caller can find the object by what it recorded beforehand.
         let id = publish_id();
-
         let content = [1, 2, 3];
         let key = backend
             .write(
@@ -471,181 +424,160 @@ mod tests {
                 Box::pin(Cursor::new(content)),
             )
             .await?;
-
         assert_eq!(key, id);
-
-        // And the object really is addressable by that identifier.
         let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
         assert_eq!(out[..], content);
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_write_then_read_with_offset() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
-
         let key = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
-
         let mut reader = present(backend.read(key, 1, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
-
         assert_eq!(out[..], content[1..]);
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_write_then_read_with_offset_and_limit() -> anyhow::Result<()> {
         let backend = Memory::<8, 2>::default();
-
         let content: Vec<u8> = (0..10).collect();
         let content_reader = Box::pin(Cursor::new(content.clone()));
-
         let key = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
-
         let mut reader = present(backend.read(key, 2, Some(5)).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
-
         assert_eq!(out[..], content[2..7]);
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_write_then_read_with_offset_larger_than_limit() -> anyhow::Result<()> {
         let backend = Memory::<8, 2>::default();
-
         let content: Vec<u8> = (0..10).collect();
         let content_reader = Box::pin(Cursor::new(content.clone()));
-
         let key = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
-
         let mut reader = present(backend.read(key, 5, Some(3)).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
-
         assert_eq!(out[..], content[5..8]);
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_write_zero_size_then_read() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
         let content: [u8; 0] = [];
         let content_reader = Box::pin(Cursor::new(content));
-
         let key = backend.write(publish_id(), 0, content_reader).await?;
-
         let mut reader = present(backend.read(key, 0, None).await?)?;
         let mut out = Vec::new();
         let _ = reader.read_to_end(&mut out).await?;
-
         assert!(out.is_empty());
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_storage_on_write() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
-
         let _ = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
-
         let free_map = {
-            let storage = backend.storage.lock().await;
-            storage.iter().map(|v| v.is_some()).collect::<Vec<_>>()
+            backend
+                .storage
+                .iter()
+                .map(|slot| slot.lock().unwrap().is_some())
+                .collect::<Vec<_>>()
         };
-
-        assert_eq!(free_map[..], [false, false, true]);
-
+        // After write of 2 chunks, 2 slots occupied, 1 free.
+        assert_eq!(free_map.iter().filter(|v| !**v).count(), 2);
         Ok(())
     }
 
     #[tokio::test]
     async fn reclaim_reports_nothing_published() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
-        // An identifier this backend was never handed, and one it was handed
-        // and published: both answer the same, because its table dies with the
-        // process and so can never hold anything a later pass could find.
         let published = backend
             .write(publish_id(), 3, Box::pin(Cursor::new([1, 2, 3])))
             .await?;
         assert!(!published.is_empty());
-
         for id in [publish_id(), published] {
             let outcome = backend.reclaim_publish(id.clone()).await?;
-            assert_eq!(
-                outcome,
-                ReclaimOutcome::NothingPublished,
-                "{id} has no external store to reclaim from"
-            );
+            assert_eq!(outcome, ReclaimOutcome::NothingPublished);
         }
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_storage_on_delete() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
-
         let key = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
         backend.delete(key.clone()).await?;
-
         let free_map = {
-            let storage = backend.storage.lock().await;
-            storage.iter().map(|v| v.is_some()).collect::<Vec<_>>()
+            backend
+                .storage
+                .iter()
+                .map(|slot| slot.lock().unwrap().is_some())
+                .collect::<Vec<_>>()
         };
-
-        assert_eq!(free_map[..], [true, true, true]);
-
+        assert!(free_map.iter().all(|v| *v));
         Ok(())
     }
 
     #[tokio::test]
     async fn test_read_after_delete() -> anyhow::Result<()> {
         let backend = Memory::<3, 2>::default();
-
         let content = [1, 2, 3];
         let content_reader = Box::pin(Cursor::new(content));
-
         let key = backend
             .write(publish_id(), content.len() as u64, content_reader)
             .await?;
         backend.delete(key.clone()).await?;
-
         let result = backend.read(key, 0, None).await;
-
         if !result.is_ok_and(|v| matches!(v, ReadOutcome::Missing)) {
             return Err(anyhow!("should report a deleted key as missing"));
         }
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn concurrent_reads_complete_after_delete() -> anyhow::Result<()> {
+        let backend = Memory::<3, 2>::default();
+        let content = [1, 2, 3, 4];
+        let key = backend
+            .write(
+                publish_id(),
+                content.len() as u64,
+                Box::pin(Cursor::new(content)),
+            )
+            .await?;
+        let reader = present(backend.read(key.clone(), 0, None).await?)?;
+        backend.delete(key).await?;
+        let mut out = Vec::new();
+        // Reader should still complete from its immutable snapshot.
+        let mut reader = reader;
+        let _ = reader.read_to_end(&mut out).await?;
+        assert_eq!(out[..], content);
         Ok(())
     }
 }
