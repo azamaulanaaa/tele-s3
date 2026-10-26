@@ -152,18 +152,21 @@ impl<B: Backend> TeleS3<B> {
             return Ok(());
         }
 
-        let results =
-            futures::future::join_all(claimed.iter().map(|id| self.backend.delete(id.clone())))
-                .await;
+        const BACKEND_DELETE_BATCH: usize = 8;
 
         let mut deleted: Vec<String> = Vec::with_capacity(claimed.len());
         let mut failed: Vec<String> = Vec::with_capacity(claimed.len());
-        for (id, result) in claimed.iter().zip(results) {
-            match result {
-                Ok(()) => deleted.push(id.clone()),
-                Err(err) => {
-                    tracing::warn!(blob_id = %id, error.type = "backend_delete", error.message = ?err, "backend delete failed");
-                    failed.push(id.clone());
+        for chunk in claimed.chunks(BACKEND_DELETE_BATCH) {
+            let results =
+                futures::future::join_all(chunk.iter().map(|id| self.backend.delete(id.clone())))
+                    .await;
+            for (id, result) in chunk.iter().zip(results) {
+                match result {
+                    Ok(()) => deleted.push(id.clone()),
+                    Err(err) => {
+                        tracing::warn!(blob_id = %id, error.type = "backend_delete", error.message = ?err, "backend delete failed");
+                        failed.push(id.clone());
+                    }
                 }
             }
         }
@@ -195,19 +198,23 @@ impl<B: Backend> TeleS3<B> {
     /// Best-effort by construction: a failure is logged and the request keeps
     /// its original error.
     async fn discard_backend_blobs(&self, ids: Vec<String>) -> bool {
-        let results =
-            futures::future::join_all(ids.iter().map(|id| self.backend.delete(id.clone()))).await;
+        const BACKEND_DELETE_BATCH: usize = 8;
 
         let mut all_deleted = true;
-        for (id, result) in ids.iter().zip(results) {
-            if let Err(err) = result {
-                all_deleted = false;
-                tracing::warn!(
-                    blob_id = %id,
-                    error.type = "backend_delete",
-                    error.message = ?err,
-                    "failed to delete a backend blob that was never registered"
-                );
+        for chunk in ids.chunks(BACKEND_DELETE_BATCH) {
+            let results =
+                futures::future::join_all(chunk.iter().map(|id| self.backend.delete(id.clone())))
+                    .await;
+            for (id, result) in chunk.iter().zip(results) {
+                if let Err(err) = result {
+                    all_deleted = false;
+                    tracing::warn!(
+                        blob_id = %id,
+                        error.type = "backend_delete",
+                        error.message = ?err,
+                        "failed to delete a backend blob that was never registered"
+                    );
+                }
             }
         }
 
@@ -279,46 +286,49 @@ impl<B: Backend> TeleS3<B> {
 
         let mut cleared: Vec<String> = Vec::new();
 
-        for intent in candidates {
-            // The query already applies the age rule; re-checking it here
-            // keeps the pass honest if the two ever drift, and costs nothing.
-            if !publish_intent_is_due(intent.created_at, now) {
-                continue;
-            }
-
-            let outcome = self
-                .backend
-                .reclaim_publish(intent.publish_id.clone())
-                .await;
-
-            match intent_disposition(&outcome) {
-                IntentDisposition::Clear => cleared.push(intent.publish_id.clone()),
-                IntentDisposition::KeepPending => match &outcome {
-                    Ok(ReclaimOutcome::ReclaimFailed) => tracing::warn!(
-                        publish_id = %intent.publish_id,
-                        error.type = "reclaim_publish",
-                        "an unconfirmed publish could not be deleted; its intent stays pending"
-                    ),
-                    // `Err` here is "this pass could not find out", not "there
-                    // is nothing there" — logged at the same weight precisely
-                    // because the row survives either way.
-                    Err(err) => tracing::warn!(
-                        publish_id = %intent.publish_id,
-                        error.type = "reclaim_publish",
-                        error.message = ?err,
-                        "could not reclaim an unconfirmed publish; its intent stays pending"
-                    ),
-                    // Not `unreachable!`: this runs at start-up, where a panic
-                    // on a future variant would take the service down over a
-                    // reconciliation detail. Any arm that is not one of the
-                    // two settled outcomes keeps the row and is logged.
-                    Ok(other) => tracing::warn!(
-                        publish_id = %intent.publish_id,
-                        outcome = ?other,
-                        error.type = "unrecognised_reclaim_outcome",
-                        "unrecognised reclaim outcome; its intent stays pending"
-                    ),
-                },
+        const RECONCILE_BATCH: usize = 4;
+        for chunk in candidates.chunks(RECONCILE_BATCH) {
+            let futs: Vec<_> = chunk
+                .iter()
+                .map(|intent| {
+                    let intent = intent.clone();
+                    let backend = &self.backend;
+                    async move {
+                        if !publish_intent_is_due(intent.created_at, now) {
+                            return None;
+                        }
+                        let outcome = backend.reclaim_publish(intent.publish_id.clone()).await;
+                        match intent_disposition(&outcome) {
+                            IntentDisposition::Clear => Some(intent.publish_id.clone()),
+                            IntentDisposition::KeepPending => {
+                                match &outcome {
+                                    Ok(ReclaimOutcome::ReclaimFailed) => tracing::warn!(
+                                        publish_id = %intent.publish_id,
+                                        error.type = "reclaim_publish",
+                                        "an unconfirmed publish could not be deleted; its intent stays pending"
+                                    ),
+                                    Err(err) => tracing::warn!(
+                                        publish_id = %intent.publish_id,
+                                        error.type = "reclaim_publish",
+                                        error.message = ?err,
+                                        "could not reclaim an unconfirmed publish; its intent stays pending"
+                                    ),
+                                    Ok(other) => tracing::warn!(
+                                        publish_id = %intent.publish_id,
+                                        outcome = ?other,
+                                        error.type = "unrecognised_reclaim_outcome",
+                                        "unrecognised reclaim outcome; its intent stays pending"
+                                    ),
+                                }
+                                None
+                            }
+                        }
+                    }
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            for cleared_id in results.into_iter().flatten() {
+                cleared.push(cleared_id);
             }
         }
 
