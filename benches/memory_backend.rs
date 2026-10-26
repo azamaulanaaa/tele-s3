@@ -1,3 +1,5 @@
+#![allow(missing_docs, clippy::expect_used)]
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::executor::block_on;
 use futures::io::Cursor;

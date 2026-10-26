@@ -75,6 +75,7 @@ pub(crate) fn tagging_header_to_json(tagging: Option<&str>) -> S3Result<serde_js
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     #[test]

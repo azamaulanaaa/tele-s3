@@ -1,5 +1,8 @@
 [package]
 name = "tele-s3"
+description = "S3-compatible gateway backed by Telegram"
+keywords = ["s3", "telegram", "gateway"]
+categories = ["web-programming"]
 version = "0.6.0"
 edition = "2024"
 autobenches = false
@@ -88,3 +91,24 @@ harness = false
 inherits = "release"
 codegen-units = 1
 debug = true
+
+[lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unsafe_code = "deny"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+[lints.clippy]
+all = "deny"
+cargo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+
+[lints.clippy.multiple_crate_versions]
+level = "allow"
+priority = 1
+

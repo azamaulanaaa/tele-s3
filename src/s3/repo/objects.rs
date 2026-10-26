@@ -37,7 +37,8 @@ const OBJECT_VERSION_COLUMNS: [entity::object::Column; 7] = [
 /// reads (`get_latest_model`, `get_object_version`, the delete paths) still
 /// materialise the whole row because they genuinely need `content`.
 #[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
-pub struct ObjectListRow {
+/// Documentation.
+pub(crate) struct ObjectListRow {
     /// The key. Also the `next_marker` / continuation-token cursor and the
     /// input to the handler's `CommonPrefix` rollup.
     pub id: String,
@@ -47,7 +48,8 @@ pub struct ObjectListRow {
 
 /// One row of a `ListObjectVersions` page.
 #[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
-pub struct ObjectVersionRow {
+/// Documentation.
+pub(crate) struct ObjectVersionRow {
     /// The key; also the `next_key_marker` cursor and the `CommonPrefix` input.
     pub id: String,
     /// Also the `next_version_id_marker` cursor.
@@ -78,7 +80,8 @@ impl Repository {
         Ok(m)
     }
 
-    pub async fn get_object_version(
+    /// Documentation.
+    pub(crate) async fn get_object_version(
         &self,
         bucket: &str,
         key: &str,
@@ -102,7 +105,8 @@ impl Repository {
     /// of interleaving into zero (or two) `is_latest` rows, and a crash
     /// between demote and insert can no longer orphan the key.
     #[instrument(skip(self, data, condition), level = "debug", err)]
-    pub async fn cas_put_object(
+    /// Documentation.
+    pub(crate) async fn cas_put_object(
         &self,
         bucket: String,
         key: String,
@@ -147,7 +151,9 @@ impl Repository {
     /// Error mapping is unchanged: the condition check, the versioning
     /// branches and their codes all come from `cas_put_object_txn`.
     #[instrument(skip(self, data, condition), level = "debug", err)]
-    pub async fn publish_object_with_new_blob(
+    /// Documentation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_object_with_new_blob(
         &self,
         blob_id: String,
         publish_id: Option<&str>,
@@ -185,6 +191,7 @@ impl Repository {
         }
     }
 
+    /// Documentation.
     pub(super) async fn cas_put_object_txn(
         &self,
         txn: &DatabaseTransaction,
@@ -267,6 +274,7 @@ impl Repository {
         Ok(m)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_object_internal(
         &self,
         txn: &DatabaseTransaction,
@@ -411,7 +419,8 @@ impl Repository {
         }
     }
 
-    pub async fn set_object_tags_versioned(
+    /// Documentation.
+    pub(crate) async fn set_object_tags_versioned(
         &self,
         bucket: &str,
         key: &str,
@@ -438,7 +447,8 @@ impl Repository {
     }
 
     /// Version id of the current latest entry for a key, if any.
-    pub async fn latest_version_id(&self, bucket: &str, key: &str) -> S3Result<Option<String>> {
+    /// Documentation.
+    pub(crate) async fn latest_version_id(&self, bucket: &str, key: &str) -> S3Result<Option<String>> {
         Ok(self
             .get_latest_model(bucket, key)
             .await?
@@ -449,7 +459,8 @@ impl Repository {
     /// key has no versions at all). Used to attach delete-marker headers
     /// to GET/HEAD errors.
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn get_latest_raw(
+    /// Documentation.
+    pub(crate) async fn get_latest_raw(
         &self,
         bucket: &str,
         key: &str,
@@ -458,7 +469,8 @@ impl Repository {
     }
 
     #[instrument(skip(self, data), level = "debug", err)]
-    pub async fn upsert_object(
+    /// Documentation.
+    pub(crate) async fn upsert_object(
         &self,
         bucket: String,
         key: String,
@@ -487,13 +499,15 @@ impl Repository {
 
     #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
+    /// Documentation.
+    pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
         let m = self.get_latest_model(bucket, key).await?;
         Ok(m.is_some_and(|v| !v.is_delete_marker))
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
+    /// Documentation.
+    pub(crate) async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
         let m = self
             .get_latest_model(bucket, key)
             .await?
@@ -504,9 +518,9 @@ impl Repository {
         Ok(m)
     }
 
-    /// Versioned delete: if version_id is Some, permanently delete that version.
+    /// Versioned delete: if `version_id` is Some, permanently delete that version.
     /// If None, create delete marker (if bucket versioning enabled) or permanently delete null version.
-    /// Returns (deleted_model, is_delete_marker_created)
+    /// Returns (`deleted_model`, `is_delete_marker_created`)
     ///
     /// Every statement runs inside one transaction, mirroring
     /// [`Self::cas_put_object`]. That matters because "at most one row per key
@@ -527,7 +541,8 @@ impl Repository {
     /// granularity leave two `is_latest` rows for `get_latest_model` to resolve
     /// arbitrarily.
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn delete_object_versioned(
+    /// Documentation.
+    pub(crate) async fn delete_object_versioned(
         &self,
         bucket: &str,
         key: &str,
@@ -702,7 +717,7 @@ impl Repository {
             .order_by_asc(entity::object::Column::Id);
 
         if let Some(delimiter) = delimiter {
-            let prefix_len = prefix.map(|v| v.len()).unwrap_or_default() as u32;
+            let prefix_len = prefix.map(str::len).unwrap_or_default() as u32;
 
             query =
                 query.filter(
@@ -776,7 +791,8 @@ impl Repository {
     /// fetching a full page of them is pure waste: 1000 rows meant 1000 JSON
     /// documents pulled across the wire and dropped.
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn list_objects(
+    /// Documentation.
+    pub(crate) async fn list_objects(
         &self,
         bucket: &str,
         prefix: Option<String>,
@@ -828,9 +844,7 @@ impl Repository {
                             .add(entity::object::Column::LastModified.lt(marker_modified)),
                     )
                     .into_condition(),
-                None => key_marker
-                    .map(|km| entity::object::Column::Id.gt(km).into_condition())
-                    .unwrap_or_else(|| Condition::all().into_condition()),
+                None => key_marker.map_or_else(|| Condition::all().into_condition(), |km| entity::object::Column::Id.gt(km).into_condition()),
             })
             .order_by_asc(entity::object::Column::Id)
             .order_by_desc(entity::object::Column::LastModified)
@@ -878,7 +892,9 @@ impl Repository {
     /// (`content`, `user_metadata`, `tags`, `checksums`) are never read by the
     /// handler, so they are no longer fetched — a 1000-row page used to drag
     /// along 1000 JSON documents.
-    pub async fn list_object_versions(
+    /// Documentation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_object_versions(
         &self,
         bucket: &str,
         prefix: Option<String>,
@@ -945,6 +961,7 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
     use crate::s3::repo::PutCondition;
 

@@ -126,6 +126,7 @@ pub(crate) fn verify_checksums(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     /// Base64 digests of the right length for each algorithm, deliberately

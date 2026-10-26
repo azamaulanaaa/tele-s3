@@ -68,6 +68,8 @@ impl<const M: usize> AsyncRead for ObjectReader<M> {
     }
 }
 
+/// In-memory backend.
+#[allow(missing_debug_implementations)]
 pub struct Memory<const N: usize, const M: usize> {
     storage: Vec<StdMutex<Option<[u8; M]>>>,
     free_slots: StdMutex<VecDeque<usize>>,
@@ -321,6 +323,7 @@ impl<const N: usize, const M: usize> Backend for Memory<N, M> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     use anyhow::anyhow;

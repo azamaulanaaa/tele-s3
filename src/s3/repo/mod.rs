@@ -7,31 +7,31 @@ mod buckets;
 mod multipart;
 mod objects;
 
-pub mod entity;
+pub(super) mod entity;
 
 pub(crate) use multipart::{MultipartCompletion, MultipartUploadStateUpdate};
 
 /// Precondition for a compare-and-swap object write.
-pub enum PutCondition {
+pub(crate) enum PutCondition {
     None,
-    /// If-Match with a specific ETag: write only if the object exists
-    /// and its stored ETag matches. Missing object → NoSuchKey.
+    /// If-Match with a specific `ETag`: write only if the object exists
+    /// and its stored `ETag` matches. Missing object → `NoSuchKey`.
     IfMatch(String),
     /// If-Match: * — write only if the object exists.
     IfMatchAny,
     /// If-None-Match: * — create-only; any existing object → 412.
     IfNoneMatchAny,
-    /// If-None-Match with a specific ETag: fail only if the object exists
-    /// and its stored ETag matches.
+    /// If-None-Match with a specific `ETag`: fail only if the object exists
+    /// and its stored `ETag` matches.
     IfNoneMatch(String),
 }
 
-pub struct Repository {
+pub(crate) struct Repository {
     pub db: DatabaseConnection,
 }
 
 /// Field bundle for writing an object row.
-pub struct ObjectWrite {
+pub(crate) struct ObjectWrite {
     pub size: u64,
     pub content_type: Option<String>,
     pub etag: Option<String>,
@@ -47,7 +47,7 @@ pub struct ObjectWrite {
 
 impl Repository {
     #[instrument(skip(db), level = "debug")]
-    pub async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
+    pub(crate) async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
         Self::sync_table(&db).await?;
 
         Ok(Self { db })
@@ -71,6 +71,7 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     async fn repo() -> Repository {

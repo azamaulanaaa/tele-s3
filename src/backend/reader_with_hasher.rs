@@ -9,7 +9,7 @@ use futures::io::AsyncRead;
 
 /// Streaming digests computed in a single read pass.
 ///
-/// md5 is always needed for the ETag; the rest are only compared when the
+/// md5 is always needed for the `ETag`; the rest are only compared when the
 /// client supplied the corresponding `checksum_*` header, but computing them
 /// unconditionally keeps the read path single-pass and cheap relative to
 /// the Telegram upload.
@@ -23,6 +23,7 @@ pub struct IntegrityDigests {
 }
 
 impl IntegrityDigests {
+    /// Update all digests with the given bytes.
     pub fn update(&mut self, bytes: &[u8]) {
         Digest::update(&mut self.md5, bytes);
         Digest::update(&mut self.sha1, bytes);
@@ -31,27 +32,38 @@ impl IntegrityDigests {
         self.crc32c = crc32c::crc32c_append(self.crc32c, bytes);
     }
 
+    /// Finalize MD5 and reset its state.
     pub fn finalize_md5_reset(&mut self) -> Vec<u8> {
         Digest::finalize_reset(&mut self.md5).to_vec()
     }
 
+    /// Finalize SHA-1.
+    #[must_use]
     pub fn finalize_sha1(&self) -> Vec<u8> {
         self.sha1.clone().finalize().to_vec()
     }
 
+    /// Finalize SHA-256.
+    #[must_use]
     pub fn finalize_sha256(&self) -> Vec<u8> {
         self.sha256.clone().finalize().to_vec()
     }
 
+    /// Finalize CRC32.
+    #[must_use]
     pub fn finalize_crc32(&self) -> u32 {
         self.crc32.clone().finalize()
     }
 
+    /// Finalize CRC32C.
+    #[must_use]
     pub fn finalize_crc32c(&self) -> u32 {
         self.crc32c
     }
 }
 
+#[allow(missing_debug_implementations)]
+/// Integrity reader.
 pub struct IntegrityReader<R>
 where
     R: AsyncRead + Unpin,
@@ -64,6 +76,7 @@ impl<R> IntegrityReader<R>
 where
     R: AsyncRead + Unpin,
 {
+    /// Create a new integrity reader.
     pub fn new(inner: R, state: Arc<Mutex<IntegrityDigests>>) -> Self {
         Self { inner, state }
     }
@@ -94,6 +107,8 @@ where
     }
 }
 
+#[allow(missing_debug_implementations)]
+/// Reader with hasher.
 pub struct ReaderWithHasher<R, H>
 where
     R: AsyncRead + Unpin,
@@ -108,6 +123,7 @@ where
     R: AsyncRead + Unpin,
     H: DynDigest,
 {
+    /// Create a new reader with hasher.
     pub fn new(inner: R, hasher: Arc<Mutex<H>>) -> Self {
         Self { inner, hasher }
     }

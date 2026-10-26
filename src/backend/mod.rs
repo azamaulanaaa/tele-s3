@@ -27,6 +27,7 @@ pub const PUBLISH_ID_PREFIX: &str = "s3pub-";
 /// publish the object under it — for `Grammers` that is the file name of the
 /// Telegram message — and it must carry no user data: bucket names and keys
 /// are chosen by clients, and this string is visible in the chat.
+#[must_use]
 pub fn new_publish_id() -> String {
     format!("{PUBLISH_ID_PREFIX}{}", uuid::Uuid::new_v4().simple())
 }
@@ -37,6 +38,7 @@ pub fn new_publish_id() -> String {
 /// self-minted: without it they cannot tell a key they were handed from
 /// something they could never address, which is the distinction
 /// [`ReadOutcome::Fault`] turns on.
+#[must_use]
 pub fn is_publish_id(id: &str) -> bool {
     id.strip_prefix(PUBLISH_ID_PREFIX)
         .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -90,10 +92,13 @@ pub type BoxedAsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 #[non_exhaustive]
 pub enum BackendError {
     #[error("Out of range")]
+    #[allow(missing_docs)]
     OutOfRange,
     #[error("Backend is rate limited")]
+    #[allow(missing_docs)]
     SlowDown,
     #[error("Size {actual} exceeds limit {max}")]
+    #[allow(missing_docs)]
     ExceedLimitSize { max: u64, actual: u64 },
     /// An internal `std::sync::Mutex` was poisoned by a panic while it was
     /// held, so whatever it guards is of unknown consistency.
@@ -101,13 +106,16 @@ pub enum BackendError {
     /// Permanent for the life of the process: retrying cannot clear a
     /// poisoned lock, so this must never be reported as a retryable failure.
     #[error("Internal lock `{lock}` is poisoned")]
+    #[allow(missing_docs)]
     PoisonedLock { lock: &'static str },
     /// The backend contradicted its own bookkeeping (`detail` says which
     /// invariant). Not an I/O failure and not recoverable at runtime: the
     /// backend state is corrupt and the operation cannot be served correctly.
     #[error("Backend invariant violated: {detail}")]
+    #[allow(missing_docs)]
     InvariantViolation { detail: &'static str },
     #[error("Unrecognize error")]
+    #[allow(missing_docs)]
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 

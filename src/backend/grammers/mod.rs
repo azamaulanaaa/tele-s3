@@ -93,14 +93,14 @@ const PUBLISH_LOOKBACK_MESSAGES: usize = 500;
 /// multi-part GET), and Telegram rate-limits a burst aimed at a single chat,
 /// so the bound is applied here, at the backend boundary, where every caller
 /// inherits it.
-pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+pub(super) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
 /// Deadline for a single Telegram request, generous enough for a
 /// `PART_SIZE`/`MAX_CHUNK_SIZE` transfer on a slow link.
-pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Attempts per retry loop, the first try included.
-pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
+pub(super) const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 
 /// Scope every instrument below is registered under.
 ///
@@ -289,6 +289,7 @@ impl GrammersLimits {
     /// panic the runtime: zero permits or a zero deadline would stall every
     /// request forever, and [`Semaphore::new`] panics above
     /// [`Semaphore::MAX_PERMITS`].
+    #[must_use]
     pub fn sanitized(mut self) -> Self {
         self.max_concurrent_requests = self
             .max_concurrent_requests
@@ -300,11 +301,17 @@ impl GrammersLimits {
     }
 }
 
+#[allow(missing_debug_implementations)]
+/// Telegram backend configuration.
 pub struct GrammersConfig {
+#[allow(missing_docs)]
     pub app_id: i32,
+    #[allow(missing_docs)]
     pub app_hash: String,
+    #[allow(missing_docs)]
     pub bot_token: String,
-    /// Where the MTProto session (auth keys and DC state) is persisted.
+    #[allow(missing_docs)]
+    /// Where the `MTProto` session (auth keys and DC state) is persisted.
     ///
     /// Not the object metadata store, although `main` passes it the same
     /// connection. The tables are created on first use, and losing this
@@ -323,6 +330,8 @@ pub struct GrammersConfig {
 }
 
 #[derive(Clone)]
+#[allow(missing_debug_implementations)]
+/// Telegram backend handle.
 pub struct Grammers {
     client: Client,
     sender_pool_handle: SenderPoolFatHandle,
@@ -359,7 +368,7 @@ fn classify_rpc_error(code: i32, name: &str, value: Option<u32>) -> RpcFailure {
     }
 
     match value {
-        Some(seconds) => RpcFailure::FloodWait(Duration::from_secs(seconds as u64 + 1)),
+        Some(seconds) => RpcFailure::FloodWait(Duration::from_secs(u64::from(seconds) + 1)),
         None => RpcFailure::FloodWithoutDuration {
             name: name.to_owned(),
         },
@@ -523,7 +532,7 @@ enum PublishFailure {
 ///   so [`PublishOutcome::NothingPublished`] really means "Telegram
 ///   reported no error for this request", not "no message exists".
 ///
-/// Either way no retry can repair it: MTProto offers no idempotency key for
+/// Either way no retry can repair it: `MTProto` offers no idempotency key for
 /// message creation, so re-sending an ambiguous `send_message` risks
 /// publishing the object twice. See [`Grammers::write`].
 fn classify_publish_failure(failure: &PublishFailure) -> PublishOutcome {
@@ -651,7 +660,7 @@ impl From<KeyFault> for ReadOutcome {
 /// `telegram_error` is Telegram's own name for the failure — `FLOOD_WAIT_5`,
 /// `FLOOD_PREMIUM_WAIT_X` — and it is deliberately *not* `operation`:
 /// `operation` names which of ours was in flight, and overloading the two
-/// makes the query "was this a FLOOD_PREMIUM, or a write that got blocked?"
+/// makes the query "was this a `FLOOD_PREMIUM`, or a write that got blocked?"
 /// unanswerable.
 ///
 /// Pure, so the event's shape is testable without a `Grammers`, a client or a
@@ -837,6 +846,7 @@ impl Grammers {
         Ok(())
     }
 
+    /// Connect to Telegram and build the backend.
     #[instrument(skip(config), level = "debug", err)]
     pub async fn init(config: GrammersConfig) -> anyhow::Result<Self> {
         let limits = config.limits.sanitized();
@@ -913,6 +923,7 @@ impl Grammers {
         self.peer.id.to_string()
     }
 
+    /// Close the Telegram connection pool.
     #[instrument(skip(self), level = "debug")]
     pub fn close(self) {
         self.sender_pool_handle.quit();
@@ -1033,6 +1044,7 @@ impl Grammers {
     /// The deadline starts once the permit is held, so time spent queued
     /// behind other callers is never charged against a request that has not
     /// started yet.
+    #[allow(clippy::expect_used)]
     async fn attempt<T, F>(&self, operation: &str, rpc: F) -> Result<T, AttemptError>
     where
         F: Future<Output = Result<T, InvocationError>>,
@@ -1364,7 +1376,7 @@ impl Backend for Grammers {
     /// The upload and the publish are two requests, and only the first is
     /// idempotent. Once every part is in, `send_message` turns the uploaded
     /// bytes into a real message — and it is deliberately not retried on a
-    /// deadline, because MTProto offers no idempotency key for message
+    /// deadline, because `MTProto` offers no idempotency key for message
     /// creation: a retry after a lost answer risks publishing the object
     /// twice.
     ///
@@ -1500,7 +1512,7 @@ impl Backend for Grammers {
         };
         let offset: usize = offset.try_into().map_err(|_| BackendError::OutOfRange)?;
         let limit: Option<usize> = limit
-            .map(|v| v.try_into())
+            .map(std::convert::TryInto::try_into)
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
 
@@ -1526,16 +1538,13 @@ impl Backend for Grammers {
 
             // The message is there but holds nothing to stream: the object
             // is unreadable, not absent.
-            match message.media() {
-                Some(v) => v,
-                None => {
-                    tracing::error!(
-                        key = %key,
-                        error.type = "no_media",
-                        "backend read fault: the message a key names exists but carries no media"
-                    );
-                    return Ok(KeyFault::NoMedia.into());
-                }
+            if let Some(v) = message.media() { v } else {
+                tracing::error!(
+                    key = %key,
+                    error.type = "no_media",
+                    "backend read fault: the message a key names exists but carries no media"
+                );
+                return Ok(KeyFault::NoMedia.into());
             }
         };
 
@@ -1664,9 +1673,11 @@ impl Backend for Grammers {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_published_name_is_the_caller_supplied_identifier() {
         // The orphan-recovery contract: the caller records this identifier
         // as a publish intent *before* the write, so it must reach the
@@ -1677,6 +1688,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_publish_id_carries_no_user_data() {
         // The identifier is published in a Telegram chat, so it must not
         // embed the bucket or key the object was written for. The generator
@@ -1695,6 +1707,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_publish_is_matched_only_by_its_exact_file_name() {
         let id = crate::backend::new_publish_id();
 
@@ -1718,6 +1731,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn flood_error_with_duration_is_retried_after_the_requested_window() {
         assert_eq!(
             classify_rpc_error(420, "FLOOD_WAIT", Some(31)),
@@ -1736,6 +1750,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn untimed_rate_limit_variants_are_not_retried() {
         assert_eq!(
             classify_rpc_error(420, "FLOOD_WAIT", None),
@@ -1746,6 +1761,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn other_rpc_errors_are_fatal() {
         assert_eq!(
             classify_rpc_error(500, "INTERNAL", Some(2)),
@@ -1758,6 +1774,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn attempts_are_allowed_up_to_the_budget() {
         assert_eq!(next_attempt(1, 3), Attempt::Retry);
         assert_eq!(next_attempt(2, 3), Attempt::Retry);
@@ -1765,11 +1782,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_single_attempt_budget_never_retries() {
         assert_eq!(next_attempt(1, 1), Attempt::Exhausted { attempts: 1 });
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn default_limits_bound_the_backend_without_changing_single_object_work() {
         let limits = GrammersLimits::default();
 
@@ -1781,6 +1800,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn sanitized_limits_reject_degenerate_values() {
         let limits = GrammersLimits {
             max_concurrent_requests: 0,
@@ -1795,6 +1815,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn sanitized_limits_cap_an_unusable_concurrency_bound() {
         let limits = GrammersLimits {
             max_concurrent_requests: Semaphore::MAX_PERMITS + 1,
@@ -1806,6 +1827,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn sanitized_limits_leaves_usable_values_alone() {
         let limits = GrammersLimits {
             max_concurrent_requests: 4,
@@ -1825,11 +1847,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_well_formed_key_resolves_to_its_message_id() {
         assert_eq!(resolve_key("42").unwrap(), 42);
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_malformed_key_is_a_fault_and_not_an_absence() {
         // A key minted by another backend reaches `read` too, and it is a
         // fault: nothing this backend wrote is absent.
@@ -1844,6 +1868,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_message_without_media_is_a_fault_and_not_an_absence() {
         // Reachable only with a live Telegram session, so the decision is
         // covered here instead: the message exists, so its bytes cannot be
@@ -1855,6 +1880,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn delete_of_an_unparseable_key_has_nothing_to_target() {
         // The `delete` half of the idempotency contract: a key this backend
         // cannot parse names nothing it wrote, so it is already absent and
@@ -1865,6 +1891,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_fault_is_distinguishable_from_a_missing_object() {
         // The whole point of the three-way answer: an operator must be able
         // to tell a corrupt key from a deleted object in a log line.
@@ -1877,6 +1904,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_rejected_publish_published_nothing() {
         // Telegram answered this exact request with an error, so no message
         // was created and there is no orphan to look for.
@@ -1901,6 +1929,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_publish_that_ran_out_of_time_is_ambiguous() {
         // The request was dispatched; its answer may have been lost, and the
         // message may already be in the chat.
@@ -1915,6 +1944,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_publish_lost_below_the_rpc_layer_is_ambiguous() {
         // Every layer that fails after dispatch leaves the same question
         // open, whatever it is called.
@@ -1928,6 +1958,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn only_a_rejection_is_a_proof_that_nothing_was_published() {
         let failures = [
             PublishFailure::Rejected {
@@ -1952,6 +1983,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_ambiguous_publish_is_logged_with_the_identifiers_of_the_upload() {
         // The only record of an orphan: no key is returned on this path, so
         // there is no metadata row and nothing else in the system names the
@@ -1983,6 +2015,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_definite_publish_failure_logs_no_orphan_warning() {
         let log = capture_log(|| {
             unpublished_upload(
@@ -2001,6 +2034,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_publish_that_never_left_the_process_keeps_its_own_error() {
         // A local fault is passed through untouched, and claims nothing was
         // published.
@@ -2029,6 +2063,7 @@ mod tests {
 /// subscriber filter would drop them and a field assertion on one would pass
 /// vacuously.
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) fn capture_log(f: impl FnOnce()) -> String {
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -2091,6 +2126,7 @@ mod field_vocabulary {
     /// A body longer than the caller declared reports the number it was
     /// measured against, so the fault can be counted without reading prose.
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_overlong_body_names_its_declared_size_and_error_type() {
         let log = capture_log(|| {
             let _ = overlong_body(4_096);
@@ -2104,6 +2140,7 @@ mod field_vocabulary {
     /// which message to delete by hand, so every identifier it needs must be
     /// a field.
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_unconfirmed_publish_names_what_to_delete_and_why_it_failed() {
         let log = capture_log(|| {
             let _ = unpublished_upload(
@@ -2129,6 +2166,7 @@ mod field_vocabulary {
     /// A poisoned mutex disables rate-limit tracking for the life of the
     /// process, and the log is the only place it is written down.
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_poisoned_flood_guard_names_the_lock_it_lost() {
         let log = capture_log(|| {
             let _ = poisoned_flood_guard();
@@ -2141,6 +2179,7 @@ mod field_vocabulary {
     /// Each part upload is reported at `debug` with its index and size, which
     /// is what makes a stalled multi-part upload diagnosable.
     #[test]
+    #[allow(clippy::expect_used)]
     fn every_uploaded_part_is_reported_with_its_index_and_size() {
         let log = capture_log(|| {
             let mut body = std::io::Cursor::new(vec![1u8, 2, 3]);
@@ -2209,6 +2248,7 @@ mod body_contract {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_exact_multiple_of_the_part_size_uploads_no_short_part() {
         let plan = BodyPlan::for_size(PART_SIZE * 2);
 
@@ -2217,6 +2257,7 @@ mod body_contract {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn one_byte_past_a_multiple_costs_a_one_byte_part() {
         let plan = BodyPlan::for_size(PART_SIZE * 2 + 1);
 
@@ -2225,6 +2266,7 @@ mod body_contract {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_zero_byte_body_is_uploaded_as_no_parts() {
         let plan = BodyPlan::for_size(0);
 
@@ -2233,6 +2275,7 @@ mod body_contract {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_body_of_exactly_the_declared_size_uploads_every_byte() {
         let body = vec![7u8; 64];
         let fake = upload_body(&body, 64)
@@ -2244,6 +2287,7 @@ mod body_contract {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_body_one_byte_short_fails_and_uploads_nothing() {
         let err = upload_body(&[7u8; 63], 64)
             .await
@@ -2253,6 +2297,7 @@ mod body_contract {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_body_past_the_declared_size_fails_and_is_not_truncated() {
         // The silent-truncation case: 65 bytes declared as 64. Before the fix
         // this returned a key naming a 64-byte object and said nothing.
@@ -2270,6 +2315,7 @@ mod body_contract {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn an_over_long_body_after_a_full_final_part_is_still_rejected() {
         // The `PART_SIZE` boundary case: the plan is satisfied exactly, so only
         // the post-upload probe can catch the extra byte.
@@ -2282,6 +2328,7 @@ mod body_contract {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_body_one_byte_over_a_full_part_uploads_exactly_the_declared_bytes() {
         let body: Vec<u8> = (0..(PART_SIZE + 1)).map(|i| i as u8).collect();
         let fake = upload_body(&body, PART_SIZE as u64 + 1)
@@ -2293,6 +2340,7 @@ mod body_contract {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_zero_byte_body_with_bytes_is_over_long() {
         let err = upload_body(&[7u8; 1], 0)
             .await
@@ -2318,6 +2366,7 @@ mod flood_telemetry {
     /// A `FLOOD_PREMIUM_WAIT_600` answered with no wait value: the anomalous
     /// case that used to vanish into a genericised `BackendError::Other`.
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_rate_limit_without_a_wait_window_is_still_logged() {
         let log = capture_log(|| {
             log_flood_without_duration(
@@ -2342,6 +2391,7 @@ mod flood_telemetry {
     /// tell "we were blocked while writing" from "Telegram replied
     /// FLOOD_PREMIUM_WAIT", and it cannot if both land in `operation`.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_telegram_error_name_is_never_the_operation_field() {
         let log = capture_log(|| {
             log_flood_hit(
@@ -2368,6 +2418,7 @@ mod flood_telemetry {
     /// event sees that a *download* was blocked *by a premium wait*, not that
     /// some operation happened to be called `FLOOD_PREMIUM_WAIT_600`.
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_flood_event_names_the_in_flight_operation_and_the_peer() {
         let log = capture_log(|| {
             log_flood_hit(
@@ -2389,6 +2440,7 @@ mod flood_telemetry {
     /// peer, so a trace shows *what was blocked*, not merely that something
     /// was.
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_flood_wait_names_what_it_delayed() {
         let log = capture_log(|| {
             log_flood_wait("delete_messages", "-1001234567890", Duration::from_secs(30));
@@ -2403,6 +2455,7 @@ mod flood_telemetry {
     /// operator's collector binds to, so a rename here is a breaking change
     /// and this test is what makes it a deliberate one.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_flood_counter_is_broken_down_by_error_name_and_operation() {
         let ordinary = flood_limit_attributes("FLOOD_WAIT_30", "write");
         let premium = flood_limit_attributes("FLOOD_PREMIUM_WAIT_600", "download_chunk");
@@ -2420,6 +2473,7 @@ mod flood_telemetry {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_wait_histogram_is_broken_down_by_operation_and_peer() {
         let attrs = flood_wait_attributes("delete_messages", "-1001234567890");
 
@@ -2433,6 +2487,7 @@ mod flood_telemetry {
     /// The RPC instruments are grouped by operation and outcome, so a
     /// timeout on one operation cannot hide behind an `ok` on another.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_rpc_instruments_are_broken_down_by_operation_and_outcome() {
         let ok = rpc_attributes("publish_message", RpcOutcome::Ok);
         let timed_out = rpc_attributes("publish_message", RpcOutcome::Timeout);
@@ -2452,6 +2507,7 @@ mod flood_telemetry {
     /// collector behind them — which is also what happens in a process with
     /// telemetry configured off, where the meter is the no-op one.
     #[test]
+    #[allow(clippy::expect_used)]
     fn instruments_build_without_an_exporter() {
         use opentelemetry::metrics::MeterProvider as _;
 
@@ -2468,6 +2524,7 @@ mod flood_telemetry {
     /// Every instrument name is prefixed, so a shared collector cannot confuse
     /// one of them with another library's.
     #[test]
+    #[allow(clippy::expect_used)]
     fn every_instrument_is_namespaced_to_this_crate() {
         for name in [
             FLOOD_LIMIT_COUNTER,

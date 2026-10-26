@@ -72,6 +72,7 @@ pub enum AdminEndpoint {
 
 impl AdminEndpoint {
     /// Stable name for the endpoint, used as a tracing field.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Liveness => "liveness",
@@ -86,6 +87,7 @@ impl AdminEndpoint {
 ///
 /// `None` means "not an admin request": the caller must let the request
 /// through to S3 untouched.
+#[must_use]
 pub fn classify(path: &str) -> Option<AdminEndpoint> {
     match path {
         LIVENESS_PATH => Some(AdminEndpoint::Liveness),
@@ -112,6 +114,7 @@ fn is_reserved(path: &str) -> bool {
 pub enum ReconcilerOutcome {
     /// The pass ran. `affected` rows were reconciled (or cleared); zero is a
     /// perfectly ordinary result, not a failure.
+    #[allow(missing_docs)]
     Completed { affected: usize },
     /// The pass returned an error.
     ///
@@ -169,6 +172,7 @@ impl AdminState {
     /// It tracks `trace_export` today — one endpoint turns both on — and is
     /// published separately so a probe can tell which half of the pipeline a
     /// future change left dark.
+    #[must_use]
     pub fn new(
         listen_port: u16,
         limits: GrammersLimits,
@@ -195,6 +199,7 @@ impl AdminState {
     /// rate limit must never look like a dead process to whatever is
     /// supervising it — that would turn a throttled upstream into a restart
     /// loop over a healthy server.
+    #[must_use]
     pub fn liveness(&self) -> AdminResponse {
         AdminResponse::ok(json!({ "status": "ok" }))
     }
@@ -217,6 +222,7 @@ impl AdminState {
     /// with no remedy available short of restarting the very process that
     /// would fix it. The outcome is published in the body and logged at
     /// start-up instead, where an operator can act on it.
+    #[must_use]
     pub fn readiness(&self) -> AdminResponse {
         AdminResponse::ok(json!({
             "status": "ready",
@@ -232,6 +238,7 @@ impl AdminState {
     /// and what start-up reconciliation achieved. No database counts — those
     /// would put a live query on an unauthenticated probe path, which is a
     /// poor trade for a number nobody needs to make a decision.
+    #[must_use]
     pub fn introspection(&self) -> AdminResponse {
         AdminResponse::ok(json!({
             "status": "ok",
@@ -340,6 +347,7 @@ pub struct AdminRoute {
 
 impl AdminRoute {
     /// Build the route around the state to publish.
+    #[must_use]
     pub fn new(state: AdminState) -> Self {
         Self { state }
     }
@@ -404,6 +412,7 @@ impl S3Route for AdminRoute {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     use crate::s3::helpers::validate_bucket_name;
@@ -433,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn reserved_paths_reach_the_admin_handler() {
         assert_eq!(classify(LIVENESS_PATH), Some(AdminEndpoint::Liveness));
         assert_eq!(classify(READINESS_PATH), Some(AdminEndpoint::Readiness));
@@ -446,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn s3_paths_are_never_admin_requests() {
         for path in [
             "/",
@@ -466,6 +477,7 @@ mod tests {
     /// the crate's own validator rather than a copy of the rule, so this test
     /// cannot drift from what `CreateBucket` enforces.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_reserved_prefix_cannot_be_a_bucket_name() {
         validate_bucket_name(".tele-s3").expect_err("a leading dot is not a bucket");
         validate_bucket_name(".tele-s3.healthz").expect_err("a leading dot is not a bucket either");
@@ -475,6 +487,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn liveness_answers_200_whatever_the_reconcilers_did() {
         for report in [
             StartupReport {
@@ -495,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn readiness_reports_the_reconciler_outcomes_without_failing() {
         let degraded = AdminState::new(
             8000,
@@ -529,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn introspection_publishes_the_effective_runtime_state() {
         let body = body_of(&state().introspection());
 
@@ -550,6 +565,7 @@ mod tests {
     /// document has exactly these keys, so a future field that carried a
     /// config value could not be added without failing this test.
     #[test]
+    #[allow(clippy::expect_used)]
     fn introspection_publishes_only_documented_fields() {
         fn keys(value: &Value) -> Vec<&str> {
             value
@@ -603,6 +619,7 @@ mod tests {
     /// came from anywhere but this file would be the only way a secret could
     /// escape, and there is nowhere for one to come from.
     #[test]
+    #[allow(clippy::expect_used)]
     fn introspection_contains_no_free_form_text() {
         fn assert_literal_or_number(value: &Value) {
             match value {
@@ -631,6 +648,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_unknown_admin_path_is_a_404_not_an_s3_error() {
         let response = unknown_endpoint_response();
         assert_eq!(response.status, StatusCode::NOT_FOUND);

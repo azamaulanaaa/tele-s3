@@ -1,3 +1,4 @@
+//! Binary entry point for tele-s3.
 use std::{env, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
@@ -118,17 +119,14 @@ impl LogFormat {
             return Self::Text;
         };
 
-        match Self::parse(&raw) {
-            Some(parsed) => parsed,
-            None => {
-                tracing::warn!(
-                    env_var = LOG_FORMAT_ENV,
-                    value = %raw,
-                    error.type = "unparsable_env_override",
-                    "unknown log format requested; using the default text format"
-                );
-                Self::Text
-            }
+        if let Some(parsed) = Self::parse(&raw) { parsed } else {
+            tracing::warn!(
+                env_var = LOG_FORMAT_ENV,
+                value = %raw,
+                error.type = "unparsable_env_override",
+                "unknown log format requested; using the default text format"
+            );
+            Self::Text
         }
     }
 }
@@ -863,6 +861,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     use tele_s3::admin::ReconcilerOutcome;
@@ -873,6 +872,7 @@ mod tests {
     /// guarantee is about the config an operator actually writes rather than
     /// about a hypothetical one.
     #[test]
+    #[allow(clippy::expect_used)]
     fn admin_endpoints_publish_no_config_credentials() {
         const SENTINELS: [&str; 5] = [
             "AKIAEXAMPLEACCESSKEY",
@@ -982,6 +982,7 @@ mod tests {
     /// The default has to stay the human-readable renderer: nothing about an
     /// operator's existing output changes unless they ask for it.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_log_format_defaults_to_text() {
         assert_eq!(LogFormat::from_env(), LogFormat::Text);
     }
@@ -989,6 +990,7 @@ mod tests {
     /// `json` is the opt-in, and the spelling an operator will guess. Case
     /// and surrounding whitespace do not matter.
     #[test]
+    #[allow(clippy::expect_used)]
     fn json_output_is_opt_in() {
         for raw in ["json", "JSON", " JSON \n"] {
             assert_eq!(LogFormat::parse(raw), Some(LogFormat::Json), "{raw}");
@@ -998,6 +1000,7 @@ mod tests {
     /// An unrecognised value degrades to the default rather than to a process
     /// that logs nothing.
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_unknown_log_format_falls_back_to_text() {
         for raw in ["yaml", "1", ""] {
             assert_eq!(LogFormat::parse(raw), None, "{raw}");
@@ -1012,6 +1015,7 @@ mod tests {
     /// itself rather than on any side effect: [`TraceExport::from_env`] is
     /// the only thing that reads the environment, and it returns nothing.
     #[test]
+    #[allow(clippy::expect_used)]
     fn trace_export_stays_off_without_a_configured_endpoint() {
         assert_eq!(TraceExport::endpoint_from(None, None), None);
         // A variable that is set to nothing is not a configuration either, and
@@ -1033,6 +1037,7 @@ mod tests {
     /// when it is the only one set; and when both are set the crate's own
     /// spelling wins, so an operator can override a cluster-wide default.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_crates_own_endpoint_variable_takes_precedence() {
         let own = "http://collector.internal:4318/v1/traces";
         let standard = "http://otel-collector:4318/v1/traces";
@@ -1063,6 +1068,7 @@ mod tests {
     /// reader only collects when an instrument records, so this needs no
     /// collector and no network.
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_configured_endpoint_initialises_the_pipeline() {
         let settings = TraceExport {
             endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
@@ -1095,6 +1101,7 @@ mod tests {
     /// reported to [`Telemetry::flush`], which logs it and returns. No panic,
     /// and no error handed back to the caller that is trying to shut down.
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_unreachable_collector_cannot_break_shutdown() {
         let settings = TraceExport {
             // Port 1 on loopback: nothing listens there, and the connection is
@@ -1118,6 +1125,7 @@ mod tests {
     /// to. The version is the crate version, so it cannot drift from the
     /// binary that produced the span.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_resource_carries_the_service_name_and_crate_version() {
         let resource = TraceExport {
             endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
@@ -1143,6 +1151,7 @@ mod tests {
     /// Every trace is exported unless the operator says otherwise, and every
     /// spelling of "otherwise" that a shell would produce is accepted.
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_sample_ratio_defaults_to_every_trace() {
         assert_eq!(DEFAULT_SAMPLE_RATIO, 1.0);
 
@@ -1159,6 +1168,7 @@ mod tests {
     /// A ratio that cannot be used falls back to the documented default and
     /// says so, rather than panicking or quietly meaning "export nothing".
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_unusable_sample_ratio_falls_back_to_the_default() {
         for raw in ["", "  ", "half", "1.5", "-0.1", "NaN", "inf"] {
             assert_eq!(TraceExport::sample_ratio(raw), None, "{raw}");

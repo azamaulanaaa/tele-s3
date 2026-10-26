@@ -3,7 +3,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "s3_multipart_upload_state")]
-pub struct Model {
+pub(crate) struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub bucket_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
@@ -11,10 +11,10 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub upload_id: String,
     pub content_type: Option<String>,
-    /// x-amz-meta-* headers captured at CreateMultipartUpload, replayed
+    /// x-amz-meta-* headers captured at `CreateMultipartUpload`, replayed
     /// onto the completed object.
     pub user_metadata: serde_json::Value,
-    /// Tag-set captured at CreateMultipartUpload (`[]` when none),
+    /// Tag-set captured at `CreateMultipartUpload` (`[]` when none),
     /// replayed onto the completed object. Nullable so databases created
     /// before this column existed still sync (missing values read as `[]`).
     pub tags: Option<serde_json::Value>,

@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
 use aws_config::{Region, SdkConfig};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::SharedCredentialsProvider;
@@ -5,10 +6,10 @@ use s3s::{auth::SimpleAuth, host::SingleDomain, service::S3ServiceBuilder};
 use sea_orm::Database;
 use tele_s3::{backend::Memory, s3::TeleS3};
 
-pub const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 const DOMAIN_NAME: &str = "localhost:9000";
 
-pub async fn config<const N: usize, const M: usize>() -> anyhow::Result<SdkConfig> {
+pub(crate) async fn config<const N: usize, const M: usize>() -> anyhow::Result<SdkConfig> {
     let cred = Credentials::for_tests();
 
     let database = Database::connect("sqlite::memory:").await?;
@@ -31,7 +32,7 @@ pub async fn config<const N: usize, const M: usize>() -> anyhow::Result<SdkConfi
         .credentials_provider(SharedCredentialsProvider::new(cred))
         .http_client(client)
         .region(Region::new(REGION))
-        .endpoint_url(format!("http://{}", DOMAIN_NAME))
+        .endpoint_url(format!("http://{DOMAIN_NAME}"))
         .build();
 
     Ok(config)

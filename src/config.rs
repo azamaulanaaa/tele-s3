@@ -3,13 +3,13 @@ use std::{fmt::Display, fs::read_to_string, path::Path};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConfigErrorKind {
+pub(crate) enum ConfigErrorKind {
     #[error("Invalid File: {0}")]
     InvalidFile(&'static str),
 }
 
 #[derive(Debug, thiserror::Error)]
-pub struct ConfigError {
+pub(crate) struct ConfigError {
     kind: ConfigErrorKind,
     #[source]
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -22,7 +22,7 @@ impl Display for ConfigError {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Config {
+pub(crate) struct Config {
     pub api_id: i32,
     pub api_hash: String,
     pub bot_token: String,

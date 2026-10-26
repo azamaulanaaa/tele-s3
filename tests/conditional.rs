@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
 use anyhow::Context;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
@@ -36,7 +37,7 @@ async fn test_conditional_get_etag() -> anyhow::Result<()> {
         .context("put")?;
     let etag = put.e_tag().unwrap().to_string();
     // etag from put is without quotes, but S3 ETag header includes quotes. Use the etag as is.
-    println!("etag: {}", etag);
+    println!("etag: {etag}");
 
     // Get with If-Match matching -> should succeed 200
     let _out = client
@@ -59,11 +60,10 @@ async fn test_conditional_get_etag() -> anyhow::Result<()> {
     assert!(res.is_err(), "If-Match non-matching should be 412");
     if let Err(e) = res {
         let code = e.as_service_error().and_then(|se| se.code()).unwrap_or("");
-        println!("If-Match non-matching code: {}", code);
+        println!("If-Match non-matching code: {code}");
         assert!(
             code.contains("PreconditionFailed") || code.contains("412"),
-            "expected PreconditionFailed, got {}",
-            code
+            "expected PreconditionFailed, got {code}"
         );
     }
 
@@ -82,14 +82,11 @@ async fn test_conditional_get_etag() -> anyhow::Result<()> {
         // XML code to parse; fall back to the raw HTTP status.
         let status = e.raw_response().map(|r| r.status().as_u16());
         println!(
-            "If-None-Match matching code: {}, status: {:?}",
-            code, status
+            "If-None-Match matching code: {code}, status: {status:?}"
         );
         assert!(
             code.contains("NotModified") || code.contains("304") || status == Some(304),
-            "expected NotModified, got {} ({:?})",
-            code,
-            status
+            "expected NotModified, got {code} ({status:?})"
         );
     }
 
@@ -164,7 +161,7 @@ async fn test_conditional_get_modified_since() -> anyhow::Result<()> {
         .await
         .context("head")?;
     let last_modified = head.last_modified().unwrap();
-    println!("last_modified: {:?}", last_modified);
+    println!("last_modified: {last_modified:?}");
 
     // If-Modified-Since with time after last_modified -> should be 304 (not modified)
     // Use a future time
@@ -183,14 +180,11 @@ async fn test_conditional_get_modified_since() -> anyhow::Result<()> {
         // XML code to parse; fall back to the raw HTTP status.
         let status = e.raw_response().map(|r| r.status().as_u16());
         println!(
-            "If-Modified-Since future code: {}, status: {:?}",
-            code, status
+            "If-Modified-Since future code: {code}, status: {status:?}"
         );
         assert!(
             code.contains("NotModified") || code.contains("304") || status == Some(304),
-            "expected NotModified, got {} ({:?})",
-            code,
-            status
+            "expected NotModified, got {code} ({status:?})"
         );
     }
 
@@ -217,11 +211,10 @@ async fn test_conditional_get_modified_since() -> anyhow::Result<()> {
     assert!(res.is_err(), "If-Unmodified-Since past should be 412");
     if let Err(e) = res {
         let code = e.as_service_error().and_then(|se| se.code()).unwrap_or("");
-        println!("If-Unmodified-Since past code: {}", code);
+        println!("If-Unmodified-Since past code: {code}");
         assert!(
             code.contains("PreconditionFailed") || code.contains("412"),
-            "expected PreconditionFailed, got {}",
-            code
+            "expected PreconditionFailed, got {code}"
         );
     }
 

@@ -41,7 +41,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "s3_publish_intent")]
-pub struct Model {
+pub(crate) struct Model {
     /// The caller-supplied publish identifier, and the primary key. Chosen
     /// before the backend is called and carried no user data, so it is safe
     /// to publish as a name where clients can see it.

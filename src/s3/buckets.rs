@@ -187,6 +187,7 @@ impl<B: Backend> TeleS3<B> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
     use crate::backend::Memory;
     use crate::s3::TeleS3;
@@ -217,6 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn recreate_own_bucket_is_idempotent() {
         let svc = test_service().await;
 
@@ -236,6 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn invalid_bucket_name_rejected() {
         let svc = test_service().await;
 
@@ -247,6 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn delete_bucket_blocked_by_inflight_upload() {
         let svc = test_service().await;
 

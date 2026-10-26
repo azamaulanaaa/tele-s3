@@ -10,12 +10,16 @@ use futures::{Stream, io::AsyncRead};
 
 use super::BoxedAsyncReader;
 
+#[allow(missing_debug_implementations)]
+/// A chain of async readers.
 pub struct ChainReaders {
     readers: Mutex<VecDeque<BoxedAsyncReader>>,
     buffer: Box<[u8]>,
 }
 
 impl ChainReaders {
+    /// Build a chained reader from a vector of readers.
+    #[must_use]
     pub fn from_vec(readers: Vec<BoxedAsyncReader>) -> Self {
         Self {
             readers: Mutex::new(VecDeque::from(readers)),

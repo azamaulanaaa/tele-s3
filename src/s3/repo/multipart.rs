@@ -20,6 +20,7 @@ use crate::s3::types::MultipartUploadPart;
 /// compile cleanly and silently corrupt the upload; naming the fields
 /// keeps every call site self-checking.
 #[derive(Debug)]
+/// Documentation.
 pub(crate) struct MultipartUploadStateUpdate {
     pub(crate) bucket: String,
     pub(crate) key: String,
@@ -35,6 +36,7 @@ pub(crate) struct MultipartUploadStateUpdate {
 /// Field bundle for completing one upload: the upload identity, the content
 /// the caller built the object from, the object write, and the references
 /// the completion retires.
+/// Documentation.
 pub(crate) struct MultipartCompletion {
     pub(crate) bucket: String,
     pub(crate) key: String,
@@ -50,7 +52,8 @@ pub(crate) struct MultipartCompletion {
 
 impl Repository {
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn upsert_multipart_upload_state(
+    /// Documentation.
+    pub(crate) async fn upsert_multipart_upload_state(
         &self,
         update: MultipartUploadStateUpdate,
     ) -> S3Result<()> {
@@ -122,13 +125,11 @@ impl Repository {
                             .add(entity::multipart_upload_state::Column::UploadId.gt(uid)),
                     )
                     .into_condition(),
-                (km, _) => km
-                    .map(|km| {
+                (km, _) => km.map_or_else(|| Condition::all().into_condition(), |km| {
                         entity::multipart_upload_state::Column::ObjectId
                             .gt(km)
                             .into_condition()
-                    })
-                    .unwrap_or_else(|| Condition::all().into_condition()),
+                    }),
             })
             .order_by_asc(entity::multipart_upload_state::Column::ObjectId)
             .order_by_asc(entity::multipart_upload_state::Column::UploadId)
@@ -156,7 +157,8 @@ impl Repository {
     /// `max_uploads` rows, so the caller derives `next_key_marker` /
     /// `next_upload_id_marker` from its last row.
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn list_multipart_uploads(
+    /// Documentation.
+    pub(crate) async fn list_multipart_uploads(
         &self,
         bucket: &str,
         prefix: Option<&str>,
@@ -190,7 +192,8 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn get_bucket_upload_count(&self, bucket: &str) -> S3Result<u64> {
+    /// Documentation.
+    pub(crate) async fn get_bucket_upload_count(&self, bucket: &str) -> S3Result<u64> {
         let count = entity::multipart_upload_state::Entity::find()
             .filter(entity::multipart_upload_state::Column::BucketId.eq(bucket))
             .count(&self.db)
@@ -200,7 +203,8 @@ impl Repository {
         Ok(count)
     }
 
-    pub async fn get_multipart_upload_state(
+    /// Documentation.
+    pub(crate) async fn get_multipart_upload_state(
         &self,
         bucket: &str,
         key: &str,
@@ -234,7 +238,8 @@ impl Repository {
     /// [`Self::delete_multipart_upload_state_releasing_blobs`] instead.
     #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn delete_multipart_upload_state(
+    /// Documentation.
+    pub(crate) async fn delete_multipart_upload_state(
         &self,
         bucket: &str,
         key: &str,
@@ -263,6 +268,7 @@ impl Repository {
     /// The returned ids are the blobs whose count reached zero. The caller
     /// must remove their backend bytes and rows.
     #[instrument(skip(self, extract_ids), level = "debug", err)]
+    /// Documentation.
     pub(crate) async fn delete_multipart_upload_state_releasing_blobs<F>(
         &self,
         bucket: &str,
@@ -338,6 +344,7 @@ impl Repository {
     /// Returns the new version id and the released ids whose count reached
     /// zero. The caller must remove their backend bytes and rows.
     #[instrument(skip(self, completion), level = "debug", err)]
+    /// Documentation.
     pub(crate) async fn complete_multipart_upload(
         &self,
         completion: MultipartCompletion,
@@ -415,6 +422,8 @@ impl Repository {
     /// ids are the replaced part's blobs whose count reached zero; the caller
     /// must remove their backend bytes and rows.
     #[instrument(skip(self, part), level = "debug", err)]
+    /// Documentation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn set_multipart_part(
         &self,
         bucket: &str,
@@ -511,14 +520,14 @@ impl Repository {
         }
 
         Err(S3Error::internal_error(std::io::Error::other(format!(
-            "multipart upload state changed concurrently {} times",
-            MAX_ATTEMPTS
+            "multipart upload state changed concurrently {MAX_ATTEMPTS} times"
         ))))
     }
 
     #[allow(dead_code)]
     #[instrument(skip(self, action), level = "debug", err)]
-    pub async fn cas_update_multipart_content<F>(
+    /// Documentation.
+    pub(crate) async fn cas_update_multipart_content<F>(
         &self,
         bucket: &str,
         key: &str,
@@ -540,7 +549,9 @@ impl Repository {
     /// delete its bytes.
     #[allow(dead_code)]
     #[instrument(skip(self, action), level = "debug", err)]
-    pub async fn cas_update_multipart_content_and_resolve<F>(
+    /// Documentation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cas_update_multipart_content_and_resolve<F>(
         &self,
         bucket: &str,
         key: &str,
@@ -630,14 +641,14 @@ impl Repository {
         }
 
         Err(S3Error::internal_error(std::io::Error::other(format!(
-            "multipart upload state changed concurrently {} times",
-            MAX_ATTEMPTS
+            "multipart upload state changed concurrently {MAX_ATTEMPTS} times"
         ))))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     async fn repo() -> Repository {

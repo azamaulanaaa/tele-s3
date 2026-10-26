@@ -53,6 +53,7 @@ pub(crate) fn validate_bucket_name(name: &str) -> S3Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
     #[test]

@@ -10,7 +10,7 @@ use grammers_session::{
         UpdatesState,
     },
 };
-pub use sea_orm::DbErr;
+pub(super) use sea_orm::DbErr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait,
     QueryFilter, Set, TransactionTrait,
@@ -20,20 +20,20 @@ use tracing::{error, instrument};
 mod entity;
 
 #[derive(Debug, thiserror::Error)]
-pub enum SessionStorageError {
+pub(super) enum SessionStorageError {
     #[error("SeaOrm : {0}")]
     SeaOrm(#[from] DbErr),
     #[error("IO : {0}")]
     IO(#[from] std::io::Error),
 }
 
-pub struct SessionStorage {
+pub(super) struct SessionStorage {
     inner: DatabaseConnection,
 }
 
 impl SessionStorage {
     #[instrument(skip(connection), level = "debug", err)]
-    pub async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
+    pub(super) async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
         Self::sync_table(&connection).await?;
 
         Ok(Self { inner: connection })
@@ -187,24 +187,18 @@ impl Session for SessionStorage {
             let ipv4 = v.ipv4.parse();
             let ipv6 = v.ipv6.parse();
 
-            let (ipv4, ipv6) = match (ipv4, ipv6) {
-                (Ok(v4), Ok(v6)) => (v4, v6),
-                _ => {
-                    error!(dc_id, error.type = "corrupt_dc_option", "Corrupted IP address in database. Ignoring row.");
+            let (ipv4, ipv6) = if let (Ok(v4), Ok(v6)) = (ipv4, ipv6) { (v4, v6) } else {
+                error!(dc_id, error.type = "corrupt_dc_option", "Corrupted IP address in database. Ignoring row.");
 
-                    return None;
-                }
+                return None;
             };
 
             let auth_key = match v.auth_key {
                 None => None,
-                Some(bytes) => match bytes.try_into() {
-                    Ok(key) => Some(key),
-                    Err(_) => {
-                        error!(dc_id, error.type = "corrupt_dc_option", "Corrupted auth key in database. Ignoring row.");
+                Some(bytes) => if let Ok(key) = bytes.try_into() { Some(key) } else {
+                    error!(dc_id, error.type = "corrupt_dc_option", "Corrupted auth key in database. Ignoring row.");
 
-                        return None;
-                    }
+                    return None;
                 },
             };
 
@@ -337,7 +331,7 @@ impl Session for SessionStorage {
                 }),
             };
 
-            let hash = peer.auth().map(|auth| auth.hash());
+            let hash = peer.auth().map(grammers_session::types::PeerAuth::hash);
 
             let txn = self.begin().await?;
 

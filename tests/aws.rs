@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
 use anyhow::Context;
 use aws_sdk_s3::{
     Client,
@@ -68,7 +69,7 @@ async fn test_delete_bucket() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchBucket".to_string())
     );
 
@@ -118,7 +119,7 @@ async fn test_head_bucket() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchBucket".to_string())
     );
 
@@ -308,7 +309,7 @@ async fn test_put_object_and_head_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|e| e.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -367,7 +368,7 @@ async fn test_put_object_and_get_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|e| e.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -454,7 +455,7 @@ async fn test_delete_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|e| e.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -553,7 +554,7 @@ async fn test_copy_object() -> anyhow::Result<()> {
     let object_name = "test_name";
     let object_destination_name = "text_name_2";
     let object_content = "test_content";
-    let copy_source = format!("{}/{}", bucket_name, object_name);
+    let copy_source = format!("{bucket_name}/{object_name}");
 
     let err = {
         let res = client
@@ -566,7 +567,7 @@ async fn test_copy_object() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|e| e.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -638,7 +639,7 @@ async fn test_list_objects_with_prefix() -> anyhow::Result<()> {
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -694,7 +695,7 @@ async fn test_list_objects_v2_with_prefix() -> anyhow::Result<()> {
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -753,7 +754,7 @@ async fn test_list_objects_with_prefix_and_delimiter() -> anyhow::Result<()> {
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -821,7 +822,7 @@ async fn test_list_objects_v2_with_prefix_and_delimiter() -> anyhow::Result<()> 
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -886,7 +887,7 @@ async fn test_list_objects_with_next_marker() -> anyhow::Result<()> {
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -907,7 +908,7 @@ async fn test_list_objects_with_next_marker() -> anyhow::Result<()> {
             .context("list objects")?;
         (
             res.contents().to_owned(),
-            res.next_marker().map(|v| v.to_owned()),
+            res.next_marker().map(std::borrow::ToOwned::to_owned),
         )
     };
 
@@ -962,7 +963,7 @@ async fn test_list_objects_v2_with_continuation_token() -> anyhow::Result<()> {
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -983,7 +984,7 @@ async fn test_list_objects_v2_with_continuation_token() -> anyhow::Result<()> {
             .context("list objects")?;
         (
             res.contents().to_owned(),
-            res.next_continuation_token().map(|v| v.to_owned()),
+            res.next_continuation_token().map(std::borrow::ToOwned::to_owned),
         )
     };
 
@@ -1038,7 +1039,7 @@ async fn test_list_objects_v2_with_start_after() -> anyhow::Result<()> {
         ["prefix_item", "test_content"],
     ];
 
-    for &[key, content] in objects_data.iter() {
+    for &[key, content] in &objects_data {
         let _ = client
             .put_object()
             .bucket(bucket_name)
@@ -1086,7 +1087,7 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
             res.err()
         };
         assert_eq!(
-            err.and_then(|e| e.code().map(|e| e.to_owned())),
+            err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
             Some("NoSuchBucket".to_string())
         );
     }
@@ -1136,7 +1137,7 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
             .context("upload part")?;
 
         completed_part =
-            completed_part.parts(CompletedPart::builder().part_number(part_number).build())
+            completed_part.parts(CompletedPart::builder().part_number(part_number).build());
     }
     let completed_part = completed_part.build();
 
@@ -1434,7 +1435,7 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
             res.upload_id.context("missing upload id")?
         };
 
-        let copy_source = format!("{}/{}", bucket_name, source_name);
+        let copy_source = format!("{bucket_name}/{source_name}");
 
         let e_tag = {
             let res = client
@@ -1500,7 +1501,7 @@ async fn test_upload_part_copy() -> anyhow::Result<()> {
             res.upload_id.context("missing upload id")?
         };
 
-        let copy_source = format!("{}/{}", bucket_name, source_name);
+        let copy_source = format!("{bucket_name}/{source_name}");
 
         let _ = client
             .upload_part_copy()
@@ -1576,7 +1577,7 @@ async fn test_copied_object_survives_sibling_deletion() -> anyhow::Result<()> {
         .await
         .context("put source object")?;
 
-    let copy_source = format!("{}/source", bucket_name);
+    let copy_source = format!("{bucket_name}/source");
 
     // Deleting one alias must not corrupt the other.
     {
@@ -1670,7 +1671,7 @@ async fn test_copied_object_survives_sibling_deletion() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.and_then(|e| e.code().map(|e| e.to_owned())),
+            err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
             Some("NoSuchKey".to_string()),
             "deleted source should be gone"
         );
@@ -1723,7 +1724,7 @@ async fn test_upload_part_copy_shares_without_harming_source() -> anyhow::Result
         .await
         .context("put source object")?;
 
-    let copy_source = format!("{}/source", bucket_name);
+    let copy_source = format!("{bucket_name}/source");
 
     // Ranged copy-part into an upload that is then aborted: the source
     // must remain fully intact.
@@ -1909,7 +1910,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.and_then(|e| e.code().map(|c| c.to_owned())),
+            err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
             Some("PreconditionFailed".to_string())
         );
     }
@@ -1939,7 +1940,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.and_then(|e| e.code().map(|c| c.to_owned())),
+            err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
             Some("PreconditionFailed".to_string())
         );
     }
@@ -1959,7 +1960,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.and_then(|e| e.code().map(|c| c.to_owned())),
+            err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
             Some("NoSuchKey".to_string())
         );
     }
@@ -2008,7 +2009,7 @@ async fn test_conditional_writes() -> anyhow::Result<()> {
         };
 
         assert_eq!(
-            err.and_then(|e| e.code().map(|c| c.to_owned())),
+            err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
             Some("PreconditionFailed".to_string()),
             "stale If-Match must reject completion"
         );
@@ -2107,7 +2108,7 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
         .context("get object acl")?;
 
     assert!(object_acl.owner().is_some(), "object acl should have owner");
-    assert!(!object_acl.grants().is_empty());
+    assert_ne!(object_acl.grants(), []);
 
     // ACLs against missing resources still report the right errors.
     let err = {
@@ -2120,7 +2121,7 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -2133,7 +2134,7 @@ async fn test_acl_stubs() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchBucket".to_string())
     );
 
@@ -2222,7 +2223,7 @@ async fn test_delete_bucket_blocked_by_inflight_upload() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("BucketNotEmpty".to_string())
     );
 
@@ -2318,7 +2319,7 @@ async fn test_object_metadata() -> anyhow::Result<()> {
         .copy_object()
         .bucket(bucket_name)
         .key("meta-copy")
-        .copy_source(format!("{}/meta", bucket_name))
+        .copy_source(format!("{bucket_name}/meta"))
         .send()
         .await
         .context("copy object")?;
@@ -2486,7 +2487,7 @@ async fn test_object_tagging() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -2604,7 +2605,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("InvalidRequest".to_string())
     );
 
@@ -2622,7 +2623,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("InvalidRequest".to_string())
     );
 
@@ -2640,7 +2641,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("BadDigest".to_string())
     );
 
@@ -2652,7 +2653,7 @@ async fn test_checksum_echo() -> anyhow::Result<()> {
         .await
         .err();
     assert_eq!(
-        head_missing.and_then(|e| e.code().map(|c| c.to_owned())),
+        head_missing.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 
@@ -2730,7 +2731,7 @@ async fn test_upload_part_checksum_verification() -> anyhow::Result<()> {
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("BadDigest".to_string())
     );
 
@@ -3079,7 +3080,7 @@ async fn test_put_object_over_backend_capacity_rejected() -> anyhow::Result<()> 
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("EntityTooLarge".to_string())
     );
 
@@ -3094,7 +3095,7 @@ async fn test_put_object_over_backend_capacity_rejected() -> anyhow::Result<()> 
         res.err()
     };
     assert_eq!(
-        err.and_then(|e| e.code().map(|c| c.to_owned())),
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
         Some("NoSuchKey".to_string())
     );
 

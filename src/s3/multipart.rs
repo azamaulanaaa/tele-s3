@@ -134,7 +134,7 @@ impl<B: Backend> TeleS3<B> {
             let mut guard = state
                 .lock()
                 .map_err(|_| S3Error::new(S3ErrorCode::InternalError))?;
-            let hash_md5 = guard.finalize_md5_reset().to_vec();
+            let hash_md5 = guard.finalize_md5_reset().clone();
             let computed = (
                 guard.finalize_crc32(),
                 guard.finalize_crc32c(),
@@ -183,16 +183,13 @@ impl<B: Backend> TeleS3<B> {
         }
 
         if let Some(expected) = req.input.content_md5 {
-            let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
-                Ok(v) => v,
-                Err(_) => {
-                    self.release_blobs(vec![id]).await?;
-                    let _ = self
-                        .repo
-                        .clear_publish_intents(std::slice::from_ref(&publish_id))
-                        .await;
-                    return Err(S3Error::new(S3ErrorCode::InvalidDigest));
-                }
+            let expected_digest = if let Ok(v) = base64::prelude::BASE64_STANDARD.decode(expected.trim()) { v } else {
+                self.release_blobs(vec![id]).await?;
+                let _ = self
+                    .repo
+                    .clear_publish_intents(std::slice::from_ref(&publish_id))
+                    .await;
+                return Err(S3Error::new(S3ErrorCode::InvalidDigest));
             };
 
             if expected_digest[..] != hash_md5[..] {
@@ -342,7 +339,7 @@ impl<B: Backend> TeleS3<B> {
             let hash_md5 = md5::Md5::digest(&hashes_byte);
             let hash_md5 = hex::encode(hash_md5);
 
-            Some(format!("{}-{}", hash_md5, part_count))
+            Some(format!("{hash_md5}-{part_count}"))
         };
 
         let versioning_status = self.repo.get_bucket_versioning(&req.input.bucket).await?;
@@ -479,8 +476,7 @@ impl<B: Backend> TeleS3<B> {
             .filter(|(num, _)| {
                 req.input
                     .part_number_marker
-                    .map(|marker| *num > marker)
-                    .unwrap_or(true)
+                    .is_none_or(|marker| *num > marker)
             })
             .map(|(num, p)| Part {
                 part_number: Some(num),
@@ -553,8 +549,7 @@ impl<B: Backend> TeleS3<B> {
         } else {
             None
         }
-        .map(|(k, u)| (Some(k), Some(u)))
-        .unwrap_or((None, None));
+        .map_or((None, None), |(k, u)| (Some(k), Some(u)));
 
         let res = S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(req.input.bucket),
@@ -609,7 +604,7 @@ impl<B: Backend> TeleS3<B> {
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-        let source_size = model.size as u64;
+        let source_size = u64::from(model.size);
 
         // Parse "bytes=start-end" (inclusive on both ends per S3 spec).
         let range = match req.input.copy_source_range.as_deref() {
@@ -796,6 +791,7 @@ impl<B: Backend> TeleS3<B> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
     use crate::backend::{Memory, ReadOutcome};
     use crate::s3::TeleS3;
@@ -1071,6 +1067,7 @@ mod tests {
     /// `s3::objects` pins the swallow itself against the shared helper both
     /// write paths evaluate.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn complete_multipart_propagates_object_read_failure() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1092,6 +1089,7 @@ mod tests {
     /// every error -- rather than only `NoSuchKey` -- would break completing
     /// an upload onto a fresh key.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn complete_multipart_onto_absent_key_is_not_an_error() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1113,6 +1111,7 @@ mod tests {
     /// object's references after deleting the state, which left the new
     /// object pointing at a blob that no reference protected.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn complete_multipart_keeps_the_upload_when_the_state_delete_fails() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1174,6 +1173,7 @@ mod tests {
     /// A repeated upload of one part number must release the blob that the
     /// replaced part was the last holder of.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn uploading_a_part_again_releases_the_replaced_blob() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1235,6 +1235,7 @@ mod tests {
     /// A failed release of the replaced object's references must roll the
     /// completion back, so the old object keeps the bytes it still owns.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn complete_multipart_keeps_the_old_object_when_the_release_fails() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1334,6 +1335,7 @@ mod tests {
     /// A failed blob release must leave the upload in place, not delete the
     /// only record of references that are still alive.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn abort_multipart_keeps_the_upload_when_the_blob_release_fails() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1389,6 +1391,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn negative_max_uploads_is_invalid_argument() {
         let (svc, _upload_id) = test_service_with_upload().await;
 
@@ -1400,6 +1403,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn list_uploads_paginates_and_reports_next_markers() {
         let (svc, _upload_id) = test_service_with_upload().await;
         svc.repo
@@ -1446,6 +1450,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn negative_max_parts_is_invalid_argument() {
         let (svc, upload_id) = test_service_with_upload().await;
 
@@ -1457,6 +1462,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn negative_content_length_is_invalid_argument() {
         let (svc, upload_id) = test_service_with_upload().await;
 
@@ -1474,6 +1480,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn upload_part_reports_the_specific_checksum_failure() {
         let (svc, upload_id) = test_service_with_upload().await;
 
@@ -1494,6 +1501,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_successful_part_resolves_its_publish_intent() {
         let (svc, upload_id) = test_service_with_upload().await;
         svc.upload_part_inner(upload_one_byte_part_req(&upload_id))
@@ -1513,6 +1521,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_failed_intent_resolve_keeps_the_part_out_of_the_upload() {
         // The content update and the resolve commit together. Otherwise the
         // upload would link a part whose intent stays pending, and the reclaim

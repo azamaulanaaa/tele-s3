@@ -3,7 +3,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "s3_object")]
-pub struct Model {
+pub(crate) struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub bucket_id: String,
     #[sea_orm(primary_key, auto_increment = false)]

@@ -7,12 +7,12 @@ use super::Repository;
 use super::entity;
 
 impl Repository {
-    pub async fn get_bucket_versioning(&self, bucket: &str) -> S3Result<Option<String>> {
+    pub(crate) async fn get_bucket_versioning(&self, bucket: &str) -> S3Result<Option<String>> {
         let model = self.get_bucket(bucket).await?;
         Ok(model.versioning_status)
     }
 
-    pub async fn put_bucket_versioning(
+    pub(crate) async fn put_bucket_versioning(
         &self,
         bucket: &str,
         status: Option<String>,
@@ -39,7 +39,7 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn create_bucket(&self, name: String, region: Option<String>) -> S3Result<()> {
+    pub(crate) async fn create_bucket(&self, name: String, region: Option<String>) -> S3Result<()> {
         let active_model = entity::bucket::ActiveModel {
             id: Set(name),
             region: Set(region),
@@ -67,7 +67,7 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn list_buckets(&self) -> S3Result<Vec<entity::bucket::Model>> {
+    pub(crate) async fn list_buckets(&self) -> S3Result<Vec<entity::bucket::Model>> {
         let buckets = entity::bucket::Entity::find()
             .all(&self.db)
             .await
@@ -77,7 +77,7 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn delete_bucket(&self, name: &str) -> S3Result<()> {
+    pub(crate) async fn delete_bucket(&self, name: &str) -> S3Result<()> {
         entity::bucket::Entity::delete_by_id(name)
             .exec(&self.db)
             .await
@@ -87,7 +87,7 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn get_bucket_object_count(&self, name: &str) -> S3Result<u64> {
+    pub(crate) async fn get_bucket_object_count(&self, name: &str) -> S3Result<u64> {
         // Count all versions including delete markers; bucket is non-empty if any version exists.
         let object_count = entity::object::Entity::find()
             .filter(entity::object::Column::BucketId.eq(name))
@@ -99,7 +99,7 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn bucket_exists(&self, name: &str) -> S3Result<bool> {
+    pub(crate) async fn bucket_exists(&self, name: &str) -> S3Result<bool> {
         let bucket_exists = entity::bucket::Entity::find_by_id(name)
             .one(&self.db)
             .await
@@ -110,7 +110,7 @@ impl Repository {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn get_bucket(&self, name: &str) -> S3Result<entity::bucket::Model> {
+    pub(crate) async fn get_bucket(&self, name: &str) -> S3Result<entity::bucket::Model> {
         let bucket = entity::bucket::Entity::find_by_id(name)
             .one(&self.db)
             .await

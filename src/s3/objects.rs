@@ -68,7 +68,7 @@ pub(super) fn checked_max_keys(max_keys: Option<i32>) -> S3Result<i32> {
     Ok(raw.min(MAX_KEYS_CEILING))
 }
 
-/// Validate the `max-uploads` paging size of ListMultipartUploads.
+/// Validate the `max-uploads` paging size of `ListMultipartUploads`.
 ///
 /// `max-uploads` is bounded by the same S3 ceiling as `max-keys` and has the
 /// same unset default, so the rule lives in one place; this alias keeps the
@@ -277,21 +277,18 @@ impl<B: Backend> TeleS3<B> {
         if let Some(expected) = req.input.content_md5 {
             // Decode instead of comparing strings so padding/whitespace
             // variations in the client header don't cause false mismatches.
-            let expected_digest = match base64::prelude::BASE64_STANDARD.decode(expected.trim()) {
-                Ok(v) => v,
-                Err(_) => {
-                    let discarded = match id {
-                        Some(id) => self.discard_backend_blobs(vec![id]).await,
-                        None => true,
-                    };
-                    if discarded && let Some(pid) = &publish_id {
-                        let _ = self
-                            .repo
-                            .clear_publish_intents(std::slice::from_ref(pid))
-                            .await;
-                    }
-                    return Err(S3Error::new(S3ErrorCode::InvalidDigest));
+            let expected_digest = if let Ok(v) = base64::prelude::BASE64_STANDARD.decode(expected.trim()) { v } else {
+                let discarded = match id {
+                    Some(id) => self.discard_backend_blobs(vec![id]).await,
+                    None => true,
+                };
+                if discarded && let Some(pid) = &publish_id {
+                    let _ = self
+                        .repo
+                        .clear_publish_intents(std::slice::from_ref(pid))
+                        .await;
                 }
+                return Err(S3Error::new(S3ErrorCode::InvalidDigest));
             };
 
             if expected_digest[..] != hash_md5[..] {
@@ -324,7 +321,7 @@ impl<B: Backend> TeleS3<B> {
                     id,
                     offset: 0,
                     size,
-                })
+                });
             }
 
             serde_json::to_value(&content).map_err(S3Error::internal_error)?
@@ -478,7 +475,7 @@ impl<B: Backend> TeleS3<B> {
 
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
-        let size = model.size as u64;
+        let size = u64::from(model.size);
 
         // Point the destination at the source's existing backend blobs
         // instead of duplicating them: backends may be capacity-limited,
@@ -599,8 +596,8 @@ impl<B: Backend> TeleS3<B> {
 
     /// Resolve the object a read (`GetObject` / `HeadObject`) addresses.
     ///
-    /// Addressing a delete marker by version is MethodNotAllowed (405); a
-    /// latest-key read of one reads as NoSuchKey, but S3 still reports which
+    /// Addressing a delete marker by version is `MethodNotAllowed` (405); a
+    /// latest-key read of one reads as `NoSuchKey`, but S3 still reports which
     /// marker hides the key. Both operations answer from the same row, so the
     /// rule lives here once.
     async fn resolve_read_object(
@@ -656,10 +653,10 @@ impl<B: Backend> TeleS3<B> {
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
 
         let (mut offset, mut remain_length) = if let Some(range) = req.input.range {
-            let r = range.check(model.size as u64)?;
+            let r = range.check(u64::from(model.size))?;
             (r.start, r.end - r.start)
         } else {
-            (0, model.size as u64)
+            (0, u64::from(model.size))
         };
 
         let content_length = remain_length;
@@ -762,7 +759,7 @@ impl<B: Backend> TeleS3<B> {
 
         let res = S3Response::new(HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
-            content_length: Some(model.size as i64),
+            content_length: Some(i64::from(model.size)),
             content_type: model.content_type,
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
             e_tag: model.etag.map(ETag::Strong),
@@ -1128,7 +1125,7 @@ impl<B: Backend> TeleS3<B> {
                 if let Some(key) = v.id.strip_prefix(&prefix)
                     && let Some((pre, _)) = key.split_once(&del)
                 {
-                    common_prefixes_set.insert(format!("{}{}{}", prefix, pre, del));
+                    common_prefixes_set.insert(format!("{prefix}{pre}{del}"));
                     continue;
                 }
                 filtered_versions.push(v.clone());
@@ -1137,7 +1134,7 @@ impl<B: Backend> TeleS3<B> {
                 if let Some(key) = d.id.strip_prefix(&prefix)
                     && let Some((pre, _)) = key.split_once(&del)
                 {
-                    common_prefixes_set.insert(format!("{}{}{}", prefix, pre, del));
+                    common_prefixes_set.insert(format!("{prefix}{pre}{del}"));
                     continue;
                 }
                 filtered_delete_markers.push(d.clone());
@@ -1166,7 +1163,7 @@ impl<B: Backend> TeleS3<B> {
                 is_latest: Some(m.is_latest),
                 last_modified: Some(chrono_to_timestamp(m.last_modified)),
                 e_tag: m.etag.clone().map(ETag::Strong),
-                size: Some(m.size as i64),
+                size: Some(i64::from(m.size)),
                 storage_class: Some(s3s::dto::ObjectVersionStorageClass::from_static(
                     s3s::dto::ObjectVersionStorageClass::STANDARD,
                 )),
@@ -1364,6 +1361,7 @@ fn delete_key_error(key: String, version_id: Option<String>, err: &S3Error) -> E
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
     use crate::backend::{BackendError, Memory};
     use crate::s3::TeleS3;
@@ -1461,6 +1459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_present_read_outcome_yields_the_reader() {
         let reader: BoxedAsyncReader = Box::pin(futures::io::Cursor::new(b"bytes".to_vec()));
 
@@ -1468,6 +1467,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_missing_read_outcome_is_an_internal_error_and_never_no_such_key() {
         // The metadata row promised these bytes before the backend was
         // called, so a genuine absence here is lost data, not a missing
@@ -1481,6 +1481,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_fault_read_outcome_is_an_internal_error_that_hides_the_fault() {
         let err =
             match read_outcome_to_reader(ReadOutcome::Fault(BackendError::InvariantViolation {
@@ -1694,6 +1695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn get_on_delete_marker_reports_marker_headers() {
         let svc = test_service().await;
         let marker_vid = versioned_bucket_with_marker(&svc).await;
@@ -1718,6 +1720,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn head_on_delete_marker_reports_marker_headers() {
         let svc = test_service().await;
         let marker_vid = versioned_bucket_with_marker(&svc).await;
@@ -1740,6 +1743,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn version_addressed_marker_read_reports_marker_headers() {
         let svc = test_service().await;
         let marker_vid = versioned_bucket_with_marker(&svc).await;
@@ -1762,6 +1766,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn missing_key_has_no_delete_marker_headers() {
         let svc = test_service().await;
         svc.repo
@@ -1893,6 +1898,7 @@ mod tests {
     /// from a genuinely unversioned bucket -- and on the destructive paths
     /// (bulk delete, tagging write) that meant silently discarding versions.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn versioned_read_paths_propagate_versioning_lookup_failure() {
         let svc = test_service().await;
         seed_versions(&svc, &["k"]).await;
@@ -1920,6 +1926,7 @@ mod tests {
     /// The destructive sites: a failed versioning lookup must abort the whole
     /// request rather than fall through to the non-versioned path.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn destructive_paths_fail_closed_on_versioning_lookup_failure() {
         let svc = test_service().await;
         seed_versions(&svc, &["k"]).await;
@@ -1947,6 +1954,7 @@ mod tests {
     /// The unversioned case must keep answering `Ok(None)`: the fix changes
     /// error handling only, never a bucket that genuinely has no versioning.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn unversioned_bucket_still_reports_no_version_id() {
         let svc = test_service().await;
         svc.repo
@@ -2082,6 +2090,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn delimiter_rollup_is_unaffected_by_sql_page_limit() {
         let svc = test_service().await;
         seed_versions(&svc, &["a/1", "a/2", "b/1"]).await;
@@ -2126,6 +2135,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn version_pages_cover_every_row_exactly_once() {
         let svc = test_service().await;
         seed_versions(&svc, &["a/1", "a/2", "a/3", "b/1", "b/2", "c/1"]).await;
@@ -2140,6 +2150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn version_max_keys_of_one_pages_a_single_key() {
         let svc = test_service().await;
         seed_versions(&svc, &["a/1", "b/1"]).await;
@@ -2209,6 +2220,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_successful_write_records_and_resolves_a_publish_intent() {
         let svc = flaky_write_service().await;
         svc.repo
@@ -2238,6 +2250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_failed_write_leaves_its_publish_intent_pending() {
         // The load-bearing assertion of this scope: a publish that may have
         // happened and returned no key is found by nothing else, so a failed
@@ -2271,6 +2284,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_failed_intent_resolve_does_not_publish_the_object() {
         // The resolve is part of the publish transaction. If it fails, the
         // object must not commit while its intent stays pending: the reclaim
@@ -2301,6 +2315,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_checksum_failure_keeps_the_intent_when_the_backend_delete_fails() {
         // A failed delete leaves bytes with no metadata row. The pending
         // intent is then the only record that can lead the reclaim pass back
@@ -2332,6 +2347,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn an_invalid_content_md5_keeps_the_intent_when_the_backend_delete_fails() {
         let svc = flaky_write_service().await;
         svc.repo
@@ -2358,6 +2374,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_checksum_failure_clears_the_intent_after_the_backend_delete() {
         let svc = flaky_write_service().await;
         svc.repo
@@ -2383,6 +2400,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_zero_size_write_records_no_intent() {
         let svc = flaky_write_service().await;
         svc.repo
@@ -2401,6 +2419,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_publish_id_carries_no_user_data() {
         // The identifier is published under in the backend, so it must never
         // embed the bucket or key the object was written for.
@@ -2434,6 +2453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn negative_max_keys_is_invalid_argument() {
         let svc = test_service().await;
         svc.repo
@@ -2461,6 +2481,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn max_keys_above_ceiling_is_clamped() {
         let svc = test_service().await;
         svc.repo
@@ -2488,6 +2509,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn default_max_keys_is_the_ceiling() {
         let svc = test_service().await;
         svc.repo
@@ -2503,6 +2525,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn negative_content_length_is_invalid_argument() {
         let svc = test_service().await;
         svc.repo
@@ -2545,6 +2568,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn common_prefix_splits_at_the_first_delimiter_after_the_prefix() {
         assert_eq!(
             common_prefix_for("p/a/1", "p/", "/").as_deref(),
@@ -2554,6 +2578,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn common_prefix_splits_the_whole_key_when_the_prefix_does_not_match() {
         // Rows reaching the rollup have already been filtered by the prefix,
         // but the split falls back to the key itself while the listed prefix
@@ -2563,6 +2588,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn rollup_without_delimiter_lists_every_row_as_an_object() {
         let (contents, prefixes, next) = rollup_list_page(rows(&["a/1", "b"]), "", None, false);
 
@@ -2573,6 +2599,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn rollup_with_delimiter_rolls_shared_prefixes_out_of_the_contents() {
         let (contents, prefixes, _) = rollup_list_page(
             rows(&["photos/1.jpg", "photos/2.jpg", "docs/readme"]),
@@ -2591,6 +2618,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn rollup_treats_a_prefix_that_is_also_a_key_as_a_common_prefix() {
         let (contents, prefixes, _) =
             rollup_list_page(rows(&["a", "a/", "a/b"]), "", Some("/"), false);
@@ -2664,6 +2692,7 @@ mod tests {
     /// the exact expression both write paths evaluate, and the end-to-end
     /// absence test below pins the branch that follows it.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn replaced_object_propagates_a_repository_read_failure() {
         let svc = test_service().await;
         seed_unversioned_object(&svc, "b", "old").await;
@@ -2687,6 +2716,7 @@ mod tests {
     /// against over-correcting the fix into a blanket `?` that would break
     /// copying onto a fresh key.
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn replaced_object_is_none_for_an_absent_key_and_copy_still_succeeds() {
         let svc = test_service().await;
         seed_unversioned_object(&svc, "b", "src").await;
@@ -2717,6 +2747,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn rollup_applies_the_listed_prefix_before_the_delimiter() {
         let (contents, prefixes, _) =
             rollup_list_page(rows(&["p/a/1", "p/a/2", "p/b"]), "p/", Some("/"), false);
@@ -2726,6 +2757,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn rollup_of_an_empty_page_is_empty_and_uncursored() {
         let (contents, prefixes, next) = rollup_list_page(Vec::new(), "", Some("/"), false);
 
@@ -2735,6 +2767,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn rollup_cursor_is_the_last_row_key_only_when_the_page_was_truncated() {
         let (contents, prefixes, next) = rollup_list_page(rows(&["a", "b"]), "", None, true);
 

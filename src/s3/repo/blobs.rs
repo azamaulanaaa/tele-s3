@@ -45,7 +45,7 @@ impl Repository {
 
     /// Register a freshly created backend blob with a single reference.
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn register_new_blob(&self, id: String, size: u64) -> S3Result<()> {
+    pub(crate) async fn register_new_blob(&self, id: String, size: u64) -> S3Result<()> {
         Self::insert_blob(&self.db, id, size).await
     }
 
@@ -63,7 +63,7 @@ impl Repository {
     /// that cannot record the intent must not call the backend: an
     /// unrecorded publish is unrecoverable.
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn record_publish_intent(
+    pub(crate) async fn record_publish_intent(
         &self,
         publish_id: String,
         bucket_id: String,
@@ -97,7 +97,7 @@ impl Repository {
     /// Test-only: every production success path resolves inside the publish
     /// transaction, through [`Self::resolve_publish_intent_txn`].
     #[cfg(test)]
-    pub async fn resolve_publish_intent(&self, publish_id: &str, blob_id: String) -> S3Result<()> {
+    pub(crate) async fn resolve_publish_intent(&self, publish_id: &str, blob_id: String) -> S3Result<()> {
         Self::resolve_publish_intent_txn(&self.db, publish_id, blob_id).await
     }
 
@@ -155,7 +155,7 @@ impl Repository {
     /// Bounded by `limit` and ordered by the primary key, so one page is
     /// enough for a pass and no statement — and therefore no write lock — is
     /// ever wider than that page.
-    pub async fn pending_publish_intents(
+    pub(crate) async fn pending_publish_intents(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
         limit: u64,
@@ -176,7 +176,7 @@ impl Repository {
     /// selection and this statement keeps its row: a resolved row is the only
     /// record of which key a confirmed publish produced, and the reconciler
     /// has no business removing one.
-    pub async fn clear_publish_intents(&self, publish_ids: &[String]) -> S3Result<()> {
+    pub(crate) async fn clear_publish_intents(&self, publish_ids: &[String]) -> S3Result<()> {
         if publish_ids.is_empty() {
             return Ok(());
         }
@@ -204,7 +204,7 @@ impl Repository {
     /// A failure on any item therefore leaves no reference acquired by this
     /// call, so the caller has nothing to release after it returns an error.
     #[instrument(skip(self, items), level = "debug", err)]
-    pub async fn acquire_blob_refs(&self, items: &[(String, u64)]) -> S3Result<()> {
+    pub(crate) async fn acquire_blob_refs(&self, items: &[(String, u64)]) -> S3Result<()> {
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
         if items.is_empty() {
@@ -278,7 +278,7 @@ impl Repository {
     /// blob that exists only in the backend, with no record anywhere that it
     /// is unreferenced, and nothing that ever retries it.
     #[instrument(skip(self, ids), level = "debug", err)]
-    pub async fn release_blob_refs(&self, ids: &[String]) -> S3Result<Vec<String>> {
+    pub(crate) async fn release_blob_refs(&self, ids: &[String]) -> S3Result<Vec<String>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -381,7 +381,7 @@ impl Repository {
     /// Returns the ids this call claimed. A row that another caller already
     /// claimed is not returned.
     #[instrument(skip(self, ids), level = "debug", err)]
-    pub async fn claim_released_blob_rows(&self, ids: &[String]) -> S3Result<Vec<String>> {
+    pub(crate) async fn claim_released_blob_rows(&self, ids: &[String]) -> S3Result<Vec<String>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -432,7 +432,7 @@ impl Repository {
     /// Call this when the backend delete fails. A later release can then try
     /// the delete again.
     #[instrument(skip(self, ids), level = "debug", err)]
-    pub async fn restore_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
+    pub(crate) async fn restore_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -453,17 +453,17 @@ impl Repository {
     /// Current reference count for a blob id (0 if the row is absent).
     #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn blob_ref_count(&self, id: &str) -> S3Result<i64> {
+    pub(crate) async fn blob_ref_count(&self, id: &str) -> S3Result<i64> {
         let model = entity::blob::Entity::find_by_id(id.to_string())
             .one(&self.db)
             .await
             .map_err(S3Error::internal_error)?;
-        Ok(model.map(|m| m.refs).unwrap_or(0))
+        Ok(model.map_or(0, |m| m.refs))
     }
 
     /// Reference counts for several blob ids in one query.
     #[instrument(skip(self, ids), level = "debug", err)]
-    pub async fn blob_ref_counts(
+    pub(crate) async fn blob_ref_counts(
         &self,
         ids: &[String],
     ) -> S3Result<std::collections::HashMap<String, i64>> {
@@ -490,7 +490,7 @@ impl Repository {
     /// Guarded on `refs <= 0` so a reference acquired between the decision
     /// and this statement can never take the row away from a live holder.
     #[instrument(skip(self, ids), level = "debug", err)]
-    pub async fn delete_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
+    pub(crate) async fn delete_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -547,7 +547,7 @@ impl Repository {
     /// release path (and, for rows whose backend delete failed, of a
     /// backend-aware sweeper this pass deliberately does not attempt).
     #[instrument(skip(self), level = "debug", err)]
-    pub async fn reconcile_orphan_blobs(
+    pub(crate) async fn reconcile_orphan_blobs(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> S3Result<usize> {
@@ -824,6 +824,7 @@ fn collect_referenced_ids<'a>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
     use crate::s3::repo::{MultipartUploadStateUpdate, ObjectWrite, PutCondition};
 

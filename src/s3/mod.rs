@@ -34,6 +34,8 @@ mod objects;
 mod repo;
 mod types;
 
+#[allow(missing_debug_implementations)]
+/// S3 gateway service.
 pub struct TeleS3<B: Backend> {
     pub(crate) backend: B,
     pub(crate) repo: repo::Repository,
@@ -99,7 +101,7 @@ fn publish_intent_is_due(
 /// failure this whole table exists to prevent.
 fn intent_disposition(outcome: &Result<ReclaimOutcome, BackendError>) -> IntentDisposition {
     match outcome {
-        Ok(ReclaimOutcome::NothingPublished) | Ok(ReclaimOutcome::Reclaimed) => {
+        Ok(ReclaimOutcome::NothingPublished | ReclaimOutcome::Reclaimed) => {
             IntentDisposition::Clear
         }
         Ok(ReclaimOutcome::ReclaimFailed) | Err(_) => IntentDisposition::KeepPending,
@@ -107,6 +109,7 @@ fn intent_disposition(outcome: &Result<ReclaimOutcome, BackendError>) -> IntentD
 }
 
 impl<B: Backend> TeleS3<B> {
+    /// Initialize the S3 service with a backend and database.
     #[instrument(skip(backend, db), level = "debug", err)]
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
         let repo = repo::Repository::init(db).await?;
@@ -348,7 +351,7 @@ impl<B: Backend> TeleS3<B> {
     /// validation. The atomic re-check still happens at commit time (in
     /// `publish_object_with_new_blob` / `cas_put_object`); this only avoids
     /// wasted effort and gives preconditions correct precedence over other
-    /// errors (e.g. InvalidPart).
+    /// errors (e.g. `InvalidPart`).
     async fn precondition_gate(
         &self,
         bucket: &str,
@@ -644,6 +647,7 @@ impl<B: Backend> S3 for TeleS3<B> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use sea_orm::EntityTrait;
@@ -887,6 +891,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn an_intent_younger_than_the_threshold_is_not_due() {
         let now = chrono::Local::now().to_utc();
 
@@ -907,6 +912,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_settled_publish_clears_its_intent_and_an_unsettled_one_keeps_it() {
         // The load-bearing mapping of the scope. Only the two settled answers
         // may drop the row; every other case must leave it pending, because a
@@ -934,6 +940,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_pending_but_young_intent_is_not_swept() {
         let svc = scripted(Ok(ReclaimOutcome::Reclaimed)).await;
         record_intent_aged(&svc, "young", chrono::Duration::minutes(5)).await;
@@ -951,6 +958,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_nothing_published_intent_is_cleared() {
         let svc = scripted(Ok(ReclaimOutcome::NothingPublished)).await;
         record_intent_aged(&svc, "gone", chrono::Duration::hours(2)).await;
@@ -961,6 +969,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_reclaimed_intent_is_cleared() {
         let svc = scripted(Ok(ReclaimOutcome::Reclaimed)).await;
         record_intent_aged(&svc, "deleted", chrono::Duration::hours(2)).await;
@@ -970,6 +979,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn an_indelible_publish_keeps_its_intent_pending_for_a_later_pass() {
         // The assertion the whole scope turns on: a message that was found
         // but not deleted leaves the row pending, so a later pass retries it.
@@ -992,6 +1002,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_failed_reclaim_keeps_its_intent_pending() {
         // An unanswered lookup is an unknown publish. Clearing the row here
         // would erase the only record of bytes that may be sitting in the
@@ -1004,6 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn the_sweep_is_bounded_to_one_batch_of_intents() {
         let svc = scripted(Ok(ReclaimOutcome::Reclaimed)).await;
         for i in 0..PUBLISH_INTENT_SWEEP_BATCH + 10 {
@@ -1023,6 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn a_resolved_intent_is_never_swept() {
         let svc = scripted(Ok(ReclaimOutcome::Reclaimed)).await;
         record_intent_aged(&svc, "confirmed", chrono::Duration::hours(2)).await;
@@ -1041,6 +1054,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn the_two_reconciliation_passes_are_independent() {
         // Each pass must be runnable without the other having run, and must
         // not disturb the other's rows.
@@ -1082,6 +1096,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn retryable_backend_failures_keep_their_transient_s3_codes() {
         let err: S3Error = BackendError::SlowDown.into();
         assert_eq!(*err.code(), s3s::S3ErrorCode::SlowDown);
@@ -1095,6 +1110,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn size_limit_failure_keeps_entity_too_large_and_the_backend_message() {
         let message = BackendError::ExceedLimitSize {
             max: 10,
@@ -1117,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn permanent_backend_faults_are_internal_errors_that_name_nothing() {
         // The detail of a permanent fault is an inventory of this backend's
         // internals: anything that can reach the endpoint can provoke one and
@@ -1160,6 +1177,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn a_permanent_fault_keeps_its_detail_in_the_error_source() {
         // Redaction is only safe because the detail is not lost: this is
         // what an operator reads to tell a corrupt key from a dead lock.
@@ -1188,6 +1206,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn the_other_catch_all_is_generic_too() {
         // `Backend` is a public extension surface: a third-party backend's
         // `Other`, and any variant added later, must not become a message.
@@ -1204,6 +1223,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn wrapped_upstream_errors_still_carry_their_source_chain() {
         let err: S3Error =
             BackendError::Other(std::io::Error::other("telegram said no").into()).into();
@@ -1217,6 +1237,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn failed_backend_delete_keeps_the_blob_row() {
         let svc = service(true).await;
         svc.repo
@@ -1248,6 +1269,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn an_acquire_fails_while_the_delete_of_its_blob_is_in_flight() {
         let svc = std::sync::Arc::new(paused_service().await);
         svc.repo
@@ -1289,6 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)]
     async fn reconcile_orphan_blobs_leaves_referenced_blobs_alone() {
         let svc = service(true).await;
         svc.repo

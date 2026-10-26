@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
 use anyhow::Context;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, presigning::PresigningConfig};
@@ -6,8 +7,8 @@ use std::time::Duration;
 
 mod config;
 
-/// Presigned URLs are generated client-side via AWS SigV4 and verified
-/// server-side by s3s SimpleAuth (v4_check_presigned_url). No extra endpoint
+/// Presigned URLs are generated client-side via AWS `SigV4` and verified
+/// server-side by s3s `SimpleAuth` (`v4_check_presigned_url`). No extra endpoint
 /// is needed for public share links—clients can share the presigned URI.
 #[tokio::test]
 async fn test_presigned_get_object_generation() -> anyhow::Result<()> {
@@ -53,7 +54,7 @@ async fn test_presigned_get_object_generation() -> anyhow::Result<()> {
         .await
         .context("presign")?;
     let url = presigned.uri().to_string();
-    println!("presigned url: {}", url);
+    println!("presigned url: {url}");
     assert!(
         url.contains("X-Amz-Signature"),
         "presigned url should contain signature"
@@ -159,11 +160,10 @@ async fn test_presigned_with_versioning() -> anyhow::Result<()> {
         .await
         .context("presign v1")?;
     let url_v1 = presigned_v1.uri().to_string();
-    println!("presigned v1 url: {}", url_v1);
+    println!("presigned v1 url: {url_v1}");
     assert!(
         url_v1.contains("versionId"),
-        "presigned url for versioned object should contain versionId: {}",
-        url_v1
+        "presigned url for versioned object should contain versionId: {url_v1}"
     );
     assert!(
         url_v1.contains(&vid1),
