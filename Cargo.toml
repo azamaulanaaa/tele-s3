@@ -3,8 +3,9 @@ name = "tele-s3"
 version = "0.6.0"
 edition = "2024"
 autobenches = false
+rust-version = "1.98"
 repository = "https://github.com/azamaulanaaa/tele-s3"
-license-file = "LICENSE"
+license = "GPL-2.0-only"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

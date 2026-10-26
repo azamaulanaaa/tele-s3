@@ -1,0 +1,133 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+#
+# `mise run licenses`, `mise run advisories` and `mise run bans` each run one of
+# these checks, and CI runs all three as separate jobs, so a failure names the
+# check that failed instead of arriving as one aggregate error.
+#
+# `cargo deny check bans` is the graph-level half of dependency hygiene;
+# clippy's `cargo` lint group is the source-level half, catching a wildcard
+# requirement or missing crate metadata before it is ever resolved.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Licences observed across the dependency graph. Anything not listed — copyleft,
+# proprietary, unknown — fails the check and has to be reviewed before it is
+# added, rather than waved through by a wildcard entry.
+allow = [
+    # This crate's own licence, which the check also evaluates.
+    "GPL-2.0-only",
+    "BSL-1.0",
+    "MIT",
+    # constant_time_eq
+    "MIT-0",
+    "Apache-2.0",
+    # blake3
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    # unicode-ident
+    "Unicode-3.0",
+    # memchr, walkdir, same-file, winapi-util
+    "Unlicense",
+    "CC0-1.0",
+    # foldhash, reached through `actix-http` when `blu serve` is built.
+    # Zlib is OSI approved and FSF Free/Libre, so it is compatible with
+    # GPL-2.0-only. It is listed by the crate that pulls it, so the next
+    # person to read this knows where the obligation came from.
+    "Zlib",
+    # ISC, reached through TLS in every build: `rustls`,
+    # `rustls-webpki`, `untrusted` and `ring`.
+    # The OTLP exporter and the S3 transport need them to speak `https://`.
+    # Plain `http://` still works.
+    # Nothing downgrades and nothing upgrades.
+    #
+    # ISC is permissive, it is on the FSF's own list of licences compatible with
+    # the GPL, and it is what the Rust project itself uses. One entry is enough
+    # for all four crates: `ring` is declared "Apache-2.0 AND ISC", and
+    # `Apache-2.0` is already allowed above.
+    #
+    # **`webpki-roots` is deliberately absent, and that is a decision rather than
+    # an omission.** TLS uses the operating system trust store, not a
+    # compiled-in Mozilla bundle. Nothing in the graph pulls `webpki-roots`.
+    #
+    # `webpki-root-certs` is a different crate with the same licence family:
+    # `reqwest` 0.13 reaches it through `rustls-platform-verifier`, which still
+    # prefers the operating system store and keeps the bundled roots as a
+    # fallback for platforms that have no verifier. `CDLA-Permissive-2.0` is a
+    # permissive data licence, so it is allowed here.
+    "CDLA-Permissive-2.0",
+    "ISC",
+]
+# Some crates ship licence text without an SPDX expression. 0.9 rather than the
+# usual 0.8: a file this tool writes has to stay readable, so an unrecognised
+# licence is worth a second look.
+confidence-threshold = 0.9
+
+[bans]
+# Warn rather than fail on duplicate versions. Several transitive dependencies
+# ship more than one version of a shared crate, and collapsing those is not
+# worth the effort at this size. The count is still reported, so a regression
+# is visible.
+multiple-versions = "warn"
+# A wildcard requirement resolves to whatever is newest at install time, which
+# is not a reviewable decision and can change without a commit.
+wildcards = "deny"
+allow-wildcard-paths = false
+# `bitcode`, `serde` and `serde_json` sat in `[dependencies]` calling nothing for
+# the life of several `deny.toml` rewrites, and nothing in this file would have
+# said so: cargo-deny 0.20 has no unused-crate check — `[bans]` has no such key,
+# and adding one fails to deserialize — and `clippy::cargo` is manifest hygiene
+# rather than dependency analysis. rustc's `unused_crate_dependencies` does find
+# them, but it is a per-target lint and a package shares one `[dependencies]`
+# list across its library, its binary, nineteen test binaries, two benches and
+# two examples, so every one of those targets reports the others' dependencies as
+# unused. There is no version of the check that fits this package shape; a
+# dedicated tool would be the answer, and that is a decision about the toolchain
+# rather than about this file. Recorded here so the next person who greps
+# `deny.toml` for "unused" learns it rather than rediscovering it.
+
+[advisories]
+version = 2
+# Denied rather than warned: a yanked release is one whose author has asked for
+# it not to be used, and a backup tool has no business resolving to one. This is
+# stricter than a warn default on purpose.
+yanked = "deny"
+
+# RUSTSEC-2025-0141 used to be here: the bincode team ceased development
+# permanently after a doxxing incident, so 1.3.3 was unmaintained with no fix
+# coming. Moving to bincode 2 did not clear it — the advisory covers the whole
+# project, and the 3.0.0 release is a placeholder whose entire source is a
+# `compile_error!`. The snapshot encoding is now hand-written, in
+# `src/metadata/codec.rs`, which is where it belonged: it is the one thing in this
+# tool that has to keep working, and it should not be at the mercy of somebody
+# else's policy. The snapshot layout is now at `FORMAT_VERSION` 3; the version
+# number lives in `src/metadata.rs`, not here.
+#
+# RUSTSEC-2026-0258 (Low), an HPACK-header flood in `h2` 0.3.x. It is here because
+# `awc`, the client behind `blu versions --remote`, enables `actix-http`'s
+# `http2` feature and offers no feature to turn it off; `actix-http` 3.18 pins
+# `h2 = "0.3.27"`, and the fix exists only in 0.4.x. So this cannot be upgraded
+# away, only designed around.
+#
+# **The vulnerable code is not reachable, and that is the whole argument.**
+# `blu serve` speaks HTTP/1.1 and nothing else: it offers no TLS, so there is
+# no ALPN to negotiate over, and the client asks for HTTP/1.1. `h2` is compiled
+# into the binary and never spoken. That is an argument and not a guarantee,
+# which is why it is written down here instead of being left in a commit message
+# somebody will have to rediscover.
+#
+# This is the one entry in this file, so the ignore is scoped to this single id
+# and every other advisory still gates. Revisit when `actix-http` moves to `h2`
+# 0.4; at that point this entry should be deleted, and `cargo deny check
+# advisories` will say so if it is not.
+ignore = []
+
+[sources]
+# Denied rather than warned. The lockfile is what makes a build reproducible, so
+# a registry or git source that is not the expected one has to be a deliberate,
+# recorded decision.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

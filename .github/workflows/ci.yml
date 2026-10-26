@@ -1,0 +1,246 @@
+name: CI
+
+# Nothing here writes to the repository: these jobs read the checkout and publish
+# artifacts, nothing more. Saying so explicitly is not tidiness, though. This
+# workflow is *called* by release.yml, which grants `contents: write` because it
+# has to create a release, and a called workflow inherits the caller's token. So
+# without this line the lint, test and coverage jobs all run with write access to
+# the repository whenever a release is being cut — the widest token, on the
+# machines that run third-party actions, for jobs that need no write at all.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So the release workflow can gate publishing on this having passed.
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The suite compiles cargo-llvm-cov and cargo-dist from source, and runs a
+# release-config check that installs cargo-dist, so a superseded run is real
+# minutes of runner time. Without this, pushing a second commit while the first
+# is still running queues the entire suite again and both results are equally
+# irrelevant.
+#
+# Not set for tag pushes: a release run must finish even if something is pushed
+# meanwhile, so it gets its own group that nothing cancels.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# One job per check, named after the mise task that runs the same command, so a
+# failure here is reproducible locally with `mise run <name>`.
+
+jobs:
+  lint:
+    name: Lint (fmt & clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        # The lint levels are already denied in Cargo.toml under `[lints]`, so
+        # this fails on a violation without the flag. `-D warnings` additionally
+        # covers anything rustc or a lint group emits outside the declared set.
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  # Linux only, and deliberately not a matrix: one runner is not a matrix, and
+  # keeping the shape would suggest a knob nobody turns.
+  #
+  # To run on more than one platform again, put this back:
+  #
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       os: [ubuntu-latest, macos-latest, windows-latest]
+  #
+  # What that costs to restore is written down in the README, because dropping the
+  # other two stopped testing code rather than only stopping running it twice —
+  # see the note on the release targets there.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # rustfmt and clippy are not needed to run tests, and leaving them out keeps
+      # this job to a compile and a run.
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      - run: cargo test --all-targets --all-features --locked
+      # `--all-targets` does not imply doctests, and the README's examples are
+      # collected as doctests of a `#[cfg(doctest)]` item in `lib.rs`. Without
+      # this the only compiled prose in the repository goes unchecked.
+      - run: cargo test --doc --locked
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # 0.9.1 pinned, and the same version `mise install` puts on a developer's
+      # machine, so a coverage number that differs between the two is a bug here
+      # rather than a surprise there.
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: llvm-tools-preview
+          install: cargo-llvm-cov@0.9.1
+      # llvm-cov instruments the test binary rather than sampling, so the number
+      # is exact and does not drift between runs of the same commit.
+      #
+      # One invocation, not two. The default report goes to stdout as well as
+      # producing the HTML, so a separate `--summary-only` run would only re-run
+      # the whole instrumented suite to print a number this step already prints.
+      #
+      # `--output-dir`, not `--output-path`: `--output-path` is rejected alongside
+      # `--html`, and this step was failing for that reason alone. The report also
+      # lands in a `html/` subdirectory of whatever is passed, which is why the
+      # upload below points at `target/llvm-cov/html` and not `target/llvm-cov`.
+      #
+      # The HTML is uploaded rather than only summarised: a bare percentage says
+      # which commit regressed, not which lines.
+      - name: Measure coverage
+        run: cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov
+      - name: Upload report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+          retention-days: 7
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Pinned to an exact version rather than `stable`, so a new release
+      # breaking the build is caught here rather than being blamed on the floor.
+      #
+      # Note what this job is and is not for any more. The floor is the latest
+      # stable, so `lint` and `test` already build with the same or a newer
+      # toolchain and this catches nothing they would not. What it still catches
+      # is a *declared* floor that does not build: a typo, a version that does
+      # not exist yet, or a dependency quietly requiring more than the manifest
+      # claims. That is worth a job, and is the only thing left here worth one.
+      - name: Read the declared floor
+        id: floor
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      # The one job that needs a toolchain installed, and it installs exactly the
+      # version the manifest declares. rustup is already on the image, so this is
+      # a `rustup toolchain install` and nothing else — no action in the middle
+      # holding the token.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+          components: ''
+      - run: cargo check --all-targets --all-features --locked
+
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      - name: Check rustdoc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The version pinned in dist-workspace.toml, spelled out here as well. Two
+      # places to update when it moves, deliberately: the config is what dist
+      # itself reads at release time, and this job exists to prove the config
+      # resolves with the tool that will act on it.
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-dist@0.32.0
+
+      # `.github/workflows/release.yml` is generated by dist and then hand-edited
+      # to gate publishing on this workflow, so its bytes cannot be compared
+      # against a regeneration — `dist generate --check` would always fail.
+      # What is worth protecting is the gate itself: a regeneration that forgets
+      # it would otherwise let a tagged commit publish without passing CI.
+      #
+      # The target matrix needs no equivalent check. dist resolves it from
+      # dist-workspace.toml at plan time, so the triples never appear in the
+      # workflow and cannot drift out of sync with the config.
+      - name: The release workflow still gates publishing on CI
+        run: |
+          set -eu
+          workflow=.github/workflows/release.yml
+
+          if ! grep -q 'uses: ./.github/workflows/ci.yml' "$workflow"; then
+            echo "::error::$workflow no longer calls ci.yml; re-apply the 'checks' job"
+            exit 1
+          fi
+
+          if ! grep -A4 'build-local-artifacts:' "$workflow" | grep -q '^ *- checks$'; then
+            echo "::error::$workflow no longer waits for checks before building; re-apply it to build-local-artifacts needs"
+            exit 1
+          fi
+
+          echo "release workflow is gated on CI"
+
+      # Smoke test that the config resolves, so a typo in dist-workspace.toml
+      # fails here rather than at tag time.
+      - name: The release plan resolves
+        run: dist plan --output-format=human > /dev/null
+
+  # Three cargo-deny jobs rather than one running all its checks. They fail
+  # independently on purpose: a new dependency with an unknown licence and one
+  # with a known vulnerability are different conversations, and lumping them means
+  # a licence bump is reported as "a deny check failed".
+  #
+  # cargo-deny is installed from crates.io with --locked rather than through
+  # EmbarkStudios/cargo-deny-action, which is the third-party action this workflow
+  # otherwise avoids. Same project, same checks, one fewer `uses:` line holding
+  # this repository's token.
+  licenses:
+    name: Licences (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check dependency licences
+        run: cargo deny check licenses
+
+  advisories:
+    name: Advisories (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check advisories (vulns / yanks)
+        run: cargo deny check advisories
+
+  bans:
+    name: Bans (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check wildcards and duplicate versions
+        run: cargo deny check bans
