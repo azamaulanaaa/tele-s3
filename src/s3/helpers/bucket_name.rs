@@ -9,7 +9,8 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 /// Enforces the documented hard rules. A name needs 3 to 63 characters.
 /// The characters must be lowercase letters, digits, dots, or hyphens.
 /// The name must start and end with a letter or digit. The name must not
-/// use the `xn--` prefix. The name must not resemble an IPv4 address.
+/// contain adjacent dots. The name must not use the `xn--` prefix. The name
+/// must not resemble an IPv4 address.
 pub(crate) fn validate_bucket_name(name: &str) -> S3Result<()> {
     let invalid = || S3Error::new(S3ErrorCode::InvalidBucketName);
 
@@ -33,6 +34,10 @@ pub(crate) fn validate_bucket_name(name: &str) -> S3Result<()> {
         .last()
         .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     if !starts_ok || !ends_ok {
+        return Err(invalid());
+    }
+
+    if name.contains("..") {
         return Err(invalid());
     }
 
@@ -89,6 +94,14 @@ mod tests {
             "my bucket",
             "bucket!",
         ] {
+            let err = validate_bucket_name(name).expect_err(&format!("{name:?} should be invalid"));
+            assert_eq!(*err.code(), S3ErrorCode::InvalidBucketName);
+        }
+    }
+
+    #[test]
+    fn rejects_names_with_adjacent_dots() {
+        for name in ["a..b", "my..bucket", "foo..bar"] {
             let err = validate_bucket_name(name).expect_err(&format!("{name:?} should be invalid"));
             assert_eq!(*err.code(), S3ErrorCode::InvalidBucketName);
         }
