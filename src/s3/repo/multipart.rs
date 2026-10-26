@@ -26,9 +26,9 @@ pub(crate) struct MultipartUploadStateUpdate {
     pub(crate) key: String,
     pub(crate) upload_id: String,
     pub(crate) content_type: Option<String>,
-    /// x-amz-meta-* map as a JSON object; empty object when none.
+    /// x-amz-meta-* map as a JSON object. Empty object when none.
     pub(crate) user_metadata: serde_json::Value,
-    /// Object tag-set as a JSON array of {key, value}; empty array when none.
+    /// Object tag-set as a JSON array of {key, value}. Empty array when none.
     pub(crate) tags: serde_json::Value,
     pub(crate) content: serde_json::Value,
 }
@@ -419,7 +419,7 @@ impl Repository {
     /// so a retried or repeated upload would leak one blob per attempt.
     ///
     /// A concurrent content change retries the compare-and-swap. The returned
-    /// ids are the replaced part's blobs whose count reached zero; the caller
+    /// ids are the replaced part's blobs whose count reached zero. The caller
     /// must remove their backend bytes and rows.
     #[instrument(skip(self, part), level = "debug", err)]
     /// Documentation.

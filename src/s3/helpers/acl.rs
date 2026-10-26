@@ -1,10 +1,9 @@
-//! The synthetic ACL identity every resource is reported to belong to.
+//! The synthetic ACL identity that every resource reports as its owner.
 //!
-//! Every ACL response answers with this one owner and grant. Real ACL
-//! enforcement — evaluating a request's identity against a grant — is not
-//! modelled anywhere: the `PutBucketAcl`/`PutObjectAcl` handlers existence-
-//! check and discard, so nothing outside this file may grow the notion of a
-//! stored grant.
+//! Every ACL response returns this one owner and grant. No code enforces
+//! real ACLs. The `PutBucketAcl` and `PutObjectAcl` handlers check
+//! existence and discard the input. Code outside this file must not add
+//! stored grants.
 
 use s3s::dto::{Grant, Grantee, Owner};
 

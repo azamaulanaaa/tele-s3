@@ -1,10 +1,11 @@
-//! Evaluation of conditional GET/HEAD request headers.
+//! This module evaluates conditional GET and HEAD request headers.
 //!
-//! Read side only, and only against an already-loaded object row: it turns
-//! `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` into
-//! `412`/`304` or a pass. The write side has a different shape because it
-//! becomes a compare-and-set inside the publishing transaction, which is
-//! [`super::preconditions`]' job.
+//! This module works only on the read side. It works only against an
+//! already-loaded object row. It maps `If-Match`, `If-None-Match`,
+//! `If-Modified-Since`, and `If-Unmodified-Since` to `412`, `304`, or a
+//! pass. The write side uses a different shape. It becomes a
+//! compare-and-set inside the publishing transaction.
+//! [`super::preconditions`] handles that side.
 
 use std::time::SystemTime;
 

@@ -50,53 +50,55 @@ const FLOOD_ERROR_CODE: i32 = 420;
 // rather than a misconfiguration.
 const MIN_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How far back into the chat history [`Grammers::reclaim_publish`] looks
-/// for a publish by its file name.
+/// How far back [`Grammers::reclaim_publish`] looks in chat history.
 ///
-/// # Why iteration, and not search
+/// It looks for a publish by its file name.
 ///
-/// Telegram's message search (`client.search_messages` / `search_all_messages`
-/// — the `q` of `messages.search`) indexes **message text**, and the publish
-/// identifier is never part of that text: [`Grammers::write`] sends it as the
-/// attachment's *file name* and sends no caption. Whether Telegram also
-/// indexes an attachment's file name into its text search is a server-side
-/// indexing decision that cannot be verified from the client API, so it is not
-/// relied on here.
+/// # Why iteration, not search
 ///
-/// Walking the history can be verified from the vendored grammers 0.10 source
-/// instead, which is what this implementation does. Two facts from
+/// Telegram's message search indexes message text. The publish identifier is
+/// never part of that text. [`Grammers::write`] sends it as the attachment's
+/// file name and sends no caption. Whether Telegram also indexes an
+/// attachment's file name into its text search is a server-side indexing
+/// decision. That decision cannot be verified from the client API. So this
+/// code does not rely on it.
+///
+/// Walking the history can be verified from the vendored grammers 0.10 source.
+/// This implementation does that. Two facts from
 /// `/root/.cargo/registry/src/*/grammers-client-0.10.0`:
 ///
 /// * `Media::Document::name()` (`src/media/media.rs`) returns the file name
-///   straight off the `filename` document attribute — the very attribute
-///   `src/media/mod.rs` sets from `Uploaded::name()` on upload, i.e. the one
-///   [`Grammers::write`] passed as `publish_name`;
+///   straight off the `filename` document attribute. That attribute is the one
+///   `src/media/mod.rs` sets from `Uploaded::name()` on upload. It is the one
+///   [`Grammers::write`] passed as `publish_name`.
 /// * `Client::iter_messages` (`src/client/messages.rs`) returns newest-first
 ///   history with a `.limit(n)`.
 ///
 /// # The limitation this buys
 ///
 /// The sweep can only see this many most-recent messages. A message older than
-/// the window is indistinguishable from one that was never published, so a
-/// publish that has aged out of the window answers
-/// [`ReclaimOutcome::NothingPublished`] and its bytes stay in the chat until an
+/// the window is indistinguishable from one that was never published. A publish
+/// that has aged out of the window answers
+/// [`ReclaimOutcome::NothingPublished`]. Its bytes stay in the chat until an
 /// operator deletes them by hand. That is a real leak an unbounded sweep would
-/// close and a bounded one cannot: walking the whole history per intent is
-/// unbounded work at start-up, which the reconciler contract forbids. The
-/// window is sized for the gap between a write losing its answer and the next
-/// start-up.
+/// close. A bounded one cannot close it. Walking the whole history per intent
+/// is unbounded work at start-up. The reconciler contract forbids that work.
+/// The window is sized for the gap between a write losing its answer and the
+/// next start-up.
 const PUBLISH_LOOKBACK_MESSAGES: usize = 500;
 
 /// Telegram operations allowed in flight at once, process-wide.
 ///
-/// The S3 layer fans out one backend call per blob (`DeleteObjects`, a
-/// multi-part GET), and Telegram rate-limits a burst aimed at a single chat,
-/// so the bound is applied here, at the backend boundary, where every caller
+/// The S3 layer fans out one backend call per blob. `DeleteObjects` and a
+/// multi-part GET are examples. Telegram rate-limits a burst aimed at a single
+/// chat. So the bound is applied here, at the backend boundary. Every caller
 /// inherits it.
 pub(super) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
-/// Deadline for a single Telegram request, generous enough for a
-/// `PART_SIZE`/`MAX_CHUNK_SIZE` transfer on a slow link.
+/// Deadline for a single Telegram request.
+///
+/// It is generous enough for a `PART_SIZE`/`MAX_CHUNK_SIZE` transfer on a
+/// slow link.
 pub(super) const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Attempts per retry loop, the first try included.
@@ -104,23 +106,25 @@ pub(super) const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 
 /// Scope every instrument below is registered under.
 ///
-/// The same string as `SERVICE_NAME` in `main.rs`, which is what this crate's
-/// traces are scoped under. The constant cannot literally be shared: `main.rs`
-/// is the binary and this is the library, and a metric recorded under a
-/// different scope than its trace would not join up in a collector.
+/// The same string as `SERVICE_NAME` in `main.rs`. This crate's traces are
+/// scoped under that string. The constant cannot literally be shared. `main.rs`
+/// is the binary and this is the library. A metric recorded under a different
+/// scope than its trace would not join up in a collector.
 const TELEMETRY_SCOPE: &str = "tele-s3";
 
 /// Rate limits this process hit, by Telegram's error name and by our own
-/// operation. A count is the number an operator can put next to the
-/// concurrency and timeout settings; the split by name is what separates an
-/// ordinary `FLOOD_WAIT` from a `FLOOD_PREMIUM_WAIT`, which is a different
-/// problem with a different fix.
+/// operation.
+///
+/// A count is the number an operator can put next to the concurrency and
+/// timeout settings. The split by name separates an ordinary `FLOOD_WAIT`
+/// from a `FLOOD_PREMIUM_WAIT`. The two are different problems with different
+/// fixes.
 const FLOOD_LIMIT_COUNTER: &str = "tele_s3.telegram.flood_limits";
 
 /// How long each rate-limit window actually slept, in seconds.
 ///
-/// The distribution, not the count: a single mean tells an operator nothing
-/// about whether the retry budget can absorb the waits Telegram is asking for.
+/// The distribution, not the count. A single mean tells an operator nothing
+/// about whether the retry budget can absorb the waits Telegram asks for.
 const FLOOD_WAIT_HISTOGRAM: &str = "tele_s3.telegram.flood_wait_duration";
 
 /// Outbound Telegram RPCs, by operation and outcome.
@@ -141,8 +145,10 @@ enum RpcOutcome {
 }
 
 impl RpcOutcome {
-    /// The wire value of an outcome attribute: a closed vocabulary, so a
-    /// collector can group on it without parsing prose.
+    /// The wire value of an outcome attribute.
+    ///
+    /// It is a closed vocabulary. A collector can group on it without parsing
+    /// prose.
     fn as_str(self) -> &'static str {
         match self {
             RpcOutcome::Ok => "ok",
@@ -154,8 +160,8 @@ impl RpcOutcome {
 
 /// Attributes every rate-limit hit is recorded under.
 ///
-/// Pure, so the vocabulary an operator queries by is testable without a meter,
-/// a reader or a collector behind it.
+/// Pure. The vocabulary an operator queries by is testable without a meter, a
+/// reader, or a collector behind it.
 fn flood_limit_attributes(telegram_error: &str, operation: &str) -> [KeyValue; 2] {
     [
         KeyValue::new("telegram_error", telegram_error.to_owned()),
@@ -166,9 +172,10 @@ fn flood_limit_attributes(telegram_error: &str, operation: &str) -> [KeyValue; 2
 /// Attributes every rate-limit wait is recorded under.
 ///
 /// The wait is attributed to the operation that had to sit through it and to
-/// the peer it was addressed to — the two facts that make a process-wide
-/// guard diagnosable — rather than to whichever request happened to hold the
-/// window open, which the guard deliberately does not remember.
+/// the peer it was addressed to. Those are the two facts that make a
+/// process-wide guard diagnosable. They are not attributed to whichever
+/// request happened to hold the window open. The guard deliberately does not
+/// remember that request.
 fn flood_wait_attributes(operation: &str, peer: &str) -> [KeyValue; 2] {
     [
         KeyValue::new("operation", operation.to_owned()),
@@ -186,11 +193,11 @@ fn rpc_attributes(operation: &str, outcome: RpcOutcome) -> [KeyValue; 2] {
 
 /// The instruments this crate records through.
 ///
-/// Built from the process-wide meter, which is a no-op meter until
-/// `main.rs` installs a meter provider — and it installs one only when an
-/// OTLP endpoint is configured. So the default, self-hosted deployment
-/// records nothing, exports nothing and starts no thread, and the calls below
-/// cost a no-op dispatch rather than an aggregation.
+/// Built from the process-wide meter. That meter is a no-op meter until
+/// `main.rs` installs a meter provider. It installs one only when an OTLP
+/// endpoint is configured. So the default, self-hosted deployment records
+/// nothing. It exports nothing. It starts no thread. The calls below cost a
+/// no-op dispatch rather than an aggregation.
 #[derive(Clone)]
 struct TelegramMetrics {
     flood_limits: Counter<u64>,
@@ -258,17 +265,20 @@ type BoxedStream =
 
 /// Resource bounds applied to every outbound Telegram request.
 ///
-/// The defaults keep a single-object workload behaving as it did before —
-/// nothing was in flight concurrently in that shape, and no request took
-/// anywhere near two minutes — while stopping an unbounded fan-out from
-/// opening a burst and a wedged RPC from pinning a request forever.
+/// The defaults keep a single-object workload behaving as it did before.
+/// Nothing was in flight concurrently in that shape. No request took anywhere
+/// near two minutes. The defaults also stop an unbounded fan-out from opening
+/// a burst. They stop a wedged RPC from pinning a request forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrammersLimits {
-    /// Maximum number of Telegram operations in flight at once. Zero or an
-    /// absurd value is clamped by [`GrammersLimits::sanitized`].
+    /// Maximum number of Telegram operations in flight at once.
+    ///
+    /// Zero or an absurd value is clamped by [`GrammersLimits::sanitized`].
     pub max_concurrent_requests: usize,
-    /// Deadline for one request, counted from the moment its concurrency
-    /// permit is held (queueing behind other callers is not charged to it).
+    /// Deadline for one request.
+    ///
+    /// Counted from the moment its concurrency permit is held. Queueing
+    /// behind other callers is not charged to it.
     pub io_timeout: Duration,
     /// Maximum attempts per retry loop, the first try included.
     pub max_attempts: u32,
@@ -285,10 +295,10 @@ impl Default for GrammersLimits {
 }
 
 impl GrammersLimits {
-    /// Clamp operator-supplied values into ranges that cannot wedge or
-    /// panic the runtime: zero permits or a zero deadline would stall every
-    /// request forever, and [`Semaphore::new`] panics above
-    /// [`Semaphore::MAX_PERMITS`].
+    /// Clamp operator-supplied values into safe ranges.
+    ///
+    /// Zero permits or a zero deadline would stall every request forever.
+    /// [`Semaphore::new`] panics above [`Semaphore::MAX_PERMITS`].
     #[must_use]
     pub fn sanitized(mut self) -> Self {
         self.max_concurrent_requests = self
@@ -313,17 +323,16 @@ pub struct GrammersConfig {
     #[allow(missing_docs)]
     /// Where the `MTProto` session (auth keys and DC state) is persisted.
     ///
-    /// Not the object metadata store, although `main` passes it the same
-    /// connection. The tables are created on first use, and losing this
-    /// database costs a re-login rather than data: the bytes are messages in
-    /// the peer, and only the keys naming them live in the metadata store.
+    /// Not the object metadata store. `main` passes it the same connection.
+    /// The tables are created on first use. Losing this database costs a
+    /// re-login rather than data. The bytes are messages in the peer. Only
+    /// the keys naming them live in the metadata store.
     pub db: DatabaseConnection,
-    /// The chat every object is stored in, resolved once at
-    /// [`Grammers::init`].
+    /// The chat every object is stored in.
     ///
-    /// A key is a message id in *this* chat, so an instance built for a
-    /// different `username` cannot read objects written by another — the
-    /// message ids simply do not name the same messages.
+    /// Resolved once at [`Grammers::init`]. A key is a message id in this
+    /// chat. An instance built for a different `username` cannot read objects
+    /// written by another. The message ids do not name the same messages.
     pub username: String,
     /// Outbound concurrency bound, per-request deadline and retry budget.
     pub limits: GrammersLimits,
@@ -337,8 +346,9 @@ pub struct Grammers {
     sender_pool_handle: SenderPoolFatHandle,
     peer: PeerRef,
     flood_guard: Arc<Mutex<Option<Instant>>>,
-    /// Bounds how many Telegram operations may be in flight at once, however
-    /// many callers the layer above fans out.
+    /// Bounds how many Telegram operations may be in flight at once.
+    ///
+    /// It bounds them however many callers the layer above fans out.
     inflight: Arc<Semaphore>,
     limits: GrammersLimits,
     metrics: TelegramMetrics,
@@ -347,21 +357,22 @@ pub struct Grammers {
 /// What a failed Telegram RPC means for the calling retry loop.
 #[derive(Debug, PartialEq, Eq)]
 enum RpcFailure {
-    /// A timed rate limit: sleep `Duration` and try the same request again.
+    /// A timed rate limit. Sleep `Duration` and try the same request again.
     FloodWait(Duration),
-    /// A rate-limit variant carrying no duration; it cannot be waited out
-    /// here, so the request fails.
+    /// A rate-limit variant carrying no duration.
+    ///
+    /// It cannot be waited out here. The request fails.
     FloodWithoutDuration { name: String },
-    /// Not a rate limit; the request fails.
+    /// Not a rate limit. The request fails.
     Fatal,
 }
 
 /// Classify a server-reported RPC error.
 ///
-/// `value` is the integer the server appended to the error name, i.e. the
+/// `value` is the integer the server appended to the error name. It is the
 /// required wait in seconds for every timed rate-limit variant. One extra
 /// second of slack keeps a retry from landing inside the same window.
-/// Pure: no connection, no clock.
+/// Pure. No connection. No clock.
 fn classify_rpc_error(code: i32, name: &str, value: Option<u32>) -> RpcFailure {
     if code != FLOOD_ERROR_CODE {
         return RpcFailure::Fatal;
@@ -386,19 +397,23 @@ enum Attempt {
 
 /// How a declared `size` is cut into Telegram parts.
 ///
-/// The whole of the size accounting [`Grammers::write`] performs, with no
-/// reader and no client in it, so both sides of the "exactly `size` bytes"
-/// contract and the arithmetic at a [`PART_SIZE`] boundary are testable
-/// without a Telegram session.
+/// The whole size accounting [`Grammers::write`] performs. No reader and no
+/// client are in it. Both sides of the "exactly `size` bytes" contract are
+/// testable. The arithmetic at a [`PART_SIZE`] boundary is testable. No
+/// Telegram session is needed.
 #[derive(Debug, PartialEq, Eq)]
 struct BodyPlan {
     /// `file_total_parts` for the upload, and `parts` for the finished one.
     total_parts: i32,
-    /// The declared length, kept so the over-long error can name the number
-    /// the body was measured against.
+    /// The declared length.
+    ///
+    /// Kept so the over-long error can name the number the body was measured
+    /// against.
     declared: u64,
-    /// The length of each part, in upload order. Empty for a zero-byte body,
-    /// which is uploaded as no parts at all.
+    /// The length of each part, in upload order.
+    ///
+    /// Empty for a zero-byte body. A zero-byte body is uploaded as no parts
+    /// at all.
     lengths: Vec<usize>,
 }
 
@@ -406,7 +421,7 @@ impl BodyPlan {
     /// Cut `size` bytes into full parts plus at most one short trailing part.
     ///
     /// A `size` that is an exact multiple of [`PART_SIZE`] gets no short
-    /// part; one byte more gets a one-byte one. A zero `size` gets neither.
+    /// part. One byte more gets a one-byte part. A zero `size` gets neither.
     fn for_size(size: usize) -> Self {
         let mut lengths = Vec::with_capacity(size.div_ceil(PART_SIZE));
         let mut remaining = size;
@@ -427,20 +442,20 @@ impl BodyPlan {
 
 /// The reader carried on past the `size` the write declared.
 ///
-/// Deliberately *not* [`BackendError::ExceedLimitSize`]: that variant means
-/// "this object will not fit, send less", and it is the only one whose
-/// message reaches the client. The object the caller asked for fits — what
-/// disagrees is the body with its own declared length, and only a single byte
-/// past the end is ever read, so there is no honest `actual` to report and no
-/// advice that would help the caller.
+/// Deliberately not [`BackendError::ExceedLimitSize`]. That variant means
+/// "this object will not fit, send less". It is the only one whose message
+/// reaches the client. The object the caller asked for fits. What disagrees is
+/// the body with its own declared length. Only a single byte past the end is
+/// ever read. So there is no honest `actual` to report. No advice would help
+/// the caller.
 ///
 /// It is also not claimed to be a client error. `write` cannot tell a client
 /// that overran its `Content-Length` from a caller above it that passed the
-/// wrong `size`, and attributing the fault would be a guess. So it is an
-/// ordinary backend failure and lands on `InternalError` through the existing
-/// catch-all mapping, which keeps the reason as the error's `source` for the
-/// logs. Logged here as well, because the response deliberately does not
-/// carry it and this is the one place both numbers are in hand.
+/// wrong `size`. Attributing the fault would be a guess. So it is an ordinary
+/// backend failure. It lands on `InternalError` through the existing catch-all
+/// mapping. That mapping keeps the reason as the error's `source` for the
+/// logs. The reason is logged here too. The response deliberately does not
+/// carry it. This is the one place both numbers are in hand.
 fn overlong_body(size: u64) -> BackendError {
     tracing::error!(
         declared_bytes = size,
@@ -458,7 +473,7 @@ fn overlong_body(size: u64) -> BackendError {
 
 /// Account for the attempt that just failed. `attempt` is 1-based.
 ///
-/// Pure: the loop feeds it its own counter, so no clock is involved.
+/// Pure. The loop feeds it its own counter. No clock is involved.
 fn next_attempt(attempt: u32, max_attempts: u32) -> Attempt {
     if attempt < max_attempts {
         Attempt::Retry
@@ -467,74 +482,80 @@ fn next_attempt(attempt: u32, max_attempts: u32) -> Attempt {
     }
 }
 
-/// Outcome of one outbound Telegram request, after the concurrency bound and
-/// the per-request deadline have been applied.
+/// Outcome of one outbound Telegram request.
+///
+/// The concurrency bound and the per-request deadline have been applied.
 enum AttemptError {
     /// The server (or the transport) rejected the request.
     Rpc(Box<InvocationError>),
-    /// The request outlived its deadline. Not retryable: the server may
-    /// still complete a request we stopped waiting for, and re-sending it
-    /// is not always safe — a timed-out `send_message` would duplicate the
-    /// message.
+    /// The request outlived its deadline.
+    ///
+    /// Not retryable. The server may still complete a request we stopped
+    /// waiting for. Re-sending it is not always safe. A timed-out
+    /// `send_message` would duplicate the message.
     Timeout(Duration),
 }
 
 /// Whether the publish step of [`Grammers::write`] left a message behind.
 ///
-/// The upload is already complete when the message is published, so the only
-/// question this answers is whether the chat may now be holding a message
-/// that nothing else in the system knows about.
+/// The upload is already complete when the message is published. So the only
+/// question this answers is whether the chat may now hold a message that
+/// nothing else in the system knows about.
 #[derive(Debug, PartialEq, Eq)]
 enum PublishOutcome {
-    /// Nothing was published: the request never reached Telegram, or
-    /// Telegram answered it with an error. The bytes are unreferenced part
-    /// state that the server reclaims on its own.
+    /// Nothing was published.
+    ///
+    /// The request never reached Telegram. Or Telegram answered it with an
+    /// error. The bytes are unreferenced part state that the server reclaims
+    /// on its own.
     NothingPublished,
-    /// A message may exist in the peer chat holding the uploaded bytes,
-    /// with no key and therefore no metadata row naming it.
+    /// A message may exist in the peer chat holding the uploaded bytes.
+    ///
+    /// It has no key. So no metadata row names it.
     PossiblyPublished,
 }
 
-/// How the publish step of [`Grammers::write`] failed, without any client type
-/// in it.
+/// How the publish step of [`Grammers::write`] failed.
 ///
-/// Deliberately separate from [`AttemptError`]: the classification below must
-/// be exercisable with no session, no connection and no Telegram server, and
-/// only the conversion needs to know what an [`InvocationError`] is.
+/// No client type is in it. Deliberately separate from [`AttemptError`]. The
+/// classification below must be exercisable with no session, no connection, and
+/// no Telegram server. Only the conversion needs to know what an
+/// [`InvocationError`] is.
 #[derive(Debug, PartialEq, Eq)]
 enum PublishFailure {
     /// Telegram returned an error for this request.
     Rejected { rpc_error: String },
     /// The request outlived the per-request deadline after it was dispatched.
     TimedOut { after: Duration },
-    /// The request failed below the RPC layer once it was on the wire, so the
-    /// server may already have created the message. `kind` names the layer
+    /// The request failed below the RPC layer once it was on the wire.
+    ///
+    /// The server may already have created the message. `kind` names the layer
     /// for the log.
     ResponseLost { kind: &'static str },
 }
 
 /// Which publish failures may have created a message.
 ///
-/// The rule is deliberately one-sided: only a rejection Telegram reported for
-/// *this* request is treated as proof that nothing was published. A deadline
-/// and every failure below the RPC layer leave the outcome unknown, so they
-/// are classified [`PublishOutcome::PossiblyPublished`] and the operator is
-/// handed the identifiers to look for.
+/// The rule is deliberately one-sided. Only a rejection Telegram reported for
+/// this request counts as proof that nothing was published. A deadline and
+/// every failure below the RPC layer leave the outcome unknown. They are
+/// classified [`PublishOutcome::PossiblyPublished`]. The operator is handed the
+/// identifiers to look for.
 ///
 /// What is coarse about it:
 ///
 /// * `InvocationError::Session` usually means the request was never
-///   dispatched — the session was consulted before the peer was known — so
-///   classifying it as possibly published is the conservative over-approximation
-///   rather than a claim that a message exists.
-/// * The reverse coarseness sits on the other arm: Telegram's own error
-///   contract does not forbid a server-side error *after* the side effect,
-///   so [`PublishOutcome::NothingPublished`] really means "Telegram
-///   reported no error for this request", not "no message exists".
+///   dispatched. The session was consulted before the peer was known. So
+///   classifying it as possibly published is the conservative
+///   over-approximation. It is not a claim that a message exists.
+/// * The reverse coarseness sits on the other arm. Telegram's own error
+///   contract does not forbid a server-side error after the side effect. So
+///   [`PublishOutcome::NothingPublished`] really means "Telegram reported no
+///   error for this request". It does not mean "no message exists".
 ///
-/// Either way no retry can repair it: `MTProto` offers no idempotency key for
-/// message creation, so re-sending an ambiguous `send_message` risks
-/// publishing the object twice. See [`Grammers::write`].
+/// Either way no retry can repair it. `MTProto` offers no idempotency key for
+/// message creation. Re-sending an ambiguous `send_message` risks publishing
+/// the object twice. See [`Grammers::write`].
 fn classify_publish_failure(failure: &PublishFailure) -> PublishOutcome {
     match failure {
         PublishFailure::Rejected { .. } => PublishOutcome::NothingPublished,
@@ -545,8 +566,9 @@ fn classify_publish_failure(failure: &PublishFailure) -> PublishOutcome {
 }
 
 impl PublishFailure {
-    /// Name the layer that lost the response, without guessing where it was
-    /// lost.
+    /// Name the layer that lost the response.
+    ///
+    /// It does not guess where the response was lost.
     fn from_attempt(err: &AttemptError) -> Self {
         match err {
             AttemptError::Timeout(after) => PublishFailure::TimedOut { after: *after },
@@ -564,8 +586,8 @@ impl PublishFailure {
                 InvocationError::Transport(_) => PublishFailure::ResponseLost { kind: "transport" },
                 // `Session`, `Dropped`, `InvalidDc`, `Authentication` and any
                 // variant a later grammers adds: none of them is a statement
-                // from the server that it refused the create, so none is
-                // allowed to claim the upload published nothing.
+                // from the server that it refused the create. So none is allowed
+                // to claim the upload published nothing.
                 _ => PublishFailure::ResponseLost {
                     kind: "uncategorised",
                 },
@@ -589,23 +611,28 @@ impl PublishFailure {
 
 /// Why [`Grammers::write`] published no message and can name no key.
 enum PublishFault {
-    /// The request was never dispatched — a local fault, here the flood
-    /// guard's mutex. Nothing reached Telegram, so nothing was published.
+    /// The request was never dispatched.
+    ///
+    /// A local fault, here the flood guard's mutex. Nothing reached Telegram.
+    /// So nothing was published.
     NotDispatched(BackendError),
-    /// The request was dispatched and failed. Whether a message exists
-    /// depends on the failure; see [`classify_publish_failure`].
+    /// The request was dispatched and failed.
+    ///
+    /// Whether a message exists depends on the failure. See
+    /// [`classify_publish_failure`].
     Dispatched(PublishFailure),
 }
 
-/// Turn a publish fault into the caller's error, logging the only record of
-/// a possible orphan.
+/// Turn a publish fault into the caller's error.
 ///
-/// `file_id` and `name` are the upload's coordinates: on the ambiguous
-/// outcomes a message holding those bytes may be sitting in the peer chat
-/// with no key pointing at it, so no metadata row exists and
-/// `reconcile_orphan_blobs` — which drops rows, not backend objects — can
-/// never see it. They are written here and nowhere else, which makes this log
-/// line the operator's only way to find and delete that message by hand.
+/// It logs the only record of a possible orphan.
+///
+/// `file_id` and `name` are the upload's coordinates. On the ambiguous
+/// outcomes a message holding those bytes may sit in the peer chat. It has no
+/// key pointing at it. So no metadata row exists.
+/// `reconcile_orphan_blobs` drops rows, not backend objects. It can never see
+/// it. The coordinates are written here and nowhere else. This log line is the
+/// operator's only way to find and delete that message by hand.
 fn unpublished_upload(fault: PublishFault, file_id: i64, name: &str) -> BackendError {
     match fault {
         PublishFault::NotDispatched(err) => err,
@@ -628,17 +655,21 @@ fn unpublished_upload(fault: PublishFault, file_id: i64, name: &str) -> BackendE
 
 /// Why a [`Grammers`] key could not be turned into a message to fetch.
 ///
-/// Split out of [`Grammers::read`] and given its own mapping into
-/// [`ReadOutcome`] so the decision is testable without a live Telegram
-/// session: the two facts here are all the classification depends on, and
-/// only obtaining them needs a client.
+/// Split out of [`Grammers::read`]. Given its own mapping into
+/// [`ReadOutcome`]. The decision is testable without a live Telegram session.
+/// The two facts here are all the classification depends on. Only obtaining
+/// them needs a client.
 #[derive(Debug, PartialEq, Eq)]
 enum KeyFault {
-    /// The key is not a message id, so it is not one this backend minted.
-    /// A key from another backend lands here too.
+    /// The key is not a message id.
+    ///
+    /// So it is not one this backend minted. A key from another backend lands
+    /// here too.
     Unaddressable,
-    /// The message exists but carries no media, so there is nothing to
-    /// stream. The object is present and unreadable, not absent.
+    /// The message exists but carries no media.
+    ///
+    /// So there is nothing to stream. The object is present and unreadable, not
+    /// absent.
     NoMedia,
 }
 
@@ -657,13 +688,13 @@ impl From<KeyFault> for ReadOutcome {
 
 /// The event a Telegram rate limit produces when it asked for a wait.
 ///
-/// `telegram_error` is Telegram's own name for the failure — `FLOOD_WAIT_5`,
-/// `FLOOD_PREMIUM_WAIT_X` — and it is deliberately *not* `operation`:
-/// `operation` names which of ours was in flight, and overloading the two
-/// makes the query "was this a `FLOOD_PREMIUM`, or a write that got blocked?"
-/// unanswerable.
+/// `telegram_error` is Telegram's own name for the failure. Examples:
+/// `FLOOD_WAIT_5`, `FLOOD_PREMIUM_WAIT_X`. It is deliberately not
+/// `operation`. `operation` names which of ours was in flight. Overloading the
+/// two makes the query "was this a `FLOOD_PREMIUM`, or a write that got
+/// blocked?" unanswerable.
 ///
-/// Pure, so the event's shape is testable without a `Grammers`, a client or a
+/// Pure. The event's shape is testable without a `Grammers`, a client, or a
 /// Telegram session behind it.
 fn log_flood_hit(operation: &str, peer: &str, telegram_error: &str, code: i32, wait: Duration) {
     tracing::warn!(
@@ -678,9 +709,9 @@ fn log_flood_hit(operation: &str, peer: &str, telegram_error: &str, code: i32, w
 
 /// The event a Telegram rate limit produces when it named no wait at all.
 ///
-/// The anomalous case: the server refused the request and would not say for
-/// how long, so there is nothing to sleep off and nothing to retry into. It
-/// used to produce no event at all, which left the operator with only the
+/// The anomalous case. The server refused the request and would not say for
+/// how long. So there is nothing to sleep off and nothing to retry into. It
+/// used to produce no event at all. That left the operator with only the
 /// genericised `BackendError::Other` a caller sees.
 fn log_flood_without_duration(operation: &str, peer: &str, telegram_error: &str, code: i32) {
     tracing::warn!(
@@ -693,8 +724,9 @@ fn log_flood_without_duration(operation: &str, peer: &str, telegram_error: &str,
     );
 }
 
-/// The event a flood-guard wait produces, inside [`Grammers::sleep_off_flood`]'s
-/// span.
+/// The event a flood-guard wait produces.
+///
+/// It is produced inside [`Grammers::sleep_off_flood`]'s span.
 fn log_flood_wait(operation: &str, peer: &str, waited: Duration) {
     tracing::warn!(
         operation,
@@ -704,12 +736,13 @@ fn log_flood_wait(operation: &str, peer: &str, waited: Duration) {
     );
 }
 
-/// The flood guard's mutex is poisoned, so its bookkeeping is of unknown
-/// consistency for the life of the process.
+/// The flood guard's mutex is poisoned.
+///
+/// Its bookkeeping is of unknown consistency for the life of the process.
 ///
 /// The `detail`/`lock` a permanent fault carries is deliberately kept out of
-/// the response the client sees, which leaves the log as the only place it
-/// is ever written down — so it is written here, where the lock is named.
+/// the response the client sees. That leaves the log as the only place it is
+/// ever written down. So it is written here, where the lock is named.
 fn poisoned_flood_guard() -> BackendError {
     tracing::error!(
         lock = "flood_guard",
@@ -724,23 +757,24 @@ fn poisoned_flood_guard() -> BackendError {
 /// Resolve a key to the message id to fetch.
 ///
 /// `Err` carries the [`ReadOutcome`] to report. A key this backend cannot
-/// address is [`ReadOutcome::Fault`] and never [`ReadOutcome::Missing`]:
-/// saying the object is absent would tell the operator it was deleted when
-/// in fact it was never one of ours to delete.
+/// address is [`ReadOutcome::Fault`]. It is never [`ReadOutcome::Missing`].
+/// Saying the object is absent would tell the operator it was deleted. In
+/// fact it was never one of ours to delete.
 ///
-/// Pure, so the malformed-key decision is testable without a client.
+/// Pure. The malformed-key decision is testable without a client.
 fn resolve_key(key: &str) -> Result<i32, ReadOutcome> {
     key.parse::<i32>()
         .map_err(|_| KeyFault::Unaddressable.into())
 }
 
-/// The message id a `delete` should target, or `None` when the key names
-/// nothing this backend wrote.
+/// The message id a `delete` should target.
 ///
-/// Deliberately the opposite of [`resolve_key`]: where `read` calls an
-/// unparseable key a fault, `delete` calls it absent, because the idempotency
-/// contract makes deleting something that is not there a success. Pure, so
-/// that half of the contract is testable without a client.
+/// `None` when the key names nothing this backend wrote.
+///
+/// Deliberately the opposite of [`resolve_key`]. Where `read` calls an
+/// unparseable key a fault, `delete` calls it absent. The idempotency
+/// contract makes deleting something that is not there a success. Pure. That
+/// half of the contract is testable without a client.
 fn delete_target(key: &str) -> Option<i32> {
     key.parse::<i32>().ok()
 }
@@ -758,48 +792,49 @@ impl AttemptError {
 
 /// Name a caller-supplied publish identifier publishes under.
 ///
-/// The published file name is the caller's identifier and nothing else: the
-/// caller recorded it as a publish intent before this write, so a publish
-/// whose answer was lost is still findable by this exact string. Pure, so
-/// the "the name is the identifier" contract is testable without a session.
+/// The published file name is the caller's identifier and nothing else. The
+/// caller recorded it as a publish intent before this write. So a publish
+/// whose answer was lost is still findable by this exact string. Pure. The
+/// "the name is the identifier" contract is testable without a session.
 fn publish_name(publish_id: &str) -> &str {
     publish_id
 }
 
 /// Whether an attachment's file name is the publish being looked for.
 ///
-/// The name is the *only* coordinate a lost publish can be found by, so the
-/// comparison is exact and whole: no prefix match (a partial match would
-/// happily delete the wrong message), no case folding (Telegram preserves the
-/// name, so the caller must match what it sent), and no trimming.
+/// The name is the only coordinate a lost publish can be found by. So the
+/// comparison is exact and whole. No prefix match. A partial match would
+/// happily delete the wrong message. No case folding. Telegram preserves the
+/// name. The caller must match what it sent. No trimming.
 fn attachment_is_publish(file_name: Option<&str>, publish_id: &str) -> bool {
     file_name == Some(publish_id)
 }
 
 impl Grammers {
-    /// Upload the parts `plan` describes from `reader`, then prove the reader
-    /// really ended.
+    /// Upload the parts `plan` describes from `reader`.
     ///
-    /// Split out of [`Grammers::write`] with the client reached only through
-    /// `upload_part`, so the size accounting and both directions of the
-    /// "exactly `size` bytes" contract are exercisable with a fake and no
-    /// Telegram session.
+    /// Then prove the reader really ended.
+    ///
+    /// Split out of [`Grammers::write`]. The client is reached only through
+    /// `upload_part`. So the size accounting and both directions of the
+    /// "exactly `size` bytes" contract are exercisable with a fake. No
+    /// Telegram session is needed.
     ///
     /// The declared length is enforced on both sides. Short: a part is filled
-    /// with `read_exact`, so a body that ends early fails here. Long: once
-    /// the last planned part is in, one more byte is read — a body that still
-    /// has one is over-long and fails.
+    /// with `read_exact`. So a body that ends early fails here. Long: once the
+    /// last planned part is in, one more byte is read. A body that still has
+    /// one is over-long and fails.
     ///
-    /// That order is the whole point. The over-long check is only sound
-    /// *after* the parts are up, because a stream that has not been read past
-    /// its declared end cannot be shown to have ended there. In exchange the
-    /// check still runs before the message is sent, so nothing is published:
-    /// what is left behind is Telegram-side part state under a `file_id` no
-    /// message references, which the server reclaims on its own. No key is
-    /// ever returned for it, so the reconciler — which drops metadata *rows*,
-    /// not backend objects — has nothing to see and nothing to miss. The
-    /// residual window is that orphaned part state, and it holds no bytes the
-    /// caller can reach.
+    /// That order is the whole point. The over-long check is only sound after
+    /// the parts are up. A stream that has not been read past its declared end
+    /// cannot be shown to have ended there. In exchange the check still runs
+    /// before the message is sent. So nothing is published. What is left behind
+    /// is Telegram-side part state under a `file_id` no message references.
+    /// The server reclaims that state on its own. No key is ever returned for
+    /// it. So the reconciler has nothing to see and nothing to miss. The
+    /// reconciler drops metadata rows, not backend objects. The residual
+    /// window is that orphaned part state. It holds no bytes the caller can
+    /// reach.
     async fn upload_parts<R, F, Fut>(
         reader: &mut R,
         plan: &BodyPlan,
@@ -830,9 +865,9 @@ impl Grammers {
         }
 
         // The declared `size` is now uploaded. One byte more is all it takes
-        // to tell a body that ended at `size` from one that did not, and a
-        // byte here means the trailing bytes would otherwise be dropped with
-        // no error and a key returned for a short object.
+        // to tell a body that ended at `size` from one that did not. A byte
+        // here means the trailing bytes would otherwise be dropped with no
+        // error. A key would be returned for a short object.
         let mut trailing = [0u8; 1];
         let overlong = reader
             .read(&mut trailing)
@@ -912,13 +947,14 @@ impl Grammers {
         })
     }
 
-    /// The chat every request this backend makes is addressed to, as
-    /// Telegram's own dialog id.
+    /// The chat every request this backend makes is addressed to.
     ///
-    /// The flood guard is one process-wide mutex, so a rate limit one request
-    /// draws holds up every *other* request too. That is what makes the peer
-    /// worth naming on a flood: an operator reading one chat's rate limit has
-    /// to be able to tell which chat drew it.
+    /// Given as Telegram's own dialog id.
+    ///
+    /// The flood guard is one process-wide mutex. A rate limit one request
+    /// draws holds up every other request too. That is what makes the peer
+    /// worth naming on a flood. An operator reading one chat's rate limit has
+    /// to tell which chat drew it.
     fn peer_name(&self) -> String {
         self.peer.id.to_string()
     }
@@ -929,13 +965,14 @@ impl Grammers {
         self.sender_pool_handle.quit();
     }
 
-    /// Sleep off whatever the flood guard is holding, and say so in its own
-    /// span.
+    /// Sleep off whatever the flood guard is holding.
     ///
-    /// The span is the point: a wait is a thing that happened, with a
-    /// duration, and an operator tuning the concurrency and timeout knobs
-    /// needs to find one wait and read it rather than infer it from an event
-    /// riding whichever request span happened to be current.
+    /// Say so in its own span.
+    ///
+    /// The span is the point. A wait is a thing that happened, with a
+    /// duration. An operator tuning the concurrency and timeout knobs needs to
+    /// find one wait and read it. Inferring it from an event riding whichever
+    /// request span happened to be current is not enough.
     #[instrument(
         name = "telegram.flood_wait",
         skip(self, peer),
@@ -949,8 +986,8 @@ impl Grammers {
 
     /// Sleep off the remaining rate-limit window, if one is still in force.
     ///
-    /// `operation` is the operation about to go out — the one that has to sit
-    /// through whatever window another request opened.
+    /// `operation` is the operation about to go out. It is the one that has to
+    /// sit through whatever window another request opened.
     async fn check_flood_wait(&self, operation: &str) -> Result<(), BackendError> {
         let wait_time = {
             let guard = self
@@ -980,12 +1017,13 @@ impl Grammers {
         Ok(())
     }
 
-    /// Turn a server error into a retry decision, recording whatever it was.
+    /// Turn a server error into a retry decision.
+    ///
+    /// It records whatever it was.
     ///
     /// `operation` is the operation that was in flight when the server
-    /// answered, which is the fact that makes the process-wide guard
-    /// diagnosable: the same 420 means something quite different depending on
-    /// which request drew it.
+    /// answered. That fact makes the process-wide guard diagnosable. The same
+    /// 420 means something quite different depending on which request drew it.
     async fn catch_flood_error(
         &self,
         err: &InvocationError,
@@ -1014,8 +1052,8 @@ impl Grammers {
             }
             RpcFailure::FloodWithoutDuration { name } => {
                 // A rate limit the server would not put a duration on. This is
-                // the anomalous case and the one most worth seeing, and it used
-                // to produce no event at all: it became a `BackendError::Other`
+                // the anomalous case and the one most worth seeing. It used to
+                // produce no event at all. It became a `BackendError::Other`
                 // whose wording is genericised away before a client ever sees
                 // it. The request still fails exactly as it did.
                 self.metrics.record_flood(&name, operation);
@@ -1031,19 +1069,19 @@ impl Grammers {
 
     /// Run one outbound Telegram request under both bounds.
     ///
-    /// The permit is taken before the request starts and dropped as soon as
-    /// the attempt ends — the request is never issued without one, so the
-    /// bound holds at the wire and not just in the caller's own accounting.
-    /// It is deliberately *not* held across a flood wait or a retry: a task
-    /// sleeping out a rate limit must never withhold capacity from the
-    /// tasks that are making progress.
+    /// The permit is taken before the request starts. It is dropped as soon as
+    /// the attempt ends. The request is never issued without one. So the bound
+    /// holds at the wire, not just in the caller's own accounting. It is
+    /// deliberately not held across a flood wait or a retry. A task sleeping
+    /// out a rate limit must never withhold capacity from tasks that are
+    /// making progress.
     ///
-    /// A task holds at most one permit and never waits for a second while
-    /// holding one, so the queue can never depend on itself to drain.
+    /// A task holds at most one permit. It never waits for a second while
+    /// holding one. So the queue can never depend on itself to drain.
     ///
-    /// The deadline starts once the permit is held, so time spent queued
-    /// behind other callers is never charged against a request that has not
-    /// started yet.
+    /// The deadline starts once the permit is held. Time spent queued behind
+    /// other callers is never charged against a request that has not started
+    /// yet.
     #[allow(clippy::expect_used)]
     async fn attempt<T, F>(&self, operation: &str, rpc: F) -> Result<T, AttemptError>
     where
@@ -1077,19 +1115,20 @@ impl Grammers {
         }
     }
 
-    /// Fetch the chunk that holds `pos`, or `None` at the end of the media.
+    /// Fetch the chunk that holds `pos`.
     ///
-    /// A fresh `DownloadIter` is built per chunk: it loses its internal
-    /// state after any error (its variant is replaced by `Empty`), so
-    /// reusing one across errors makes `next()` return `Ok(None)` and
-    /// silently truncate the stream — one instance per chunk is the only way
-    /// to resume reliably.
+    /// Returns `None` at the end of the media.
     ///
-    /// Only a long flood is retried, and only within the attempt budget, so
-    /// a media that floods on every chunk fails the caller instead of
-    /// looping forever. A deadline aborts the chunk: the server may still
-    /// deliver it, but the iterator that would resume it is gone, and
-    /// truncating the body silently would be worse than failing.
+    /// A fresh `DownloadIter` is built per chunk. It loses its internal state
+    /// after any error. Its variant is replaced by `Empty`. Reusing one across
+    /// errors makes `next()` return `Ok(None)` and silently truncate the
+    /// stream. One instance per chunk is the only way to resume reliably.
+    ///
+    /// Only a long flood is retried. It is retried only within the attempt
+    /// budget. So a media that floods on every chunk fails the caller. It does
+    /// not loop forever. A deadline aborts the chunk. The server may still
+    /// deliver it. The iterator that would resume it is gone. Truncating the
+    /// body silently would be worse than failing.
     async fn download_chunk(
         &self,
         media: &Media,
@@ -1145,25 +1184,26 @@ impl Grammers {
         }
     }
 
-    /// Id of a recent message in the peer chat whose attachment is named
-    /// exactly `publish_id`.
+    /// Id of a recent message in the peer chat.
     ///
-    /// One bounded walk of [`PUBLISH_LOOKBACK_MESSAGES`] newest messages, each
-    /// step under the same concurrency bound and the same per-request deadline
-    /// as every other outbound request here (`attempt` is what
-    /// [`Grammers::retry_rpc`] uses underneath, and the flood wait is checked
-    /// up front exactly as it does).
+    /// Its attachment is named exactly `publish_id`.
     ///
-    /// The first match wins. A duplicate name would mean two messages holding
-    /// the same bytes under one identifier, which the S3 layer cannot produce:
-    /// `publish_id` is minted from a UUID and the intent row is its primary
-    /// key. So there is nothing a caller could do with a second anyway.
+    /// One bounded walk of [`PUBLISH_LOOKBACK_MESSAGES`] newest messages. Each
+    /// step is under the same concurrency bound and the same per-request
+    /// deadline as every other outbound request here. `attempt` is what
+    /// [`Grammers::retry_rpc`] uses underneath. The flood wait is checked up
+    /// front exactly as it does.
+    ///
+    /// The first match wins. A duplicate name would mean two messages hold the
+    /// same bytes under one identifier. The S3 layer cannot produce that.
+    /// `publish_id` is minted from a UUID. The intent row is its primary key.
+    /// So there is nothing a caller could do with a second anyway.
     ///
     /// # The window
     ///
-    /// Only the newest [`PUBLISH_LOOKBACK_MESSAGES`] messages are examined.
-    /// A publish older than that is reported as not found — see
-    /// [`PUBLISH_LOOKBACK_MESSAGES`] for why that is a deliberate limit and
+    /// Only the newest [`PUBLISH_LOOKBACK_MESSAGES`] messages are examined. A
+    /// publish older than that is reported as not found. See
+    /// [`PUBLISH_LOOKBACK_MESSAGES`] for why that is a deliberate limit. It is
     /// not an oversight.
     async fn find_published_message(&self, publish_id: &str) -> Result<Option<i32>, BackendError> {
         let mut messages = self
@@ -1172,9 +1212,9 @@ impl Grammers {
             .limit(PUBLISH_LOOKBACK_MESSAGES);
 
         loop {
-            // Not `retry_rpc`: that takes a `FnMut` closure, and a future
-            // borrowing `messages` cannot escape one. The bound is applied
-            // through `attempt` instead, which is the same request path.
+            // Not `retry_rpc`: that takes a `FnMut` closure. A future borrowing
+            // `messages` cannot escape one. The bound is applied through
+            // `attempt` instead. That is the same request path.
             self.check_flood_wait("iter_messages").await?;
 
             let message = match self.attempt("iter_messages", messages.next()).await {
@@ -1189,17 +1229,17 @@ impl Grammers {
                     );
                     return Err(AttemptError::Timeout(timeout).into_backend_error());
                 }
-                // A history request that fails is *not* proof that no message
-                // is there: answering "nothing published" off a failed lookup
-                // would clear an intent for bytes that may well be sitting in
-                // the chat. It fails the call instead.
+                // A history request that fails is not proof that no message is
+                // there. Answering "nothing published" off a failed lookup would
+                // clear an intent for bytes that may well sit in the chat. It
+                // fails the call instead.
                 Err(AttemptError::Rpc(err)) => {
                     return Err(AttemptError::Rpc(err).into_backend_error());
                 }
             };
 
-            // Only an attachment can carry a published name; a photo, a
-            // sticker or a text message never can.
+            // Only an attachment can carry a published name. A photo, a
+            // sticker, or a text message never can.
             let Some(Media::Document(document)) = message.media() else {
                 continue;
             };
@@ -1210,13 +1250,15 @@ impl Grammers {
         }
     }
 
-    /// Drive `rpc` until it succeeds, a retryable rate limit clears, or the
-    /// attempt budget runs out.
+    /// Drive `rpc` until it succeeds.
     ///
-    /// Every attempt is preceded by [`Grammers::check_flood_wait`], so the
-    /// window a 420 asked for is always slept off in full before the
-    /// request goes back out. The loop is bounded: a request that keeps
-    /// failing now fails its caller instead of pinning it indefinitely.
+    /// It retries after a retryable rate limit. It stops when the attempt
+    /// budget runs out.
+    ///
+    /// Every attempt is preceded by [`Grammers::check_flood_wait`]. So the
+    /// window a 420 asked for is always slept off in full before the request
+    /// goes back out. The loop is bounded. A request that keeps failing now
+    /// fails its caller. It does not pin the caller indefinitely.
     async fn retry_rpc<T, F, Fut>(
         &self,
         operation: &'static str,
@@ -1276,14 +1318,14 @@ impl Grammers {
 
     /// Publish the uploaded parts as a message in the peer chat.
     ///
-    /// The flood-wait loop is [`Grammers::retry_rpc`]'s: a rate limit is
-    /// slept off and the create is repeated, which is safe because nothing
-    /// has been created yet. Everything else stops the loop, and the failure
-    /// is reported as a [`PublishFault`] rather than flattened into a
-    /// [`BackendError`], because on the ambiguous outcomes the caller must
-    /// learn that a message may exist behind the error.
+    /// The flood-wait loop is [`Grammers::retry_rpc`]'s. A rate limit is
+    /// slept off. The create is repeated. That is safe because nothing has been
+    /// created yet. Everything else stops the loop. The failure is reported as
+    /// a [`PublishFault`]. It is not flattened into a [`BackendError`]. On the
+    /// ambiguous outcomes the caller must learn that a message may exist behind
+    /// the error.
     ///
-    /// Split out of [`Grammers::write`] so the classification in
+    /// Split out of [`Grammers::write`]. So the classification in
     /// [`classify_publish_failure`] is testable with no client in it.
     async fn publish_message(&self, draft: InputMessage) -> Result<Message, PublishFault> {
         let mut attempt: u32 = 0;
@@ -1310,15 +1352,15 @@ impl Grammers {
 
             let failure = PublishFailure::from_attempt(&err);
 
-            // Only a rate limit is retried. A deadline is not: the message
-            // may already have been created and MTProto has no idempotency key
-            // for message creation, so re-sending would publish a duplicate.
+            // Only a rate limit is retried. A deadline is not. The message may
+            // already have been created. MTProto has no idempotency key for
+            // message creation. Re-sending would publish a duplicate.
             let retryable = match &err {
                 AttemptError::Rpc(err) => {
                     match self.catch_flood_error(err, "publish_message").await {
                         Ok(retry) => retry,
                         // A flood wait with no duration is still a rejection of
-                        // this request, so the failure keeps its own wording.
+                        // this request. So the failure keeps its own wording.
                         Err(_) => return Err(PublishFault::Dispatched(failure)),
                     }
                 }
@@ -1364,42 +1406,43 @@ impl Grammers {
 
 #[async_trait]
 impl Backend for Grammers {
-    /// Store `size` bytes as a message in the peer chat and return its id.
+    /// Store `size` bytes as a message in the peer chat.
     ///
-    /// The message is published under `publish_id`, the identifier the caller
-    /// chose and recorded as a publish intent before calling. It is the only
-    /// thing tying an orphaned publish back to this layer, so it must reach
-    /// the wire unchanged.
+    /// Return its id.
+    ///
+    /// The message is published under `publish_id`. That is the identifier the
+    /// caller chose. The caller recorded it as a publish intent before calling.
+    /// It is the only thing tying an orphaned publish back to this layer. So
+    /// it must reach the wire unchanged.
     ///
     /// # The residual window this cannot close
     ///
-    /// The upload and the publish are two requests, and only the first is
+    /// The upload and the publish are two requests. Only the first is
     /// idempotent. Once every part is in, `send_message` turns the uploaded
-    /// bytes into a real message — and it is deliberately not retried on a
-    /// deadline, because `MTProto` offers no idempotency key for message
-    /// creation: a retry after a lost answer risks publishing the object
-    /// twice.
+    /// bytes into a real message. It is deliberately not retried on a
+    /// deadline. `MTProto` offers no idempotency key for message creation. A
+    /// retry after a lost answer risks publishing the object twice.
     ///
-    /// So if the create **succeeds server-side but its answer is lost**, or
-    /// the attempt budget is spent after Telegram has already created the
-    /// message, `write` fails and returns no key. The chat then holds a
-    /// message that nothing in the system points at: no key means no metadata
-    /// row, and `reconcile_orphan_blobs` removes metadata *rows*, not backend
-    /// objects, so it has nothing to see and nothing to miss. That leak is
-    /// **not closed** and cannot be closed by retrying.
+    /// So if the create succeeds server-side but its answer is lost, or the
+    /// attempt budget is spent after Telegram has already created the message,
+    /// `write` fails and returns no key. The chat then holds a message that
+    /// nothing in the system points at. No key means no metadata row.
+    /// `reconcile_orphan_blobs` removes metadata rows, not backend objects.
+    /// So it has nothing to see and nothing to miss. That leak is not closed.
+    /// It cannot be closed by retrying.
     ///
     /// What this function does instead is make it findable.
-    /// [`classify_publish_failure`] separates the outcomes where the answer
-    /// proves nothing was published from the ones where a message may exist,
-    /// and on the ambiguous side [`unpublished_upload`] logs the upload's
-    /// `file_id` and `name` — after this failure those identifiers exist
-    /// nowhere else, so the log is the operator's only way to locate the
-    /// orphan and delete it from the chat by hand.
+    /// `classify_publish_failure` separates the outcomes where the answer
+    /// proves nothing was published from the ones where a message may exist.
+    /// On the ambiguous side `unpublished_upload` logs the upload's `file_id`
+    /// and `name`. After this failure those identifiers exist nowhere else. So
+    /// the log is the operator's only way to locate the orphan and delete it
+    /// from the chat by hand.
     ///
-    /// A follow-up scope owns the real repair: grammers 0.10 does expose
-    /// `search_message`/`search_all_message`, which could find a message that
+    /// A follow-up scope owns the real repair. grammers 0.10 does expose
+    /// `search_message`/`search_all_message`. Those could find a message that
     /// was created without a key and mint one for it. That needs a durable
-    /// record of the intended publish plus a backend-aware reconciler, and is
+    /// record of the intended publish plus a backend-aware reconciler. It is
     /// deliberately out of scope here.
     #[instrument(skip(self, reader), level = "debug", ret, err)]
     async fn write(
@@ -1425,9 +1468,9 @@ impl Backend for Grammers {
         };
 
         // The published file name is the caller's identifier verbatim. It is
-        // deliberately opaque and carries no bucket or key: it becomes
-        // visible in the peer chat, and it is the one coordinate a later
-        // reconciler can search a lost publish by.
+        // deliberately opaque and carries no bucket or key. It becomes visible
+        // in the peer chat. It is the one coordinate a later reconciler can
+        // search a lost publish by.
         let name = publish_name(&publish_id).to_owned();
         let mut compat_reader = reader.compat();
 
@@ -1440,7 +1483,7 @@ impl Backend for Grammers {
             let bytes = bytes.clone();
 
             async move {
-                // Retry the part through flood waits; re-uploading the same
+                // Retry the part through flood waits. Re-uploading the same
                 // part index is idempotent on Telegram's side. Each attempt
                 // carries the same `file_id`/`file_part` and the same bytes.
                 self.retry_rpc("save_big_file_part", || async {
@@ -1472,12 +1515,12 @@ impl Backend for Grammers {
 
         let draft_message = InputMessage::new().file(uploaded).silent(true);
 
-        // The parts are already uploaded, so this is a single metadata RPC
-        // against the peer. It is deliberately *not* retried on a deadline:
-        // the message may still have been created, and sending it again
-        // would publish a duplicate. A failure here reports no key, so the
-        // outcome is classified and, where a message may exist, logged with
-        // the identifiers that name the upload — see the doc comment above.
+        // The parts are already uploaded. So this is a single metadata RPC
+        // against the peer. It is deliberately not retried on a deadline. The
+        // message may still have been created. Sending it again would publish a
+        // duplicate. A failure here reports no key. So the outcome is
+        // classified. Where a message may exist, it is logged with the
+        // identifiers that name the upload. See the doc comment above.
         let message = self
             .publish_message(draft_message)
             .await
@@ -1494,11 +1537,10 @@ impl Backend for Grammers {
         offset: u64,
         limit: Option<u64>,
     ) -> Result<ReadOutcome, BackendError> {
-        // A key this backend cannot address is a fault, not an absence:
-        // saying it is missing would tell the operator the object was
-        // deleted when it was never one of ours. The fault's `detail` never
-        // reaches the client, so it is logged here, where the blob id is
-        // still in hand.
+        // A key this backend cannot address is a fault, not an absence. Saying
+        // it is missing would tell the operator the object was deleted when it
+        // was never one of ours. The fault's `detail` never reaches the
+        // client. So it is logged here, where the blob id is still in hand.
         let message_id = match resolve_key(&key) {
             Ok(message_id) => message_id,
             Err(fault) => {
@@ -1516,9 +1558,9 @@ impl Backend for Grammers {
             .transpose()
             .map_err(|_| BackendError::OutOfRange)?;
 
-        // A long flood wait (> grammers' sleep threshold) surfaces here as
-        // an RPC error; honor it, update the shared guard, and retry so a
-        // read doesn't fail just because another operation tripped the limit.
+        // A long flood wait surfaces here as an RPC error. Honor it. Update
+        // the shared guard. Retry. So a read does not fail just because another
+        // operation tripped the limit.
         let media = self
             .retry_rpc("get_messages_by_id", || async {
                 self.client
@@ -1528,16 +1570,15 @@ impl Backend for Grammers {
             .await?;
         let media = {
             let mut messages = media;
-            // The peer has no message with this id: the object this key
-            // named is genuinely gone. The only case `read` answers
-            // `Missing`.
+            // The peer has no message with this id. The object this key named
+            // is genuinely gone. The only case `read` answers `Missing`.
             let message = match messages.pop().flatten() {
                 Some(v) => v,
                 None => return Ok(ReadOutcome::Missing),
             };
 
-            // The message is there but holds nothing to stream: the object
-            // is unreadable, not absent.
+            // The message is there but holds nothing to stream. The object is
+            // unreadable, not absent.
             if let Some(v) = message.media() { v } else {
                 tracing::error!(
                     key = %key,
@@ -1551,8 +1592,8 @@ impl Backend for Grammers {
         let this = self.clone();
 
         let stream = try_stream! {
-            // Absolute position (relative to media start) of the next byte
-            // to deliver.
+            // Absolute position (relative to media start) of the next byte to
+            // deliver.
             let mut pos = offset;
             let mut bytes_remaining = limit;
 
@@ -1561,9 +1602,9 @@ impl Backend for Grammers {
                     break;
                 }
 
-                // One chunk per iteration, with a fresh download iterator
-                // each time; a real failure aborts the stream so the client
-                // sees a failure instead of a short body.
+                // One chunk per iteration, with a fresh download iterator each
+                // time. A real failure aborts the stream. So the client sees a
+                // failure instead of a short body.
                 let chunk = this
                     .download_chunk(&media, pos)
                     .await
@@ -1609,14 +1650,14 @@ impl Backend for Grammers {
         let message_id = match delete_target(&key) {
             Some(message_id) => message_id,
             // Nothing this backend wrote can be named by a key it cannot
-            // parse, so there is nothing to delete and the idempotency
-            // contract makes that a success.
+            // parse. So there is nothing to delete. The idempotency contract
+            // makes that a success.
             None => return Ok(()),
         };
 
-        // Deleting a message that is already gone succeeds server-side, so
-        // every attempt carries the same request and the loop stays bounded
-        // by the attempt budget.
+        // Deleting a message that is already gone succeeds server-side. So
+        // every attempt carries the same request. The loop stays bounded by
+        // the attempt budget.
         self.retry_rpc("delete_messages", || async {
             self.client
                 .delete_messages(self.peer, &[message_id])
@@ -1626,22 +1667,23 @@ impl Backend for Grammers {
         .await
     }
 
-    /// Walk the recent history of the peer chat looking for a message whose
-    /// attachment is named exactly `publish_id`, and delete it.
+    /// Walk the recent history of the peer chat.
     ///
-    /// The sweep is one bounded pass: at most
-    /// [`PUBLISH_LOOKBACK_MESSAGES`] messages are examined, so the cost of a
-    /// call is fixed rather than a function of how much traffic the chat has
-    /// seen.
+    /// Look for a message whose attachment is named exactly `publish_id`.
+    /// Delete it.
     ///
-    /// Deletion reuses [`Grammers::delete`], so it carries the same retry loop
-    /// and the same idempotency: a message that turns out to have been
-    /// removed already is a successful reclaim, not a failure.
+    /// The sweep is one bounded pass. At most `PUBLISH_LOOKBACK_MESSAGES`
+    /// messages are examined. So the cost of a call is fixed. It is not a
+    /// function of how much traffic the chat has seen.
     ///
-    /// A history request that fails is an `Err`, *not* a
-    /// [`ReclaimOutcome::ReclaimFailed`]: the first is "this call could not
-    /// find out", the second is "something was found and could not be
-    /// removed". Both leave the caller's intent pending, but only the second
+    /// Deletion reuses [`Grammers::delete`]. So it carries the same retry loop
+    /// and the same idempotency. A message that turns out to have been removed
+    /// already is a successful reclaim, not a failure.
+    ///
+    /// A history request that fails is an `Err`. It is not a
+    /// [`ReclaimOutcome::ReclaimFailed`]. The first means "this call could not
+    /// find out". The second means "something was found and could not be
+    /// removed". Both leave the caller's intent pending. Only the second
     /// claims to know a message is still there.
     async fn reclaim_publish(&self, publish_id: String) -> Result<ReclaimOutcome, BackendError> {
         let message_id = self.find_published_message(&publish_id).await?;
@@ -1653,10 +1695,10 @@ impl Backend for Grammers {
         match self.delete(message_id.to_string()).await {
             Ok(()) => Ok(ReclaimOutcome::Reclaimed),
             Err(err) => {
-                // Logged here rather than answered as `Err`: the caller keeps
-                // the intent pending either way, but only this arm says the
-                // message is still sitting in the chat, and that is the fact
-                // an operator needs.
+                // Logged here rather than answered as `Err`. The caller keeps
+                // the intent pending either way. Only this arm says the message
+                // is still sitting in the chat. That is the fact an operator
+                // needs.
                 tracing::warn!(
                     message_id,
                     publish_id = %publish_id,
@@ -1680,8 +1722,8 @@ mod tests {
     #[allow(clippy::expect_used)]
     fn the_published_name_is_the_caller_supplied_identifier() {
         // The orphan-recovery contract: the caller records this identifier
-        // as a publish intent *before* the write, so it must reach the
-        // message name unchanged or a lost publish is unfindable.
+        // as a publish intent *before* the write. So it must reach the message
+        // name unchanged. A lost publish is unfindable otherwise.
         let id = crate::backend::new_publish_id();
 
         assert_eq!(publish_name(&id), id);
@@ -1690,9 +1732,9 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_publish_id_carries_no_user_data() {
-        // The identifier is published in a Telegram chat, so it must not
+        // The identifier is published in a Telegram chat. So it must not
         // embed the bucket or key the object was written for. The generator
-        // takes no such arguments at all; this guards that against a later
+        // takes no such arguments at all. This guards that against a later
         // change to the format.
         let bucket = "customer-private-bucket";
         let key = "invoices/2026/q3-report.pdf";
@@ -1720,8 +1762,8 @@ mod tests {
             "a message with no attachment name cannot be this publish"
         );
 
-        // Nothing looser than equality: a partial or folded match would let
-        // the sweep delete the wrong message, which is unrecoverable.
+        // Nothing looser than equality. A partial or folded match would let
+        // the sweep delete the wrong message. That is unrecoverable.
         let other = crate::backend::new_publish_id();
         assert!(!attachment_is_publish(Some(&other), &id));
         assert!(!attachment_is_publish(Some(&id[..id.len() - 1]), &id));
@@ -1855,8 +1897,8 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_malformed_key_is_a_fault_and_not_an_absence() {
-        // A key minted by another backend reaches `read` too, and it is a
-        // fault: nothing this backend wrote is absent.
+        // A key minted by another backend reaches `read` too. It is a fault.
+        // Nothing this backend wrote is absent.
         let outcome = resolve_key("not-a-message-id").unwrap_err();
 
         match outcome {
@@ -1870,8 +1912,8 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_message_without_media_is_a_fault_and_not_an_absence() {
-        // Reachable only with a live Telegram session, so the decision is
-        // covered here instead: the message exists, so its bytes cannot be
+        // Reachable only with a live Telegram session. So the decision is
+        // covered here instead. The message exists. So its bytes cannot be
         // reported missing.
         assert!(matches!(
             ReadOutcome::from(KeyFault::NoMedia),
@@ -1882,10 +1924,10 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn delete_of_an_unparseable_key_has_nothing_to_target() {
-        // The `delete` half of the idempotency contract: a key this backend
-        // cannot parse names nothing it wrote, so it is already absent and
-        // deleting it succeeds without a request. Reachable only on a live
-        // session for the RPC that follows, so the decision is covered here.
+        // The `delete` half of the idempotency contract. A key this backend
+        // cannot parse names nothing it wrote. So it is already absent.
+        // Deleting it succeeds without a request. Reachable only on a live
+        // session for the RPC that follows. So the decision is covered here.
         assert_eq!(delete_target("42"), Some(42));
         assert_eq!(delete_target("not-a-message-id"), None);
     }
@@ -1893,7 +1935,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_fault_is_distinguishable_from_a_missing_object() {
-        // The whole point of the three-way answer: an operator must be able
+        // The whole point of the three-way answer. An operator must be able
         // to tell a corrupt key from a deleted object in a log line.
         let fault = ReadOutcome::from(KeyFault::NoMedia);
         let missing = ReadOutcome::Missing;
@@ -1906,8 +1948,8 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_rejected_publish_published_nothing() {
-        // Telegram answered this exact request with an error, so no message
-        // was created and there is no orphan to look for.
+        // Telegram answered this exact request with an error. So no message
+        // was created. There is no orphan to look for.
         let failure = PublishFailure::Rejected {
             rpc_error: "CHAT_WRITE_FORBIDDEN".to_owned(),
         };
@@ -1916,8 +1958,8 @@ mod tests {
             classify_publish_failure(&failure),
             PublishOutcome::NothingPublished
         );
-        // A rate limit that never cleared is the same arm: the create was
-        // refused on every attempt, so nothing exists in the chat.
+        // A rate limit that never cleared is the same arm. The create was
+        // refused on every attempt. So nothing exists in the chat.
         let exhausted = PublishFailure::Rejected {
             rpc_error: "FLOOD_WAIT".to_owned(),
         };
@@ -1931,7 +1973,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_publish_that_ran_out_of_time_is_ambiguous() {
-        // The request was dispatched; its answer may have been lost, and the
+        // The request was dispatched. Its answer may have been lost. The
         // message may already be in the chat.
         let failure = PublishFailure::TimedOut {
             after: Duration::from_secs(120),
@@ -1946,8 +1988,8 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_publish_lost_below_the_rpc_layer_is_ambiguous() {
-        // Every layer that fails after dispatch leaves the same question
-        // open, whatever it is called.
+        // Every layer that fails after dispatch leaves the same question open.
+        // Whatever it is called.
         for kind in ["io", "deserialize", "transport", "uncategorised"] {
             assert_eq!(
                 classify_publish_failure(&PublishFailure::ResponseLost { kind }),
@@ -1985,8 +2027,8 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn an_ambiguous_publish_is_logged_with_the_identifiers_of_the_upload() {
-        // The only record of an orphan: no key is returned on this path, so
-        // there is no metadata row and nothing else in the system names the
+        // The only record of an orphan. No key is returned on this path. So
+        // there is no metadata row. Nothing else in the system names the
         // message.
         let log = capture_log(|| {
             let err = unpublished_upload(
@@ -2036,7 +2078,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn a_publish_that_never_left_the_process_keeps_its_own_error() {
-        // A local fault is passed through untouched, and claims nothing was
+        // A local fault is passed through untouched. It claims nothing was
         // published.
         let err = unpublished_upload(
             PublishFault::NotDispatched(BackendError::PoisonedLock {
@@ -2055,12 +2097,12 @@ mod tests {
 
 /// Collect everything `f` writes through `tracing` into a string.
 ///
-/// A subscriber is installed for the closure only, so this needs no global
-/// state and no dependency beyond the `tracing-subscriber` the binary already
-/// uses.
+/// A subscriber is installed for the closure only. So this needs no global
+/// state. It needs no dependency beyond the `tracing-subscriber` the binary
+/// already uses.
 ///
-/// `DEBUG` is enabled so `debug!` events are captured too; the default
-/// subscriber filter would drop them and a field assertion on one would pass
+/// `DEBUG` is enabled so `debug!` events are captured too. The default
+/// subscriber filter would drop them. A field assertion on one would pass
 /// vacuously.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -2115,16 +2157,16 @@ pub(crate) fn capture_log(f: impl FnOnce()) -> String {
 
 /// The field names the crate's events carry, asserted on captured output.
 ///
-/// These check the *names*, not the prose. An event that leaves its data in
-/// the message can be read by a human and counted by nothing, which is the
-/// gap this module exists to keep closed: a later edit that drops a field
-/// fails here rather than silently breaking a downstream exporter.
+/// These check the names, not the prose. An event that leaves its data in
+/// the message can be read by a human. It is counted by nothing. That is the
+/// gap this module exists to keep closed. A later edit that drops a field
+/// fails here. It does not silently break a downstream exporter.
 #[cfg(test)]
 mod field_vocabulary {
     use super::*;
 
     /// A body longer than the caller declared reports the number it was
-    /// measured against, so the fault can be counted without reading prose.
+    /// measured against. So the fault can be counted without reading prose.
     #[test]
     #[allow(clippy::expect_used)]
     fn an_overlong_body_names_its_declared_size_and_error_type() {
@@ -2137,7 +2179,7 @@ mod field_vocabulary {
     }
 
     /// The orphan-publish warning is the only record that tells an operator
-    /// which message to delete by hand, so every identifier it needs must be
+    /// which message to delete by hand. So every identifier it needs must be
     /// a field.
     #[test]
     #[allow(clippy::expect_used)]
@@ -2164,7 +2206,7 @@ mod field_vocabulary {
     }
 
     /// A poisoned mutex disables rate-limit tracking for the life of the
-    /// process, and the log is the only place it is written down.
+    /// process. The log is the only place it is written down.
     #[test]
     #[allow(clippy::expect_used)]
     fn a_poisoned_flood_guard_names_the_lock_it_lost() {
@@ -2176,8 +2218,9 @@ mod field_vocabulary {
         assert!(log.contains("error.type=\"poisoned_lock\""), "{log}");
     }
 
-    /// Each part upload is reported at `debug` with its index and size, which
-    /// is what makes a stalled multi-part upload diagnosable.
+    /// Each part upload is reported at `debug` with its index and size.
+    ///
+    /// That is what makes a stalled multi-part upload diagnosable.
     #[test]
     #[allow(clippy::expect_used)]
     fn every_uploaded_part_is_reported_with_its_index_and_size() {
@@ -2205,9 +2248,11 @@ mod body_contract {
 
     use super::*;
 
-    /// Drives [`Grammers::upload_parts`] against a body of `body`, recording
-    /// the length of every part it was handed and the concatenated bytes, so
-    /// the size accounting is checked end to end with no Telegram client in it.
+    /// Drives [`Grammers::upload_parts`] against a body of `body`.
+    ///
+    /// It records the length of every part it was handed and the concatenated
+    /// bytes. So the size accounting is checked end to end. No Telegram
+    /// client is in it.
     #[derive(Debug)]
     struct FakeUpload {
         parts: Vec<usize>,
@@ -2216,7 +2261,8 @@ mod body_contract {
 
     impl FakeUpload {
         /// The sink `upload_parts` drives, standing in for the Telegram RPC.
-        /// The future is immediate, so what the fake observes is exactly what
+        ///
+        /// The future is immediate. So what the fake observes is exactly what
         /// the caller was about to send.
         fn sink(&mut self) -> impl FnMut(i32, Vec<u8>) -> Ready<Result<(), BackendError>> + '_ {
             move |part_index, bytes| {
@@ -2306,7 +2352,7 @@ mod body_contract {
             .expect_err("an over-long body must fail");
 
         assert!(matches!(err, BackendError::Other(_)), "{err:?}");
-        // The declared size must survive into the source chain, which is the
+        // The declared size must survive into the source chain. That is the
         // only place the detail is written down.
         let detail = std::error::Error::source(&err)
             .expect("the io cause is kept as the error source")
@@ -2317,8 +2363,8 @@ mod body_contract {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn an_over_long_body_after_a_full_final_part_is_still_rejected() {
-        // The `PART_SIZE` boundary case: the plan is satisfied exactly, so only
-        // the post-upload probe can catch the extra byte.
+        // The `PART_SIZE` boundary case. The plan is satisfied exactly. So
+        // only the post-upload probe can catch the extra byte.
         let body = vec![7u8; PART_SIZE + 1];
         let err = upload_body(&body, PART_SIZE as u64)
             .await
@@ -2350,21 +2396,25 @@ mod body_contract {
     }
 }
 
-/// Rate-limit observability: the events a flood produces, and the attributes
-/// the instruments are recorded under.
+/// Rate-limit observability.
 ///
-/// The flood guard is process-wide, so an operator tuning
+/// The events a flood produces, and the attributes the instruments are
+/// recorded under.
+///
+/// The flood guard is process-wide. So an operator tuning
 /// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS` and
-/// `TELE_S3_MAX_ATTEMPTS` needs to know *which* request drew a 420, *what*
-/// Telegram called it and *which chat* it came from. Before this module those
-/// three facts were either absent or folded into `operation`, and a rate
-/// limit that named no wait produced no event at all.
+/// `TELE_S3_MAX_ATTEMPTS` needs to know which request drew a 420, what
+/// Telegram called it, and which chat it came from. Before this module those
+/// three facts were either absent or folded into `operation`. A rate limit
+/// that named no wait produced no event at all.
 #[cfg(test)]
 mod flood_telemetry {
     use super::*;
 
-    /// A `FLOOD_PREMIUM_WAIT_600` answered with no wait value: the anomalous
-    /// case that used to vanish into a genericised `BackendError::Other`.
+    /// A `FLOOD_PREMIUM_WAIT_600` answered with no wait value.
+    ///
+    /// The anomalous case that used to vanish into a genericised
+    /// `BackendError::Other`.
     #[test]
     #[allow(clippy::expect_used)]
     fn a_rate_limit_without_a_wait_window_is_still_logged() {
@@ -2387,9 +2437,10 @@ mod flood_telemetry {
         assert!(log.contains("operation=\"publish_message\""), "{log}");
     }
 
-    /// The Telegram error name gets its own field. A query has to be able to
-    /// tell "we were blocked while writing" from "Telegram replied
-    /// FLOOD_PREMIUM_WAIT", and it cannot if both land in `operation`.
+    /// The Telegram error name gets its own field.
+    ///
+    /// A query has to tell "we were blocked while writing" from "Telegram
+    /// replied FLOOD_PREMIUM_WAIT". It cannot if both land in `operation`.
     #[test]
     #[allow(clippy::expect_used)]
     fn the_telegram_error_name_is_never_the_operation_field() {
@@ -2414,9 +2465,11 @@ mod flood_telemetry {
         );
     }
 
-    /// Both names at once, which is the whole point: an operator reading one
-    /// event sees that a *download* was blocked *by a premium wait*, not that
-    /// some operation happened to be called `FLOOD_PREMIUM_WAIT_600`.
+    /// Both names at once. That is the whole point.
+    ///
+    /// An operator reading one event sees that a download was blocked by a
+    /// premium wait. Not that some operation happened to be called
+    /// `FLOOD_PREMIUM_WAIT_600`.
     #[test]
     #[allow(clippy::expect_used)]
     fn a_flood_event_names_the_in_flight_operation_and_the_peer() {
@@ -2437,7 +2490,7 @@ mod flood_telemetry {
     }
 
     /// The wait an operation sits through is reported as an operation plus a
-    /// peer, so a trace shows *what was blocked*, not merely that something
+    /// peer. So a trace shows what was blocked. Not merely that something
     /// was.
     #[test]
     #[allow(clippy::expect_used)]
@@ -2451,9 +2504,10 @@ mod flood_telemetry {
         assert!(log.contains("duration_ms=30000"), "{log}");
     }
 
-    /// The metric attribute sets, asserted directly. These are the names an
-    /// operator's collector binds to, so a rename here is a breaking change
-    /// and this test is what makes it a deliberate one.
+    /// The metric attribute sets, asserted directly.
+    ///
+    /// These are the names an operator's collector binds to. A rename here is
+    /// a breaking change. This test makes it a deliberate one.
     #[test]
     #[allow(clippy::expect_used)]
     fn the_flood_counter_is_broken_down_by_error_name_and_operation() {
@@ -2467,7 +2521,7 @@ mod flood_telemetry {
         assert_eq!(ordinary[1], KeyValue::new("operation", "write".to_owned()));
 
         // A premium wait is a qualitatively different problem from an
-        // ordinary one, and the breakdown has to keep them apart.
+        // ordinary one. The breakdown has to keep them apart.
         assert_ne!(ordinary[0], premium[0]);
         assert_ne!(ordinary[1], premium[1]);
     }
@@ -2484,8 +2538,9 @@ mod flood_telemetry {
         assert_eq!(attrs[1], KeyValue::new("peer", "-1001234567890".to_owned()));
     }
 
-    /// The RPC instruments are grouped by operation and outcome, so a
-    /// timeout on one operation cannot hide behind an `ok` on another.
+    /// The RPC instruments are grouped by operation and outcome.
+    ///
+    /// So a timeout on one operation cannot hide behind an `ok` on another.
     #[test]
     #[allow(clippy::expect_used)]
     fn the_rpc_instruments_are_broken_down_by_operation_and_outcome() {
@@ -2503,9 +2558,11 @@ mod flood_telemetry {
         assert_eq!(RpcOutcome::RpcError.as_str(), "rpc_error");
     }
 
-    /// Instruments build on a plain meter, with no exporter, no reader and no
-    /// collector behind them — which is also what happens in a process with
-    /// telemetry configured off, where the meter is the no-op one.
+    /// Instruments build on a plain meter.
+    ///
+    /// No exporter, no reader, and no collector behind them. That is also
+    /// what happens in a process with telemetry configured off. The meter is
+    /// the no-op one.
     #[test]
     #[allow(clippy::expect_used)]
     fn instruments_build_without_an_exporter() {
@@ -2514,15 +2571,17 @@ mod flood_telemetry {
         let noop = opentelemetry::metrics::NoopMeterProvider::new();
         let metrics = TelegramMetrics::from_meter(&noop.meter(TELEMETRY_SCOPE));
 
-        // Recording through them is inert and must not panic: this is the path
+        // Recording through them is inert. It must not panic. This is the path
         // every request in a telemetry-less deployment takes.
         metrics.record_flood("FLOOD_WAIT_30", "write");
         metrics.record_flood_wait("write", "-1001234567890", Duration::from_secs(30));
         metrics.record_rpc("write", RpcOutcome::Ok, Duration::from_millis(120));
     }
 
-    /// Every instrument name is prefixed, so a shared collector cannot confuse
-    /// one of them with another library's.
+    /// Every instrument name is prefixed.
+    ///
+    /// So a shared collector cannot confuse one of them with another
+    /// library's.
     #[test]
     #[allow(clippy::expect_used)]
     fn every_instrument_is_namespaced_to_this_crate() {

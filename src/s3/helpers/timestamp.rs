@@ -1,8 +1,9 @@
-//! Conversion from the storage layer's timestamps to S3 timestamps.
+//! This module converts storage-layer timestamps to S3 timestamps.
 //!
-//! One direction only: the repository stores `chrono::DateTime<Utc>` and
-//! responses speak `s3s::dto::Timestamp`. Parsing a timestamp *out* of a
-//! request is `s3s`' job — the crate only ever hands these values back out.
+//! This conversion goes one way only. The repository stores
+//! `chrono::DateTime<Utc>`. Responses use `s3s::dto::Timestamp`. `s3s`
+//! parses a timestamp out of a request. This crate only returns these
+//! values.
 
 use std::time::SystemTime;
 

@@ -7,12 +7,12 @@ use std::{
 use digest::{Digest, DynDigest};
 use futures::io::AsyncRead;
 
-/// Streaming digests computed in a single read pass.
+/// One read pass computes the streaming digests.
 ///
-/// md5 is always needed for the `ETag`; the rest are only compared when the
-/// client supplied the corresponding `checksum_*` header, but computing them
-/// unconditionally keeps the read path single-pass and cheap relative to
-/// the Telegram upload.
+/// The md5 digest is always needed for the `ETag`. The code compares the other digests
+/// only when the client sends the matching `checksum_*` header. The code
+/// computes all digests in every case. This keeps the read path single-pass.
+/// It also keeps the read path cheap compared with the Telegram upload.
 #[derive(Debug, Default)]
 pub struct IntegrityDigests {
     md5: md5::Md5,
@@ -32,7 +32,7 @@ impl IntegrityDigests {
         self.crc32c = crc32c::crc32c_append(self.crc32c, bytes);
     }
 
-    /// Finalize MD5 and reset its state.
+    /// Finalize MD5. Reset its state.
     pub fn finalize_md5_reset(&mut self) -> Vec<u8> {
         Digest::finalize_reset(&mut self.md5).to_vec()
     }

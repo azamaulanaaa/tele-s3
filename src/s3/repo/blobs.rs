@@ -11,18 +11,18 @@ use tracing::instrument;
 use super::Repository;
 use super::entity;
 
-/// Reference count that marks a row as claimed for backend deletion.
+/// Reference count that marks a row for backend deletion.
 ///
-/// The value is below any count an old underflow can produce. A row left
-/// negative by an old bug still reads as released, not as claimed.
+/// The value stays below any count an old underflow can produce. A row left
+/// negative by an old bug still reads as released. It does not read as claimed.
 const BLOB_REF_DELETING: i64 = i64::MIN;
 
 impl Repository {
-    /// Insert a blob row owned by a single reference.
+    /// Insert a blob row owned by one reference.
     ///
-    /// Takes any connection, so the row can be written on its own
-    /// (`&self.db`) or inside a caller's transaction (see
-    /// `publish_object_with_new_blob` in `super::objects`).
+    /// This function takes any connection. The row can be written on its own
+    /// (`&self.db`). The row can also be written inside a caller's transaction.
+    /// See `publish_object_with_new_blob` in `super::objects`.
     pub(super) async fn insert_blob<C: ConnectionTrait>(
         conn: &C,
         id: String,
@@ -43,25 +43,22 @@ impl Repository {
         Ok(())
     }
 
-    /// Register a freshly created backend blob with a single reference.
+    /// Register a new backend blob with one reference.
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn register_new_blob(&self, id: String, size: u64) -> S3Result<()> {
         Self::insert_blob(&self.db, id, size).await
     }
 
-    /// Record the intent to publish an object, *before* the backend is called.
+    /// Record the intent to publish an object before the backend runs.
     ///
-    /// The write is the caller's own identifier (`publish_id`) so that an
-    /// object published without its answer coming back can still be found by
-    /// that identifier; this row is the durable record of that identifier and
-    /// of what it was written for. See
-    /// [`entity::publish_intent`](super::entity::publish_intent) for the
-    /// state machine.
+    /// The write uses the caller's own identifier (`publish_id`). An object
+    /// published without an answer can still be found by that identifier. This
+    /// row stores that identifier and its purpose. See
+    /// `entity::publish_intent` for the state machine.
     ///
-    /// Inserted up front rather than after the call so a failure — including a
-    /// failure with no answer at all — leaves the intent on record. A caller
-    /// that cannot record the intent must not call the backend: an
-    /// unrecorded publish is unrecoverable.
+    /// The code inserts the row up front. A failure leaves the intent on record.
+    /// That includes a failure with no answer. A caller that cannot record the
+    /// intent must not call the backend. An unrecorded publish is unrecoverable.
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn record_publish_intent(
         &self,
@@ -88,14 +85,13 @@ impl Repository {
         Ok(())
     }
 
-    /// Mark a recorded intent resolved now that the backend returned a key.
+    /// Mark a recorded intent resolved after the backend returns a key.
     ///
-    /// Only ever called on the success path. A failed write leaves the row
-    /// pending on purpose — that pending row is the only record an
-    /// unpublished-but-published-anyway object can be found by.
-    ///
-    /// Test-only: every production success path resolves inside the publish
-    /// transaction, through [`Self::resolve_publish_intent_txn`].
+    /// The code calls this only on the success path. A failed write leaves
+    /// the row pending. That pending row is the only record of an
+    /// unpublished-but-published-anyway object. Test-only: every production
+    /// success path resolves inside the publish transaction. See
+    /// [`Self::resolve_publish_intent_txn`].
     #[cfg(test)]
     pub(crate) async fn resolve_publish_intent(&self, publish_id: &str, blob_id: String) -> S3Result<()> {
         Self::resolve_publish_intent_txn(&self.db, publish_id, blob_id).await
@@ -104,13 +100,13 @@ impl Repository {
     /// Mark an intent resolved on any connection.
     ///
     /// The metadata publish passes its own transaction here. The object row,
-    /// the blob row and the resolved intent then commit together, so a
-    /// committed object can never leave its intent pending for the reclaim
-    /// pass to delete its live bytes.
+    /// the blob row, and the resolved intent commit together. A committed
+    /// object cannot leave its intent pending. The reclaim pass cannot delete
+    /// its live bytes.
     ///
-    /// A missing or already-resolved row is an error. At this point the write
-    /// has already produced a backend blob, so continuing would create the
-    /// unrecorded publish that the intent exists to prevent.
+    /// A missing or already-resolved row is an error. The write has produced a
+    /// backend blob. Continuing would create an unrecorded publish. The intent
+    /// exists to prevent that.
     #[instrument(skip(conn), level = "debug", err)]
     pub(super) async fn resolve_publish_intent_txn<C: ConnectionTrait>(
         conn: &C,
@@ -143,18 +139,17 @@ impl Repository {
         Ok(())
     }
 
-    /// Pending publish intents older than `older_than`, oldest first, capped
+    /// Pending publish intents older than `older_than`. Oldest first. Capped
     /// at `limit` rows.
     ///
-    /// The age filter is the whole safety rule of the pass: an intent younger
-    /// than the threshold may belong to a write that is still in flight, and
-    /// acting on it would look for a publish that has not happened yet. It is
-    /// applied here rather than in the caller so the query and the rule cannot
-    /// drift apart.
+    /// The age filter is the safety rule of the pass. An intent younger than
+    /// the threshold may belong to a write still in flight. Acting on it would
+    /// look for a publish that has not happened yet. The code applies the
+    /// filter here. The query and the rule cannot drift apart.
     ///
-    /// Bounded by `limit` and ordered by the primary key, so one page is
-    /// enough for a pass and no statement — and therefore no write lock — is
-    /// ever wider than that page.
+    /// The results are bounded by `limit`. They are ordered by primary key. One
+    /// page suffices for a pass. No statement is wider than that page. No write
+    /// lock is wider than that page.
     pub(crate) async fn pending_publish_intents(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
@@ -172,10 +167,10 @@ impl Repository {
 
     /// Drop the recorded intents whose publishes are settled.
     ///
-    /// Guarded on `resolved_at IS NULL` so a write that resolved between the
-    /// selection and this statement keeps its row: a resolved row is the only
-    /// record of which key a confirmed publish produced, and the reconciler
-    /// has no business removing one.
+    /// The statement is guarded on `resolved_at IS NULL`. A write that resolves
+    /// between selection and this statement keeps its row. A resolved row is the
+    /// only record of which key a confirmed publish produced. The reconciler
+    /// must not remove one.
     pub(crate) async fn clear_publish_intents(&self, publish_ids: &[String]) -> S3Result<()> {
         if publish_ids.is_empty() {
             return Ok(());
@@ -191,18 +186,17 @@ impl Repository {
         Ok(())
     }
 
-    /// Acquire one additional reference for each listed blob.
+    /// Acquire one more reference for each listed blob.
     ///
-    /// Each upsert is atomic (`INSERT ... ON CONFLICT DO UPDATE SET refs =
-    /// refs + 1`), so concurrent acquirers cannot lose increments the way a
-    /// check-then-insert can. A previously unknown blob is seeded with a
-    /// single reference owned by the caller acquiring it.
+    /// Each upsert is atomic. Concurrent acquirers cannot lose increments. A
+    /// previously unknown blob gets one reference. The caller owns that
+    /// reference.
     ///
-    /// All increments commit together. If any id is claimed for deletion,
-    /// the transaction rolls back and the call fails: the backend bytes may
-    /// already be gone, so a reference must never be created for that id.
-    /// A failure on any item therefore leaves no reference acquired by this
-    /// call, so the caller has nothing to release after it returns an error.
+    /// All increments commit together. If any id is claimed for deletion, the
+    /// transaction rolls back. The call fails. The backend bytes may already be
+    /// gone. A reference must never be created for that id. A failure on any
+    /// item leaves no reference acquired. The caller has nothing to release
+    /// after an error.
     #[instrument(skip(self, items), level = "debug", err)]
     pub(crate) async fn acquire_blob_refs(&self, items: &[(String, u64)]) -> S3Result<()> {
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
@@ -262,21 +256,20 @@ impl Repository {
         }
     }
 
-    /// Drop one reference for each listed blob id and return the ids whose
-    /// count reached zero.
-    /// Drop one reference for each listed blob id and return the ids whose
-    /// count reached zero.
+    /// Drop one reference for each listed blob id. Return the ids whose count
+    /// reached zero.
+    /// Drop one reference for each listed blob id. Return the ids whose count
+    /// reached zero.
     ///
     /// Each id is decremented by one atomic statement. The update respects a
-    /// concurrent increment, clamps the count at zero, and only one caller
-    /// can report the id that reached zero.
+    /// concurrent increment. It clamps the count at zero. Only one caller can
+    /// report the id that reached zero.
     ///
-    /// The rows of the returned ids are deliberately *kept*: the caller must
-    /// attempt the backend delete first and only then call
-    /// [`Self::delete_released_blob_rows`] for the ids it actually removed.
-    /// Dropping the bookkeeping before the bytes are gone would leave a
-    /// blob that exists only in the backend, with no record anywhere that it
-    /// is unreferenced, and nothing that ever retries it.
+    /// The rows of returned ids are kept. The caller must try the backend delete
+    /// first. Then the caller must call [`Self::delete_released_blob_rows`] for
+    /// removed ids. Dropping the bookkeeping before the bytes are gone leaves a
+    /// blob in the backend. No record would show that it is unreferenced.
+    /// Nothing would retry it.
     #[instrument(skip(self, ids), level = "debug", err)]
     pub(crate) async fn release_blob_refs(&self, ids: &[String]) -> S3Result<Vec<String>> {
         if ids.is_empty() {
@@ -298,16 +291,16 @@ impl Repository {
         }
     }
 
-    /// Drop one reference for each listed blob id on `conn` and return the
-    /// ids whose count reached zero.
+    /// Drop one reference for each listed blob id on `conn`. Return the ids
+    /// whose count reached zero.
     ///
-    /// The caller owns the transaction. That lets a larger state change (such
-    /// as deleting a multipart upload) commit together with the reference
-    /// release, so a failure cannot separate the two.
+    /// The caller owns the transaction. A larger state change can commit with
+    /// the reference release. A failure cannot separate the two. For example,
+    /// deleting a multipart upload can commit with the release.
     ///
     /// Each id is decremented by one atomic statement. The update respects a
-    /// concurrent increment, clamps the count at zero, and only one caller
-    /// can report the id that reached zero.
+    /// concurrent increment. It clamps the count at zero. Only one caller can
+    /// report the id that reached zero.
     pub(super) async fn release_blob_refs_on<C: ConnectionTrait>(
         conn: &C,
         ids: &[String],
@@ -374,12 +367,12 @@ impl Repository {
 
     /// Claim released rows for backend deletion.
     ///
-    /// The claim moves `refs` to [`BLOB_REF_DELETING`], so only one caller
-    /// can own the delete. An acquirer that meets the sentinel fails and
-    /// rolls back instead of creating a reference to deleted bytes.
+    /// The claim moves `refs` to [`BLOB_REF_DELETING`]. Only one caller can
+    /// own the delete. An acquirer that meets the sentinel fails. It rolls
+    /// back instead of creating a reference to deleted bytes.
     ///
-    /// Returns the ids this call claimed. A row that another caller already
-    /// claimed is not returned.
+    /// This function returns the ids it claimed. It does not return a row that
+    /// another caller already claimed.
     #[instrument(skip(self, ids), level = "debug", err)]
     pub(crate) async fn claim_released_blob_rows(&self, ids: &[String]) -> S3Result<Vec<String>> {
         if ids.is_empty() {
@@ -429,8 +422,8 @@ impl Repository {
 
     /// Put claimed rows back into the released state.
     ///
-    /// Call this when the backend delete fails. A later release can then try
-    /// the delete again.
+    /// Call this when the backend delete fails. A later release can try the
+    /// delete again.
     #[instrument(skip(self, ids), level = "debug", err)]
     pub(crate) async fn restore_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
         if ids.is_empty() {
@@ -450,7 +443,7 @@ impl Repository {
         Ok(())
     }
 
-    /// Current reference count for a blob id (0 if the row is absent).
+    /// Current reference count for a blob id. Returns 0 if the row is absent.
     #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn blob_ref_count(&self, id: &str) -> S3Result<i64> {
@@ -485,10 +478,10 @@ impl Repository {
         Ok(counts)
     }
 
-    /// Delete blob rows whose backend data the caller has already removed.
+    /// Delete blob rows whose backend data the caller removed.
     ///
-    /// Guarded on `refs <= 0` so a reference acquired between the decision
-    /// and this statement can never take the row away from a live holder.
+    /// The statement is guarded on `refs <= 0`. A reference acquired between
+    /// the decision and this statement cannot take the row from a live holder.
     #[instrument(skip(self, ids), level = "debug", err)]
     pub(crate) async fn delete_released_blob_rows(&self, ids: &[String]) -> S3Result<()> {
         if ids.is_empty() {
@@ -507,45 +500,40 @@ impl Repository {
         Ok(())
     }
 
-    /// Reconciliation caps, chosen so a start-up pass is bounded no matter
-    /// how large the database already is.
+    /// Reconciliation caps. They keep a start-up pass bounded. The bound holds
+    /// no matter how large the database is.
     const BLOB_SCAN_BATCH: u64 = 512;
     const BLOB_DELETE_CHUNK: usize = 256;
     const BLOB_MAX_CANDIDATES: u64 = 250_000;
 
-    /// Drop blob rows that are older than `older_than` and referenced by
-    /// neither an object version nor an in-progress multipart upload.
+    /// Drop blob rows older than `older_than`. The rows must be referenced
+    /// by neither an object version nor an in-progress multipart upload.
     ///
-    /// This is the only thing that ever reclaims the row a publish
-    /// interrupted between "record the blob" and "publish the object"
-    /// leaves behind: such a row is invisible to every list operation and
-    /// nothing else scans `s3_blob`.
+    /// This is the only pass that reclaims a row left by an interrupted
+    /// publish. Such a row is invisible to every list operation. Nothing else
+    /// scans `s3_blob`.
     ///
-    /// Bounded on every axis:
-    ///  * candidates are read in [`Self::BLOB_SCAN_BATCH`]-row keyset
-    ///    pages, and the candidate set is capped at
-    ///    [`Self::BLOB_MAX_CANDIDATES`] ids — over the cap the pass is
-    ///    abandoned with a warning rather than growing without limit;
-    ///  * holders are streamed in the same page size over the primary-key
-    ///    order, so only one page of `content` JSON is materialised at a
-    ///    time and no more than `candidates` ids are held in memory;
-    ///  * deletes are chunked, so no statement — and therefore no write
-    ///    lock — is wider than one page.
+    /// The pass is bounded on every axis:
+    ///  * Candidates are read in [`Self::BLOB_SCAN_BATCH`]-row keyset pages.
+    ///    The candidate set is capped at [`Self::BLOB_MAX_CANDIDATES`] ids.
+    ///    The pass stops with a warning if the cap is exceeded.
+    ///  * Holders are streamed in the same page size in primary-key order.
+    ///    Only one page of `content` JSON is in memory at a time.
+    ///    No more than `candidates` ids are held in memory.
+    ///  * Deletes are chunked. No statement is wider than one page.
     ///
-    /// The holder pass is deliberately *not* filtered by age: a copy
-    /// published today can still point at a two-year-old blob, so every
-    /// version has to be visited. It is a single linear pass reading the key
-    /// columns plus `content`, and it is the reason the pass is bounded by
-    /// memory rather than by `LIMIT`.
+    /// The holder pass is not filtered by age. A copy published today can
+    /// point at a two-year-old blob. Every version must be visited. It is one
+    /// linear pass over key columns plus `content`. That is why the pass is
+    /// bounded by memory, not by `LIMIT`.
     ///
-    /// No transaction spans the pass: every page is its own short implicit
-    /// transaction, so the reconciler never blocks writers for the length
-    /// of a full scan.
+    /// No transaction spans the pass. Each page is its own short implicit
+    /// transaction. The reconciler never blocks writers for a full scan.
     ///
-    /// Returns the number of rows removed. Blob rows are metadata only —
-    /// reclaiming the backend bytes of the orphans is the job of the
-    /// release path (and, for rows whose backend delete failed, of a
-    /// backend-aware sweeper this pass deliberately does not attempt).
+    /// This function returns the number of rows removed. Blob rows are metadata
+    /// only. Reclaiming backend bytes of orphans is the job of the release
+    /// path. For rows whose backend delete failed, a backend-aware sweeper
+    /// reclaims them. This pass does not attempt that.
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn reconcile_orphan_blobs(
         &self,
@@ -582,9 +570,9 @@ impl Repository {
 
     /// Delete the rows the reconciler proved unreferenced.
     ///
-    /// Guarded on `created_at < older_than` so the age rule of the pass that
-    /// selected them cannot be widened by a concurrent write, and chunked so
-    /// a single statement never spans more than one page of ids.
+    /// The statement is guarded on `created_at < older_than`. A concurrent
+    /// write cannot widen the age rule of the selecting pass. Deletes are
+    /// chunked. No single statement spans more than one page of ids.
     async fn delete_orphan_blob_rows(
         &self,
         ids: &[String],
@@ -602,7 +590,7 @@ impl Repository {
         Ok(())
     }
 
-    /// Ids of blob rows old enough to be garbage, or `None` when the set
+    /// Ids of blob rows old enough to be garbage. Returns `None` when the set
     /// would exceed the reconciliation cap.
     async fn orphan_blob_candidates(
         &self,
@@ -648,8 +636,8 @@ impl Repository {
         Ok(Some(candidates))
     }
 
-    /// Stream every object version, collecting the referenced ids that are
-    /// among `candidates`.
+    /// Stream every object version. Collect the referenced ids that are among
+    /// `candidates`.
     async fn stream_object_blob_ids<'a>(
         &self,
         candidates: &'a HashSet<String>,
@@ -708,8 +696,8 @@ impl Repository {
         Ok(())
     }
 
-    /// Stream every in-progress multipart upload, collecting the referenced
-    /// ids that are among `candidates`.
+    /// Stream every in-progress multipart upload. Collect the referenced ids
+    /// that are among `candidates`.
     async fn stream_multipart_blob_ids<'a>(
         &self,
         candidates: &'a HashSet<String>,
@@ -784,15 +772,15 @@ impl Repository {
     }
 }
 
-/// Collect the ids a `content` document points at that are candidates for
+/// Collect the ids a `content` document points at. Keep only candidates for
 /// removal.
 ///
-/// The two shapes differ (`{"item": [{"id": ...}]}` for an object,
-/// `{"<part>": {"metadata_items": [{"id": ...}]}}` for an upload), and a
-/// `LIKE '%'||id||'%'` predicate cannot express membership without
-/// scanning every candidate per row, so the walk takes every `id` string it
-/// finds and filters it against the candidate set. Borrowed, so streaming a
-/// page of rows allocates nothing beyond the set.
+/// The two shapes differ. An object uses `{"item": [{"id": ...}]}`. An
+/// upload uses `{"<part>": {"metadata_items": [{"id": ...}]}}`. A
+/// `LIKE '%'||id||'%'` predicate cannot express membership. It would scan
+/// every candidate per row. The walk takes every `id` string it finds. It
+/// filters that string against the candidate set. The walk borrows, so
+/// streaming a page allocates nothing beyond the set.
 fn collect_referenced_ids<'a>(
     content: &serde_json::Value,
     candidates: &'a HashSet<String>,
@@ -1185,11 +1173,10 @@ mod tests {
         );
     }
 
-    /// A failure on one item must roll back the references that earlier
-    /// items acquired.
+    /// A failure on one item rolls back references that earlier items acquired.
     ///
-    /// The caller cannot release them: it sees one error and no list of what
-    /// was acquired, so a partial loop would leak every increment before the
+    /// The caller cannot release them. It sees one error. It sees no list of
+    /// what was acquired. A partial loop would leak every increment before the
     /// failing item.
     #[tokio::test]
     async fn acquire_is_all_or_nothing_when_an_item_fails() {

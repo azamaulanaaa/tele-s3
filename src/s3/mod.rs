@@ -41,46 +41,33 @@ pub struct TeleS3<B: Backend> {
     pub(crate) repo: repo::Repository,
 }
 
-/// Age a blob must reach before the start-up reconciler may consider its row
-/// garbage. Long enough that a write still in flight can never be undone.
+/// Age a blob must reach before the start-up reconciler may consider its row garbage. Long enough that a write still in flight can never be undone.
 const ORPHAN_BLOB_MIN_AGE: chrono::Duration = chrono::Duration::hours(1);
 
-/// Age an unconfirmed publish intent must reach before the reconciler may
-/// act on it. Long enough that a write still in flight can never be undone.
+/// Age an unconfirmed publish intent must reach before the reconciler may act on it. Long enough that a write still in flight can never be undone.
 ///
-/// Its own constant, deliberately equal to but separate from
-/// [`ORPHAN_BLOB_MIN_AGE`]: the two passes guard different risks (an
-/// unreferenced *row* versus an unconfirmed *publish*), and tying one to the
-/// other would make tuning either one silently retune the other.
+/// This constant is its own value. It equals [`ORPHAN_BLOB_MIN_AGE`] but stays separate from it. The two passes guard different risks: an unreferenced row versus an unconfirmed publish. Tying one constant to the other would make tuning either one silently retune the other.
 const PUBLISH_INTENT_MIN_AGE: chrono::Duration = chrono::Duration::hours(1);
 
 /// Publish intents examined per reconciliation pass.
 ///
-/// Bounded like every other pass here, so the number of Telegram lookups a
-/// start-up can trigger is fixed rather than a function of how many writes
-/// lost their answers.
+/// Every pass here has a bound. This bound fixes the number of Telegram lookups a start-up can trigger. The number does not grow with the count of writes that lost their answers.
 const PUBLISH_INTENT_SWEEP_BATCH: u64 = 128;
 
 /// What a publish intent's row must become once a reclaim attempt is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntentDisposition {
-    /// The publish is settled — there was nothing, or what there was is gone
-    /// — so the row has served its purpose and may be dropped.
+    /// The publish reached a settled state. There was nothing, or what there was went away. The row served its purpose. The code may drop the row.
     Clear,
-    /// The publish is not settled, so the row stays pending and a later pass
-    /// retries it.
+    /// The publish did not settle. The row stays pending. A later pass retries it.
     KeepPending,
 }
 
-/// Whether an intent recorded at `created_at` is old enough to act on at
-/// `now`.
+/// Whether an intent recorded at `created_at` is old enough to act on at `now`.
 ///
-/// Pure, and the single definition of the rule: the SQL that selects the
-/// candidates and this function must agree, so the boundary is stated once
-/// here and the query is documented as applying it.
+/// This function is pure. It is the single definition of the rule. The SQL that selects candidates and this function must agree. This text states the boundary here once. The code documents the query as applying it.
 ///
-/// Strictly older, matching [`ORPHAN_BLOB_MIN_AGE`]'s own rule: an intent
-/// exactly at the threshold is not swept.
+/// The check uses strictly older, matching [`ORPHAN_BLOB_MIN_AGE`]'s own rule. The code does not sweep an intent exactly at the threshold.
 fn publish_intent_is_due(
     created_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
@@ -90,15 +77,9 @@ fn publish_intent_is_due(
 
 /// What one reclaim attempt means for the intent row.
 ///
-/// The load-bearing decision of this scope, kept pure and separate from the
-/// I/O so it can be tested without a Telegram session.
+/// The code keeps this decision pure and separate from I/O. Tests run it without a Telegram session.
 ///
-/// A backend error is [`IntentDisposition::KeepPending`] for the same reason
-/// [`ReclaimOutcome::ReclaimFailed`] is: an unanswered reclaim is an unknown
-/// publish, and the only thing that can resolve the unknown is a later pass.
-/// The alternative — clearing the row because we could not check — would
-/// destroy the *only* record of an object that may exist, which is the exact
-/// failure this whole table exists to prevent.
+/// A backend error maps to [`IntentDisposition::KeepPending`]. It gets the same treatment as [`ReclaimOutcome::ReclaimFailed`]. An unanswered reclaim is an unknown publish. Only a later pass can resolve the unknown. Clearing the row because the check failed would destroy the only record of an object that may exist. That is the exact failure this table exists to prevent.
 fn intent_disposition(outcome: &Result<ReclaimOutcome, BackendError>) -> IntentDisposition {
     match outcome {
         Ok(ReclaimOutcome::NothingPublished | ReclaimOutcome::Reclaimed) => {
@@ -109,7 +90,7 @@ fn intent_disposition(outcome: &Result<ReclaimOutcome, BackendError>) -> IntentD
 }
 
 impl<B: Backend> TeleS3<B> {
-    /// Initialize the S3 service with a backend and database.
+/// Initialize the S3 service with a backend and database.
     #[instrument(skip(backend, db), level = "debug", err)]
     pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
         let repo = repo::Repository::init(db).await?;
@@ -117,22 +98,13 @@ impl<B: Backend> TeleS3<B> {
         Ok(Self { backend, repo })
     }
 
-    /// Release metadata references and hard-delete blobs whose reference
-    /// count reached zero.
+/// Release metadata references. Hard-delete blobs whose reference count reached zero.
     ///
-    /// The backend delete is attempted *before* the bookkeeping is dropped,
-    /// and its outcome is observed: only the ids the backend confirmed as
-    /// removed lose their row. An id whose delete failed keeps its row, so
-    /// the blob stays accounted for instead of becoming invisible data that
-    /// nothing ever retries.
+    /// The backend delete runs before the bookkeeping drops. The code observes its outcome. Only ids the backend confirms as removed lose their row. An id whose delete failed keeps its row. The blob stays accounted for. It does not become invisible data that nothing retries.
     ///
-    /// The claim before the backend call is atomic. A concurrent acquirer
-    /// either takes the blob first, in which case the claim fails, or meets
-    /// the claim and fails its own acquire. The bytes can never disappear
-    /// under a reference that was created after the delete.
+    /// The claim before the backend call is atomic. A concurrent acquirer either takes the blob first, and then the claim fails. Or it meets the claim and fails its own acquire. The bytes can never disappear under a reference created after the delete.
     ///
-    /// Backend deletion failures never fail the user request (best-effort
-    /// cleanup) but are logged; refcount bookkeeping failures propagate.
+    /// Backend deletion failures never fail the user request. Cleanup stays best-effort. The code logs failures. Refcount bookkeeping failures propagate.
     async fn release_blobs(&self, ids: Vec<String>) -> S3Result<()> {
         let released = self.repo.release_blob_refs(&ids).await?;
 
@@ -197,16 +169,11 @@ impl<B: Backend> TeleS3<B> {
         Ok(())
     }
 
-    /// Delete backend blobs that were written but never recorded in the
-    /// metadata store (a publish rejected before its transaction).
+    /// Delete backend blobs that were written but never recorded in the metadata store. A publish rejected before its transaction leaves such blobs.
     ///
-    /// Returns true when every delete succeeded. A caller may clear a publish
-    /// intent only then: a failed delete leaves bytes with no metadata row,
-    /// and the pending intent is the only record that can lead the reclaim
-    /// pass back to them.
+    /// The function returns true when every delete succeeded. A caller may clear a publish intent only then. A failed delete leaves bytes with no metadata row. The pending intent is the only record that can lead the reclaim pass back to them.
     ///
-    /// Best-effort by construction: a failure is logged and the request keeps
-    /// its original error.
+    /// The function is best-effort by construction. The code logs a failure. The request keeps its original error.
     async fn discard_backend_blobs(&self, ids: Vec<String>) -> bool {
         const BACKEND_DELETE_BATCH: usize = 8;
 
@@ -231,12 +198,9 @@ impl<B: Backend> TeleS3<B> {
         all_deleted
     }
 
-    /// Reconcile blob rows that no object version and no in-progress
-    /// multipart upload references any more.
+    /// Reconcile blob rows that no object version and no in-progress multipart upload references.
     ///
-    /// Run once at start-up, before the service accepts traffic. Bounded and
-    /// never fatal: an oversized database is skipped with a warning rather
-    /// than turning the reconciler into an unbounded scan.
+    /// Run this once at start-up, before the service accepts traffic. The pass has bounds and never fails fatally. The code skips an oversized database with a warning. The reconciler does not become an unbounded scan.
     pub async fn reconcile_orphan_blobs(&self) -> S3Result<usize> {
         // Anything younger than this may still belong to a write that has
         // not finished publishing.
@@ -245,44 +209,23 @@ impl<B: Backend> TeleS3<B> {
         self.repo.reconcile_orphan_blobs(older_than).await
     }
 
-    /// Reclaim publishes that were never confirmed, and clear the intents
-    /// that recorded them.
+    /// Reclaim publishes that were never confirmed. Clear the intents that recorded them.
     ///
-    /// A pending intent means a publish may or may not have produced a real
-    /// message holding uploaded bytes. When it did, no key came back, so no
-    /// blob row references those bytes and
-    /// [`Self::reconcile_orphan_blobs`] cannot see them: it drops metadata
-    /// *rows*, not backend objects. This pass is what closes that gap, by
-    /// asking the backend what it published under the identifier the intent
-    /// recorded and deleting it if anything is there.
+    /// A pending intent means a publish may or may not have produced a real message holding uploaded bytes. When it did, no key came back. No blob row references those bytes. [`Self::reconcile_orphan_blobs`] cannot see them. It drops metadata rows, not backend objects. This pass closes that gap. It asks the backend what it published under the identifier the intent recorded. It deletes the result if anything is there.
     ///
     /// # Independent of the orphan-blob pass
     ///
-    /// The two passes are independent and either may be skipped:
+    /// The two passes are independent. Either may be skipped.
     ///
-    /// * they scan different tables (`s3_publish_intent` versus `s3_blob`)
-    ///   and repair different classes of leak — bytes nobody can name versus
-    ///   rows nobody references;
-    /// * neither reads the other's state, so neither can be blocked by the
-    ///   other, and running one does not require the other to have run;
-    /// * they are run independently at start-up and each keeps its own age
-    ///   threshold and its own bounds, so a failure in one is logged and does
-    ///   not stop the other.
+    /// - They scan different tables: `s3_publish_intent` versus `s3_blob`. They repair different leak classes: bytes nobody can name versus rows nobody references.
+    /// - Neither reads the other's state. Neither blocks the other. Running one does not require the other to have run.
+    /// - They run independently at start-up. Each keeps its own age threshold and its own bounds. The code logs a failure in one. It does not stop the other.
     ///
-    /// They share only that both are bounded, batched and never fatal.
+    /// Both stay bounded, batched, and never fatal.
     ///
-    /// Bounded on every axis: at most [`PUBLISH_INTENT_SWEEP_BATCH`] intents
-    /// are examined, each costing the backend one bounded lookup, and no
-    /// transaction spans the pass — every statement is its own short implicit
-    /// transaction, so this never blocks writers for the length of a sweep.
-    /// An intent is cleared only when
-    /// [`IntentDisposition::Clear`] says its publish is settled, so a
-    /// `ReclaimFailed` or an unanswered reclaim leaves the row pending and the
-    /// next pass tries again.
+    /// The pass has a bound on every axis. The code examines at most `PUBLISH_INTENT_SWEEP_BATCH` intents. Each costs the backend one bounded lookup. No transaction spans the pass. Every statement is its own short implicit transaction. The pass never blocks writers for the length of a sweep. An intent clears only when `IntentDisposition::Clear` says its publish is settled. A `ReclaimFailed` or an unanswered reclaim leaves the row pending. The next pass tries again.
     ///
-    /// Returns the number of intents cleared. A backend failure on one intent
-    /// is logged and the pass continues: one unreachable publish must not
-    /// strand every other intent behind it.
+    /// The function returns the number of intents cleared. The code logs a backend failure on one intent. The pass continues. One unreachable publish must not strand every other intent behind it.
     pub async fn reconcile_publish_intents(&self) -> S3Result<usize> {
         let now = chrono::Local::now().to_utc();
         // Anything younger than this may belong to a write that has not
@@ -347,11 +290,7 @@ impl<B: Backend> TeleS3<B> {
         Ok(cleared.len())
     }
 
-    /// Fast-fail doomed conditional writes before any expensive work or
-    /// validation. The atomic re-check still happens at commit time (in
-    /// `publish_object_with_new_blob` / `cas_put_object`); this only avoids
-    /// wasted effort and gives preconditions correct precedence over other
-    /// errors (e.g. `InvalidPart`).
+    /// Fast-fail doomed conditional writes before expensive work or validation. The atomic re-check still happens at commit time in `publish_object_with_new_blob` and `cas_put_object`. This gate only avoids wasted effort. It gives preconditions correct precedence over other errors such as `InvalidPart`.
     async fn precondition_gate(
         &self,
         bucket: &str,
@@ -656,8 +595,7 @@ mod tests {
     use super::*;
     use crate::backend::{BoxedAsyncReader, Memory, ReadOutcome};
 
-    /// A backend whose deletes can be made to fail on demand, so the
-    /// release ordering is observable.
+    /// A backend whose deletes can fail on demand. The test observes release ordering.
     struct FlakyDelete {
         inner: Memory<8, 8>,
         fail_delete: AtomicBool,
@@ -676,8 +614,7 @@ mod tests {
         }
     }
 
-    /// A backend whose delete pauses until the test lets it finish, so the
-    /// delete claim is observable while it is in flight.
+    /// A backend whose delete pauses until the test lets it finish. The test observes the delete claim while it is in flight.
     struct PausedDelete {
         inner: Memory<8, 8>,
         started: tokio::sync::Notify,
@@ -694,9 +631,7 @@ mod tests {
         }
     }
 
-    /// A backend whose answer to `reclaim_publish` is dictated by the test,
-    /// so every arm of the sweep's decision is reachable without a Telegram
-    /// session.
+    /// A backend whose answer to `reclaim_publish` the test dictates. Every arm of the sweep's decision becomes reachable without a Telegram session.
     struct ScriptedReclaim {
         inner: Memory<8, 8>,
         /// What the next reclaim answers. `None` means the call fails.
@@ -852,8 +787,7 @@ mod tests {
             .expect("init")
     }
 
-    /// Record an intent `age` old, directly, so the age under test is the one
-    /// in the row rather than one the clock happens to have produced.
+    /// Record an intent `age` old, directly. The age under test is the one in the row. The clock does not produce it.
     async fn record_intent_aged<B: Backend>(
         svc: &TeleS3<B>,
         publish_id: &str,

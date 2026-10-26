@@ -11,16 +11,16 @@ use super::entity;
 use super::{ObjectWrite, PutCondition, Repository};
 use crate::s3::objects::MAX_KEYS_CEILING;
 
-/// Columns `list_objects` projects: exactly what `list_objects_inner` and
-/// `list_objects_v2_inner` read off a row.
+/// Columns that `list_objects` projects. They are exactly what
+/// `list_objects_inner` and `list_objects_v2_inner` read from a row.
 const LIST_OBJECT_COLUMNS: [entity::object::Column; 3] = [
     entity::object::Column::Id,
     entity::object::Column::Size,
     entity::object::Column::LastModified,
 ];
 
-/// Columns `list_object_versions` projects: exactly what
-/// `list_object_versions_inner` reads off a row.
+/// Columns that `list_object_versions` projects. They are exactly what
+/// `list_object_versions_inner` reads from a row.
 const OBJECT_VERSION_COLUMNS: [entity::object::Column; 7] = [
     entity::object::Column::Id,
     entity::object::Column::VersionId,
@@ -31,16 +31,14 @@ const OBJECT_VERSION_COLUMNS: [entity::object::Column; 7] = [
     entity::object::Column::Etag,
 ];
 
-/// One row of a `ListObjects` / `ListObjectsV2` page.
+/// One row of a `ListObjects` or `ListObjectsV2` page.
 ///
-/// A projection of [`entity::object::Model`], not a replacement for it: point
-/// reads (`get_latest_model`, `get_object_version`, the delete paths) still
-/// materialise the whole row because they genuinely need `content`.
+/// This is a projection of [`entity::object::Model`]. It is not a replacement.
+/// Point reads still materialise the whole row. They genuinely need `content`.
 #[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
-/// Documentation.
 pub(crate) struct ObjectListRow {
-    /// The key. Also the `next_marker` / continuation-token cursor and the
-    /// input to the handler's `CommonPrefix` rollup.
+    /// The key. It is also the `next_marker` cursor. It is also the input to
+    /// the handler's `CommonPrefix` rollup.
     pub id: String,
     pub size: u32,
     pub last_modified: chrono::DateTime<chrono::Utc>,
@@ -48,15 +46,15 @@ pub(crate) struct ObjectListRow {
 
 /// One row of a `ListObjectVersions` page.
 #[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
-/// Documentation.
 pub(crate) struct ObjectVersionRow {
-    /// The key; also the `next_key_marker` cursor and the `CommonPrefix` input.
+    /// The key. It is also the `next_key_marker` cursor. It is also the
+    /// `CommonPrefix` input.
     pub id: String,
     /// Also the `next_version_id_marker` cursor.
     pub version_id: String,
     pub is_latest: bool,
-    /// Splits the page into versions vs delete markers, and is what a listed
-    /// marker's `x-amz-delete-marker` / `x-amz-version-id` rest on.
+    /// Splits the page into versions and delete markers. A listed marker's
+    /// `x-amz-delete-marker` and `x-amz-version-id` rest on it.
     pub is_delete_marker: bool,
     pub size: u32,
     pub last_modified: chrono::DateTime<chrono::Utc>,
@@ -80,8 +78,7 @@ impl Repository {
         Ok(m)
     }
 
-    /// Documentation.
-    pub(crate) async fn get_object_version(
+        pub(crate) async fn get_object_version(
         &self,
         bucket: &str,
         key: &str,
@@ -100,13 +97,12 @@ impl Repository {
 
     /// Atomic compare-and-swap object write.
     ///
-    /// The condition check and the demote+insert run inside one database
-    /// transaction: concurrent writers serialize on the write lock instead
-    /// of interleaving into zero (or two) `is_latest` rows, and a crash
-    /// between demote and insert can no longer orphan the key.
+    /// The condition check and the demote-plus-insert run in one database
+    /// transaction. Concurrent writers serialize on the write lock. They do not
+    /// interleave into zero or two `is_latest` rows. A crash between demote
+    /// and insert cannot orphan the key.
     #[instrument(skip(self, data, condition), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn cas_put_object(
+        pub(crate) async fn cas_put_object(
         &self,
         bucket: String,
         key: String,
@@ -131,28 +127,26 @@ impl Repository {
         }
     }
 
-    /// Atomic publish: record the freshly written blob row, the object row
-    /// and — when `publish_id` is set — the resolved publish intent in one
-    /// transaction.
+    /// Atomic publish. Record the new blob row, the object row, and the resolved
+    /// publish intent in one transaction. The intent is recorded only when
+    /// `publish_id` is set.
     ///
-    /// `PutObject` used to run [`Self::cas_put_object`] as a second
-    /// transaction after `register_new_blob`. The backend blob already
-    /// existed at that point, so a crash (or any error) between the two left
-    /// a `s3_blob` row with `refs = 1` that nothing references: invisible to
-    /// every listing, never reclaimed. Composing the blob insert with the
-    /// already-factored `cas_put_object_txn` closes the window — both rows
-    /// appear together or not at all.
+    /// `PutObject` used to run [`Self::cas_put_object`] as a second transaction
+    /// after `register_new_blob`. The backend blob already existed. A crash or
+    /// error between the two left a `s3_blob` row with `refs = 1`. Nothing
+    /// referenced that row. It was invisible to listings. It was never reclaimed.
+    /// Composing the blob insert with `cas_put_object_txn` closes that window.
+    /// Both rows appear together or not at all.
     ///
     /// The intent resolves in the same transaction for the same reason. A
-    /// resolve that ran after the commit could fail and leave a pending row
-    /// for a live object, and the reclaim pass would then delete its bytes.
-    /// If the resolve fails here, the whole publish rolls back.
+    /// resolve after commit could fail. It would leave a pending row for a live
+    /// object. The reclaim pass would then delete its bytes. If the resolve
+    /// fails here, the whole publish rolls back.
     ///
-    /// Error mapping is unchanged: the condition check, the versioning
-    /// branches and their codes all come from `cas_put_object_txn`.
+    /// Error mapping is unchanged. The condition check, the versioning branches,
+    /// and their codes all come from `cas_put_object_txn`.
     #[instrument(skip(self, data, condition), level = "debug", err)]
-    /// Documentation.
-    #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
     pub(crate) async fn publish_object_with_new_blob(
         &self,
         blob_id: String,
@@ -191,8 +185,7 @@ impl Repository {
         }
     }
 
-    /// Documentation.
-    pub(super) async fn cas_put_object_txn(
+        pub(super) async fn cas_put_object_txn(
         &self,
         txn: &DatabaseTransaction,
         bucket: String,
@@ -419,8 +412,7 @@ impl Repository {
         }
     }
 
-    /// Documentation.
-    pub(crate) async fn set_object_tags_versioned(
+        pub(crate) async fn set_object_tags_versioned(
         &self,
         bucket: &str,
         key: &str,
@@ -447,20 +439,18 @@ impl Repository {
     }
 
     /// Version id of the current latest entry for a key, if any.
-    /// Documentation.
-    pub(crate) async fn latest_version_id(&self, bucket: &str, key: &str) -> S3Result<Option<String>> {
+        pub(crate) async fn latest_version_id(&self, bucket: &str, key: &str) -> S3Result<Option<String>> {
         Ok(self
             .get_latest_model(bucket, key)
             .await?
             .map(|m| m.version_id))
     }
 
-    /// Latest version row even if it is a delete marker (`None` when the
-    /// key has no versions at all). Used to attach delete-marker headers
-    /// to GET/HEAD errors.
+    /// Latest version row, even if it is a delete marker. Returns `None` when
+    /// the key has no versions. Used to attach delete-marker headers to GET
+    /// and HEAD errors.
     #[instrument(skip(self), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn get_latest_raw(
+        pub(crate) async fn get_latest_raw(
         &self,
         bucket: &str,
         key: &str,
@@ -469,8 +459,7 @@ impl Repository {
     }
 
     #[instrument(skip(self, data), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn upsert_object(
+        pub(crate) async fn upsert_object(
         &self,
         bucket: String,
         key: String,
@@ -499,15 +488,13 @@ impl Repository {
 
     #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
+        pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
         let m = self.get_latest_model(bucket, key).await?;
         Ok(m.is_some_and(|v| !v.is_delete_marker))
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
+        pub(crate) async fn get_object(&self, bucket: &str, key: &str) -> S3Result<entity::object::Model> {
         let m = self
             .get_latest_model(bucket, key)
             .await?
@@ -518,31 +505,27 @@ impl Repository {
         Ok(m)
     }
 
-    /// Versioned delete: if `version_id` is Some, permanently delete that version.
-    /// If None, create delete marker (if bucket versioning enabled) or permanently delete null version.
-    /// Returns (`deleted_model`, `is_delete_marker_created`)
+    /// Versioned delete.
     ///
-    /// Every statement runs inside one transaction, mirroring
-    /// [`Self::cas_put_object`]. That matters because "at most one row per key
-    /// has `is_latest = true`" is enforced by the *transaction*, never by the
-    /// schema: the `s3_object` primary key is `(bucket_id, id, version_id)` and
-    /// there is no unique index on `is_latest` anywhere -- sea-orm's
-    /// `schema-sync` derive cannot express a *partial* unique index
-    /// (`WHERE is_latest = true`), and a plain unique index on `(bucket_id, id)`
-    /// would be flat-out wrong, since every non-latest version of a key shares
-    /// those two columns. The invariant is instead upheld by holding the write
-    /// lock across the whole demote / insert / promote sequence, so a concurrent
-    /// transaction on the same key serializes behind this one and never
-    /// observes -- or leaves behind -- an intermediate state. Running these
-    /// statements as separate implicit transactions would let a crash between
-    /// demote and promote strand the key with zero `is_latest` rows (still
-    /// listed by `ListObjectVersions`, invisible to `GetObject` forever), and
-    /// would let a transacted `cas_put_object` interleaving at statement
-    /// granularity leave two `is_latest` rows for `get_latest_model` to resolve
-    /// arbitrarily.
+    /// If `version_id` is Some, permanently delete that version. If None,
+    /// create a delete marker when bucket versioning is enabled. Otherwise
+    /// permanently delete the null version. Returns (`deleted_model`,
+    /// `is_delete_marker_created`).
+    ///
+    /// Every statement runs in one transaction. See [`Self::cas_put_object`].
+    /// "At most one row per key has `is_latest = true`" is enforced by the
+    /// transaction, not by the schema. The primary key is `(bucket_id, id,
+    /// version_id)`. There is no unique index on `is_latest`. sea-orm cannot
+    /// express a partial unique index. A plain unique index on `(bucket_id, id)`
+    /// would be wrong. Every non-latest version shares those two columns. The
+    /// invariant is upheld by holding the write lock across demote, insert, and
+    /// promote. A concurrent transaction serializes behind this one. It never
+    /// observes an intermediate state. Running these statements as separate
+    /// implicit transactions would let a crash strand the key with zero
+    /// `is_latest` rows. `ListObjectVersions` would still list them. `GetObject`
+    /// would never see them. It would also let two `is_latest` rows appear.
     #[instrument(skip(self), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn delete_object_versioned(
+        pub(crate) async fn delete_object_versioned(
         &self,
         bucket: &str,
         key: &str,
@@ -694,7 +677,7 @@ impl Repository {
         }
     }
 
-    /// Filter/order half of [`Self::list_objects`], split out so the rendered
+    /// Filter and order half of [`Self::list_objects`]. Split out so the rendered
     /// SQL is assertable without a database.
     fn list_objects_query(
         bucket: &str,
@@ -783,16 +766,13 @@ impl Repository {
 
     /// List the latest, non-delete-marker version of every key in a page.
     ///
-    /// Projected to [`LIST_OBJECT_COLUMNS`] — `id`, `size`, `last_modified` —
-    /// which is exactly what `list_objects_inner` / `list_objects_v2_inner` read
-    /// off a row (the key doubles as the `next_marker` cursor and as the input
-    /// to the `CommonPrefix` rollup). The heavy JSON columns (`content`,
-    /// `user_metadata`, `tags`, `checksums`) are never read by that handler, so
-    /// fetching a full page of them is pure waste: 1000 rows meant 1000 JSON
-    /// documents pulled across the wire and dropped.
+    /// Projected to [`LIST_OBJECT_COLUMNS`]: `id`, `size`, `last_modified`. That
+    /// is exactly what `list_objects_inner` and `list_objects_v2_inner` read
+    /// from a row. The key doubles as the `next_marker` cursor. It is also the
+    /// input to the `CommonPrefix` rollup. The heavy JSON columns are never read
+    /// by that handler. Fetching a full page of them wastes work.
     #[instrument(skip(self), level = "debug", err)]
-    /// Documentation.
-    pub(crate) async fn list_objects(
+        pub(crate) async fn list_objects(
         &self,
         bucket: &str,
         prefix: Option<String>,
@@ -819,11 +799,11 @@ impl Repository {
 
     /// Build the bounded page query for [`Self::list_object_versions`].
     ///
-    /// `limit` is the SQL `LIMIT` (the caller's fetch cap) and
-    /// `version_cursor` the resolved `(key_marker, last_modified)` position of
-    /// `version_id_marker`, when both markers were supplied and resolved.
-    /// Split out so the rendered SQL — `LIMIT` and marker predicate included —
-    /// is assertable without a database.
+    /// `limit` is the SQL `LIMIT`. It is the caller's fetch cap. `version_cursor`
+    /// is the resolved `(key_marker, last_modified)` position of
+    /// `version_id_marker`. Both markers must be supplied and resolved. Split
+    /// out so the rendered SQL is assertable without a database. The SQL
+    /// includes `LIMIT` and the marker predicate.
     fn object_versions_page_query(
         bucket: &str,
         prefix: Option<&str>,
@@ -860,40 +840,30 @@ impl Repository {
 
     /// List one page of a bucket's object versions.
     ///
-    /// Rows come back ordered `Id ASC, LastModified DESC, VersionId ASC` — the
-    /// S3 version-listing order — and the page is bounded by a SQL `LIMIT`: at
-    /// most `max_keys` rows are ever materialised, so a recursive
-    /// `ListObjectVersions` walk costs one indexed page per request instead of
-    /// a full-table materialisation per page.
+    /// Rows come back ordered `Id ASC, LastModified DESC, VersionId ASC`. That
+    /// is the S3 version-listing order. The page is bounded by a SQL `LIMIT`.
+    /// At most `max_keys` rows are materialised. A recursive
+    /// `ListObjectVersions` walk costs one indexed page per request. It does
+    /// not cost a full-table materialisation per page.
     ///
-    /// Pagination is a SQL predicate, not a post-fetch filter, so rows at or
-    /// before the marker are never read. With only `key_marker` the cursor is
-    /// the key itself; with `key_marker` + `version_id_marker` it is that
-    /// exact row, and the rows after it are the ones with a greater key or a
-    /// smaller `last_modified`. An unknown `version_id_marker` degrades to the
+    /// Pagination is a SQL predicate, not a post-fetch filter. Rows at or
+    /// before the marker are never read. With only `key_marker`, the cursor is
+    /// the key. With `key_marker` plus `version_id_marker`, the cursor is that
+    /// exact row. Rows after it have a greater key or a smaller
+    /// `last_modified`. An unknown `version_id_marker` degrades to the
     /// key-only boundary.
     ///
-    /// Callers pass `max_keys + 1` and use the extra row as the truncation
-    /// sentinel: `len() > max_keys` means another page exists, the sentinel
-    /// row is dropped, and the last returned row supplies the continuation
-    /// `(key_marker, version_id_marker)`.
+    /// Callers pass `max_keys + 1`. They use the extra row as the truncation
+    /// sentinel. `len() > max_keys` means another page exists. The sentinel row
+    /// is dropped. The last returned row supplies the continuation markers.
     ///
-    /// `delimiter` is intentionally ignored: the handler folds the returned
-    /// page into `CommonPrefix` entries, so the page boundary — not the bucket
-    /// — is what bounds that rollup, exactly as when this query was unbounded.
+    /// `delimiter` is ignored. The handler folds the returned page into
+    /// `CommonPrefix` entries. The page boundary bounds that rollup.
     ///
-    /// Returns `(versions, delete_markers)`, both split out of the single
-    /// ordered page, and projected to [`OBJECT_VERSION_COLUMNS`] — `id`,
-    /// `version_id`, `is_latest`, `is_delete_marker`, `size`,
-    /// `last_modified`, `etag` — which is exactly what
-    /// `list_object_versions_inner` reads off a row. `is_delete_marker` and
-    /// `version_id` are kept because the handler splits the page on them and
-    /// renders delete markers with their version id; the heavy JSON columns
-    /// (`content`, `user_metadata`, `tags`, `checksums`) are never read by the
-    /// handler, so they are no longer fetched — a 1000-row page used to drag
-    /// along 1000 JSON documents.
-    /// Documentation.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns `(versions, delete_markers)`. Both come from the single ordered
+    /// page. They are projected to [`OBJECT_VERSION_COLUMNS`]. That is exactly
+    /// what `list_object_versions_inner` reads from a row.
+        #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_object_versions(
         &self,
         bucket: &str,
@@ -1153,13 +1123,13 @@ mod tests {
     // ---- Column projection on the listing paths ----
 
     /// The JSON columns no listing query may fetch. Each is a whole JSON
-    /// document per row, so a 1000-row page used to mean 1000 documents
-    /// pulled across the wire and thrown away unread.
+    /// document per row. A 1000-row page used to mean 1000 documents pulled
+    /// across the wire and thrown away unread.
     const JSON_COLUMNS: [&str; 4] = ["content", "user_metadata", "tags", "checksums"];
 
     /// Rendered SQL of the projected `list_objects` query. `into_model` only
-    /// picks the row decoder -- it emits no SQL of its own -- so the statement
-    /// built here is the one `list_objects` executes.
+    /// picks the row decoder. It emits no SQL of its own. The statement built
+    /// here is the one `list_objects` executes.
     fn list_sql(
         prefix: Option<&str>,
         delimiter: Option<&str>,
@@ -1237,9 +1207,9 @@ mod tests {
         }
     }
 
-    /// Seed one row with every heavy JSON column populated, so a listing that
-    /// dropped or garbled one of them shows up as wrong data rather than as a
-    /// silently smaller payload.
+    /// Seed one row with every heavy JSON column populated. A listing that
+    /// drops or garbles one of them shows up as wrong data. It does not look
+    /// like a silently smaller payload.
     async fn seed_row(
         repo: &Repository,
         key: &str,
@@ -1272,8 +1242,8 @@ mod tests {
             .expect("seed row");
     }
 
-    /// The same query as `list_objects` minus the projection: exactly what a
-    /// pre-projection listing returned, row for row.
+    /// The same query as `list_objects` minus the projection. It is exactly
+    /// what a pre-projection listing returned, row for row.
     async fn list_objects_unprojected(
         repo: &Repository,
         prefix: Option<&str>,
@@ -1523,11 +1493,11 @@ mod tests {
         }
     }
 
-    /// The runtime counterpart of the rendered-SQL assertions: strip the four
-    /// JSON columns off the table and list against it. SQLite refuses to run
-    /// a statement naming a missing column, so a listing that still fetched
-    /// `content` / `user_metadata` / `tags` / `checksums` could not return
-    /// rows here at all.
+    /// The runtime counterpart of the rendered-SQL assertions. Strip the four
+    /// JSON columns off the table. List against it. SQLite refuses to run a
+    /// statement that names a missing column. A listing that still fetched
+    /// `content`, `user_metadata`, `tags`, or `checksums` could not return
+    /// rows here.
     #[tokio::test]
     async fn listing_never_names_the_json_columns_at_runtime() {
         use sea_orm::ConnectionTrait;
@@ -1600,8 +1570,8 @@ mod tests {
 
     // ---- Atomicity of the versioned delete path ----
 
-    /// Insert one version row with an explicit timestamp, so "most recent"
-    /// is unambiguous without depending on clock resolution.
+    /// Insert one version row with an explicit timestamp. "Most recent" becomes
+    /// unambiguous. It does not depend on clock resolution.
     async fn seed_version(repo: &Repository, version_id: &str, at: &str, is_latest: bool) {
         let last_modified = chrono::DateTime::parse_from_rfc3339(at)
             .expect("timestamp")

@@ -19,7 +19,7 @@ pub(crate) enum PutCondition {
     IfMatch(String),
     /// If-Match: * — write only if the object exists.
     IfMatchAny,
-    /// If-None-Match: * — create-only; any existing object → 412.
+    /// If-None-Match: * — create-only. Any existing object returns 412.
     IfNoneMatchAny,
     /// If-None-Match with a specific `ETag`: fail only if the object exists
     /// and its stored `ETag` matches.
@@ -36,12 +36,12 @@ pub(crate) struct ObjectWrite {
     pub content_type: Option<String>,
     pub etag: Option<String>,
     pub content: serde_json::Value,
-    /// x-amz-meta-* map as a JSON object; empty object when none.
+    /// x-amz-meta-* map as a JSON object. Empty object when none.
     pub user_metadata: serde_json::Value,
-    /// Client-provided checksums as a JSON object keyed by algorithm;
+    /// Client-provided checksums as a JSON object keyed by algorithm.
     /// empty object when none.
     pub checksums: serde_json::Value,
-    /// Object tag-set as JSON array of {key, value}; empty array when none.
+    /// Object tag-set as JSON array of {key, value}. Empty array when none.
     pub tags: serde_json::Value,
 }
 

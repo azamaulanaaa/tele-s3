@@ -838,7 +838,7 @@ mod tests {
             .expect("load blob rows")
     }
 
-    /// Make every update of a publish intent fail, so a resolve failure is
+    /// Make every update of a publish intent fail. A resolve failure becomes
     /// observable without a broken database connection.
     async fn refuse_publish_intent_updates(svc: &TeleS3<impl Backend>) {
         svc.repo
@@ -1033,18 +1033,18 @@ mod tests {
             .expect("drop upload delete trigger");
     }
 
-    /// Make `get_object` fail while everything the completion path touches
-    /// before it -- the upload state and its parts -- keeps working.
+    /// Make `get_object` fail. Everything the completion path touches before it
+    /// keeps working. That includes the upload state and its parts.
     ///
-    /// `get_object` reads `s3_object`, so renaming that table away turns the
+    /// `get_object` reads `s3_object`. Renaming that table away turns the
     /// lookup into a hard SQL error. `s3_multipart_upload_state` and
-    /// `s3_blob` are untouched, so the request really does reach the
-    /// replaced-object lookup: the *query itself* fails there, which is
-    /// exactly the condition a handler that folds every error into "nothing
-    /// to release" cannot distinguish from an absent key.
+    /// `s3_blob` stay untouched. The request reaches the replaced-object
+    /// lookup. The query itself fails there. That is the condition a handler
+    /// cannot distinguish from an absent key. The handler folds every error
+    /// into "nothing to release".
     ///
-    /// The table is renamed rather than dropped because `s3_object` holds a
-    /// foreign key into it and SQLite refuses to drop a referenced parent.
+    /// The table is renamed, not dropped. `s3_object` holds a foreign key into
+    /// it. SQLite refuses to drop a referenced parent.
     async fn break_object_lookup<B: crate::backend::Backend>(svc: &TeleS3<B>) {
         svc.repo
             .db
@@ -1053,19 +1053,18 @@ mod tests {
             .expect("rename s3_object away");
     }
 
-    /// A failed read of the object being replaced must abort the completion,
-    /// not report success while silently skipping the blob release.
+    /// A failed read of the object being replaced must abort the completion. It
+    /// must not report success while it skips the blob release.
     ///
-    /// Before the fix this site read `if let Ok(model) = ...get_object(...)`,
-    /// so a repository failure landed in the `else` arm and the previous
-    /// object's blob references were never released.
+    /// Before the fix, this site read `if let Ok(model) = ...get_object(...)`.
+    /// A repository failure landed in the `else` arm. The previous object's
+    /// blob references were never released.
     ///
     /// This is the end-to-end contract check. It cannot isolate the lookup on
-    /// its own: `cas_put_object` writes the same `s3_object` table later in
-    /// the request, so a fault injected at table level surfaces there too
-    /// either way. `replaced_object_propagates_a_repository_read_failure` in
-    /// `s3::objects` pins the swallow itself against the shared helper both
-    /// write paths evaluate.
+    /// its own. `cas_put_object` writes the same `s3_object` table later in
+    /// the request. A fault injected at table level surfaces there too. See
+    /// `replaced_object_propagates_a_repository_read_failure` in `s3::objects`.
+    /// It pins the swallow against the shared helper both write paths evaluate.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn complete_multipart_propagates_object_read_failure() {
@@ -1082,12 +1081,12 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::InternalError);
     }
 
-    /// The guard against over-correcting: a key that holds no object is the
-    /// normal outcome of a first completion, and must stay a silent no-op.
+    /// The guard against over-correcting. A key that holds no object is the
+    /// normal outcome of a first completion. It must stay a silent no-op.
     ///
-    /// `get_object` reports that absence as `Err(NoSuchKey)`, so propagating
-    /// every error -- rather than only `NoSuchKey` -- would break completing
-    /// an upload onto a fresh key.
+    /// `get_object` reports that absence as `Err(NoSuchKey)`. Propagating every
+    /// error would break completing an upload onto a fresh key. Only
+    /// `NoSuchKey` may be treated as absence.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn complete_multipart_onto_absent_key_is_not_an_error() {
@@ -1103,13 +1102,13 @@ mod tests {
         assert_eq!(res.output.key.as_deref(), Some("k"));
     }
 
-    /// A failed state delete must roll the object write back, so the upload
-    /// still owns its part references and a retry publishes usable bytes.
+    /// A failed state delete must roll the object write back. The upload keeps
+    /// its part references. A retry publishes usable bytes.
     ///
-    /// Before the fix the object row was committed first and the state delete
-    /// ran in a second transaction. A retry then released the previous
-    /// object's references after deleting the state, which left the new
-    /// object pointing at a blob that no reference protected.
+    /// Before the fix, the object row was committed first. The state delete ran
+    /// in a second transaction. A retry released the previous object's
+    /// references after deleting the state. The new object pointed at a blob
+    /// that no reference protected.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn complete_multipart_keeps_the_upload_when_the_state_delete_fails() {
@@ -1170,8 +1169,8 @@ mod tests {
         );
     }
 
-    /// A repeated upload of one part number must release the blob that the
-    /// replaced part was the last holder of.
+    /// A repeated upload of one part number must release the blob. The replaced
+    /// part was the last holder of that blob.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn uploading_a_part_again_releases_the_replaced_blob() {
@@ -1233,7 +1232,7 @@ mod tests {
     }
 
     /// A failed release of the replaced object's references must roll the
-    /// completion back, so the old object keeps the bytes it still owns.
+    /// completion back. The old object keeps the bytes it still owns.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn complete_multipart_keeps_the_old_object_when_the_release_fails() {
@@ -1332,8 +1331,8 @@ mod tests {
         );
     }
 
-    /// A failed blob release must leave the upload in place, not delete the
-    /// only record of references that are still alive.
+    /// A failed blob release must leave the upload in place. It must not delete
+    /// the only record of references that are still alive.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn abort_multipart_keeps_the_upload_when_the_blob_release_fails() {

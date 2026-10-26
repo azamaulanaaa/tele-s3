@@ -1,20 +1,23 @@
-//! Parsing of the `x-amz-tagging` request header into the stored tag-set
-//! document, and the percent-decoding it needs.
+//! This module parses the `x-amz-tagging` request header into the stored
+//! tag-set document. It also does the percent-decoding that parsing needs.
 //!
-//! Wire format only: `Key1=Value1&Key2=Value2` as it arrives on a request.
-//! Once decoded, the tag set is an ordinary [`super::tags`] document, so
-//! nothing outside this file should be parsing the query-param form.
+//! It handles the wire format only. The wire format is
+//! `Key1=Value1&Key2=Value2`. It arrives on a request. After decoding,
+//! the tag set becomes an ordinary [`super::tags`] document. Code outside
+//! this file must not parse the query-param form.
 
 use s3s::{S3Error, S3ErrorCode, S3Result};
 
 /// Percent-decode a `x-amz-tagging` query-param string (`Key1=Value1&...`).
 ///
-/// Decoding is byte-oriented end to end: escaped octets are appended to a
-/// byte buffer and the result is assembled as UTF-8 once, so multi-byte
-/// sequences such as `%C3%A9` round-trip instead of being reinterpreted as
-/// Latin-1. Never index-slice `input` (a `%` followed by non-ASCII would
-/// panic on a non-char-boundary); an escape that cannot produce valid UTF-8
-/// is `InvalidArgument`.
+/// Decoding works on bytes from start to finish. The code appends escaped
+/// octets to a byte buffer. The code assembles the result as UTF-8 once.
+/// Multi-byte sequences such as `%C3%A9` remain unchanged. The code does
+/// not reinterpret them as Latin-1.
+///
+/// Never index-slice `input`. A `%` followed by non-ASCII would panic on
+/// a non-char boundary. An escape that cannot produce valid UTF-8 gives
+/// `InvalidArgument`.
 fn percent_decode(input: &str) -> S3Result<String> {
     let invalid = || S3Error::new(S3ErrorCode::InvalidArgument);
     let bytes = input.as_bytes();
@@ -41,9 +44,9 @@ fn percent_decode(input: &str) -> S3Result<String> {
     String::from_utf8(out).map_err(|_| invalid())
 }
 
-/// Parse `x-amz-tagging` header (`TaggingHeader`) into the JSON tag-set
-/// storage format (`[{"key":..,"value":..}]`). `None`/empty → `[]`.
-/// Enforces S3 limits: max 10 tags.
+/// Parse the `x-amz-tagging` header (`TaggingHeader`) into the JSON
+/// tag-set storage format (`[{"key":..,"value":..}]`). Return `[]` for
+/// `None` or an empty header. Enforce the S3 limit of 10 tags.
 pub(crate) fn tagging_header_to_json(tagging: Option<&str>) -> S3Result<serde_json::Value> {
     let header = tagging.map(str::trim).unwrap_or_default();
     if header.is_empty() {

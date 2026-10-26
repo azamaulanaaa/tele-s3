@@ -1,11 +1,15 @@
-//! Translation of write-side request conditions into repository
-//! preconditions, plus the error shape delete-marker reads need.
+//! This module translates write-side request conditions into repository
+//! preconditions. It also defines the error shape that delete-marker reads
+//! need.
 //!
-//! Owns `If-Match`/`If-None-Match` on writes, which cannot be answered by
-//! inspecting a row the way reads are — they have to become a compare-and-set
-//! the publish transaction enforces atomically. Keep repository-side
-//! execution out of here: the translation ends at [`PutCondition`], and the
-//! SQL that acts on it belongs to the repository.
+//! This module owns `If-Match` and `If-None-Match` on writes. A write
+//! cannot answer them by inspecting a row the way a read does. They must
+//! become a compare-and-set. The publish transaction enforces that
+//! compare-and-set atomically.
+//!
+//! Keep repository-side execution out of this module. The translation
+//! ends at [`PutCondition`]. The SQL that handles [`PutCondition`]
+//! belongs to the repository.
 
 use s3s::{
     S3Error, S3ErrorCode, S3Result,
@@ -37,12 +41,13 @@ pub(crate) fn build_put_condition(
     })
 }
 
-/// Build an error for requests addressing a delete marker.
+/// Build an error for a request that addresses a delete marker.
 ///
-/// S3 answers GET/HEAD on a delete-marker latest (or version-addressed
-/// marker reads) with the usual error code but carries
-/// `x-amz-delete-marker: true` and `x-amz-version-id` headers so clients
-/// can tell a versioned delete from a missing key.
+/// S3 answers GET or HEAD on the latest delete marker. S3 also answers
+/// version-addressed marker reads. S3 uses the usual error code. S3 also
+/// carries `x-amz-delete-marker: true` and `x-amz-version-id` headers.
+/// Clients use those headers to tell a versioned delete from a missing
+/// key.
 pub(crate) fn delete_marker_error(version_id: &str, code: S3ErrorCode) -> S3Error {
     let mut err = S3Error::new(code);
 

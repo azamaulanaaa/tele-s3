@@ -1,30 +1,32 @@
 //! Health, readiness and introspection endpoints.
 //!
-//! They are served from the S3 listener, ahead of the S3 handlers, and are
-//! deliberately tiny: three JSON documents an orchestrator or an operator can
-//! read without knowing anything about this crate.
+//! The S3 listener serves these endpoints before the S3 handlers. They stay
+//! small by design. An orchestrator or an operator can read three JSON
+//! documents. The reader needs no knowledge of this crate.
 //!
-//! * **Liveness** — the process is alive and answering HTTP.
-//! * **Readiness** — start-up finished and S3 traffic is being served.
+//! * **Liveness** — the process is alive. It answers HTTP.
+//! * **Readiness** — start-up finished. The server serves S3 traffic.
 //! * **Introspection** — the effective runtime state: the Telegram tuning
-//!   knobs, the listen port and what each start-up reconciler did.
+//!   knobs, the listen port, and what each start-up reconciler did.
 //!
-//! None of them touch the database or Telegram, so a rate-limited upstream
-//! can never make a perfectly healthy server look broken to an orchestrator.
+//! None of them touch the database or Telegram. A rate-limited upstream
+//! cannot make a healthy server look broken to an orchestrator.
 //!
 //! # Authentication
 //!
-//! These endpoints are **unauthenticated**. A probe that has to sign a request
-//! is a probe that stops working the first time it expires, which is the
-//! opposite of what a health check is for. Nothing sensitive is published:
-//! see [`AdminState`] for what the introspection document is allowed to carry.
+//! These endpoints are unauthenticated. A probe that must sign a request
+//! stops working when it expires. That is the opposite of what a health
+//! check needs. Nothing sensitive is published. See
+//! [`AdminState`](crate::admin::AdminState) for what the introspection
+//! document can carry.
 //!
 //! # Path safety
 //!
-//! S3 addresses objects at `/{bucket}/{key}`, so any path a client chooses can
-//! name a bucket. A bare `/healthz` would therefore be read as bucket
-//! `healthz`. Every admin path starts with [`ADMIN_PREFIX`], whose leading `.`
-//! makes it unreachable as a bucket name — see that constant's documentation.
+//! S3 addresses objects at `/{bucket}/{key}`. A client can name any bucket
+//! with any path. A bare `/healthz` names bucket `healthz`. Every admin path
+//! starts with [`ADMIN_PREFIX`](crate::admin::ADMIN_PREFIX). Its leading `.`
+//! makes it unreachable as a bucket name. See that constant's
+//! documentation.
 
 use crate::backend::GrammersLimits;
 
@@ -35,17 +37,17 @@ use serde_json::{Value, json};
 /// Reserved prefix for every admin endpoint.
 ///
 /// The leading `.` is the whole point. An S3 bucket name must begin and end
-/// with a lowercase letter or a digit — the crate's own
-/// `validate_bucket_name` rejects anything else — so `.tele-s3` can never be
-/// a bucket, and no `PUT /.tele-s3/...` can ever create one. Under the S3
-/// path grammar the first segment of a request is the bucket, so nothing an
-/// S3 client can legitimately ask for lands inside this prefix.
+/// with a lowercase letter or a digit. The crate's own `validate_bucket_name`
+/// rejects anything else. So `.tele-s3` can never be a bucket. No
+/// `PUT /.tele-s3/...` can create one. Under the S3 path grammar, the first
+/// segment of a request is the bucket. Nothing an S3 client can ask for
+/// lands inside this prefix.
 pub const ADMIN_PREFIX: &str = "/.tele-s3";
 
 /// Liveness: is this process alive and serving HTTP?
 pub const LIVENESS_PATH: &str = "/.tele-s3/healthz";
 
-/// Readiness: has start-up finished, so that S3 traffic is being served?
+/// Readiness: has start-up finished? Does the server serve S3 traffic?
 pub const READINESS_PATH: &str = "/.tele-s3/readyz";
 
 /// Introspection: the effective runtime state of this process.
@@ -66,12 +68,12 @@ pub enum AdminEndpoint {
     Readiness,
     /// [`INTROSPECTION_PATH`].
     Introspection,
-    /// The reserved prefix, but no endpoint by that name.
+    /// The reserved prefix names no endpoint.
     Unknown,
 }
 
 impl AdminEndpoint {
-    /// Stable name for the endpoint, used as a tracing field.
+    /// Stable name for the endpoint. The code uses it as a tracing field.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -85,8 +87,8 @@ impl AdminEndpoint {
 
 /// Classify a request path.
 ///
-/// `None` means "not an admin request": the caller must let the request
-/// through to S3 untouched.
+/// `None` means "not an admin request". The caller must pass the request to
+/// S3 without changes.
 #[must_use]
 pub fn classify(path: &str) -> Option<AdminEndpoint> {
     match path {
@@ -102,8 +104,9 @@ pub fn classify(path: &str) -> Option<AdminEndpoint> {
 
 /// Whether a path is inside [`ADMIN_PREFIX`].
 ///
-/// Matched on a segment boundary, so a bucket called `.tele-s3x` — itself
-/// impossible, but worth not assuming — cannot claim the prefix.
+/// The code matches on a segment boundary. A bucket named `.tele-s3x`
+/// cannot claim the prefix. That bucket name is impossible, but the code
+/// does not assume it.
 fn is_reserved(path: &str) -> bool {
     path.strip_prefix(ADMIN_PREFIX)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -112,17 +115,18 @@ fn is_reserved(path: &str) -> bool {
 /// What one start-up reconciliation pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcilerOutcome {
-    /// The pass ran. `affected` rows were reconciled (or cleared); zero is a
-    /// perfectly ordinary result, not a failure.
+    /// The pass ran. It reconciled or cleared `affected` rows. Zero is an
+    /// ordinary result. Zero is not a failure.
     #[allow(missing_docs)]
     Completed { affected: usize },
     /// The pass returned an error.
     ///
-    /// The message is deliberately not carried: it is free-form operator text
-    /// that could quote anything the backend had in hand, and this document
-    /// is served unauthenticated. Which pass failed is what an operator needs,
-    /// and it is a closed set — the [`error.type`](ORPHAN_BLOB_RECONCILER_ERROR_TYPE)
-    /// name. The message is logged at start-up, where it belongs.
+    /// The code does not carry the message. The message is free-form operator
+    /// text. It could quote anything the backend had in hand. The code serves
+    /// this document without authentication. An operator needs to know which pass
+    /// failed. The failed pass is a closed set. That set is the
+    /// [`error.type`](ORPHAN_BLOB_RECONCILER_ERROR_TYPE) name. The code logs
+    /// the message at start-up.
     Failed,
 }
 
@@ -137,12 +141,13 @@ pub struct StartupReport {
 
 /// The runtime state the admin endpoints publish.
 ///
-/// The field list *is* the redaction policy: it holds a port, three numbers
-/// and two closed enums, so there is no path by which `auth_access_key`,
-/// `auth_secret_key`, `api_hash`, `bot_token`, `database_uri` or any other
-/// config value — in whole, in part, or wrapped in an error string — reaches
-/// a response. Adding a field here is the only way to change that, and the
-/// whitelist test is what makes it a deliberate act.
+/// The field list is the redaction policy. It holds a port, three numbers,
+/// and two closed enums. No path allows `auth_access_key`,
+/// `auth_secret_key`, `api_hash`, `bot_token`, `database_uri`, or any
+/// other config value to reach a response. The value cannot reach it in
+/// whole, in part, or in an error string. Adding a field here is the only
+/// way to change the policy. The whitelist test makes that change
+/// deliberate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminState {
     listen_port: u16,
@@ -156,22 +161,21 @@ pub struct AdminState {
 impl AdminState {
     /// Capture the state to publish.
     ///
-    /// Takes the port and the limits by value rather than a `&Config` on
-    /// purpose: there is no argument through which a credential could arrive.
+    /// The method takes the port and the limits by value. It does not take a
+    /// `&Config`. No argument can carry a credential.
     ///
-    /// `trace_export` is a bool and not the endpoint itself, because the
-    /// endpoint is operator infrastructure — often an in-cluster address with
-    /// a hostname in it — and this document is served unauthenticated. What
-    /// an operator needs to know from a probe is whether spans are leaving
-    /// the process at all.
+    /// `trace_export` is a bool. It is not the endpoint itself. The endpoint
+    /// is operator infrastructure. It often holds an in-cluster address with a
+    /// hostname. The code serves this document without authentication. A probe
+    /// needs to know whether spans leave the process at all.
     ///
     /// `metrics_export` answers the same question for the rate-limit and RPC
-    /// metrics, which is the pair an operator tuning
-    /// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS` and
-    /// `TELE_S3_MAX_ATTEMPTS` needs: without them they are tuning blind.
-    /// It tracks `trace_export` today — one endpoint turns both on — and is
-    /// published separately so a probe can tell which half of the pipeline a
-    /// future change left dark.
+    /// metrics. An operator tunes
+    /// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS`, and
+    /// `TELE_S3_MAX_ATTEMPTS`. Without these metrics, the operator tunes
+    /// blind. `metrics_export` tracks `trace_export` today. One endpoint turns
+    /// both on. The code publishes `metrics_export` separately. A probe can
+    /// then tell which half of the pipeline a future change made dark.
     #[must_use]
     pub fn new(
         listen_port: u16,
@@ -193,12 +197,12 @@ impl AdminState {
 
     /// Liveness.
     ///
-    /// Always [`StatusCode::OK`], and derived from nothing at all: not
-    /// Telegram reachability, not the database, not the reconcilers. A server
-    /// answering this question at all is alive by definition, and a Telegram
-    /// rate limit must never look like a dead process to whatever is
-    /// supervising it — that would turn a throttled upstream into a restart
-    /// loop over a healthy server.
+    /// The method always returns [`StatusCode::OK`]. It derives from nothing.
+    /// It does not use Telegram reachability. It does not use the database.
+    /// It does not use the reconcilers. A server that answers this question
+    /// is alive by definition. A Telegram rate limit must never look like a
+    /// dead process to the supervisor. That would turn a throttled upstream
+    /// into a restart loop over a healthy server.
     #[must_use]
     pub fn liveness(&self) -> AdminResponse {
         AdminResponse::ok(json!({ "status": "ok" }))
@@ -206,22 +210,22 @@ impl AdminState {
 
     /// Readiness.
     ///
-    /// Also always [`StatusCode::OK`], by a deliberate decision rather than
-    /// by accident: reaching this handler already means start-up ran to
-    /// completion, because reconciliation finishes before the listener binds.
-    /// So the question "is reconciliation done?" has exactly one answer here,
-    /// and the only thing left to report is *how it went*.
+    /// The method also always returns [`StatusCode::OK`]. This is a deliberate
+    /// decision, not an accident. Reaching this handler means start-up ran to
+    /// completion. Reconciliation finishes before the listener binds. So the
+    /// question "is reconciliation done?" has one answer here. The code reports
+    /// how it went.
     ///
-    /// A reconciler failure does **not** clear readiness. Both passes are
-    /// best-effort garbage collection: a failed pass leaves unreferenced rows
-    /// behind, which no listing shows and which the next pass can still
-    /// reclaim. Reads and writes are served from the database and Telegram
-    /// either way. Reporting a failed pass as "not ready" would let an
-    /// orchestrator stop routing traffic to a server that is fully capable of
-    /// serving it — converting a garbage-collection nuisance into an outage,
-    /// with no remedy available short of restarting the very process that
-    /// would fix it. The outcome is published in the body and logged at
-    /// start-up instead, where an operator can act on it.
+    /// A reconciler failure does not clear readiness. Both passes do
+    /// best-effort garbage collection. A failed pass leaves unreferenced
+    /// rows. No listing shows those rows. The next pass can reclaim them.
+    /// The database and Telegram serve reads and writes either way. Reporting a
+    /// failed pass as "not ready" would let an orchestrator stop routing
+    /// traffic to a capable server. That would make a garbage-collection
+    /// nuisance an outage. No remedy exists short of
+    /// restarting the process that would fix it. The code publishes the outcome
+    /// in the body. The code logs it at start-up. An operator can handle it
+    /// there.
     #[must_use]
     pub fn readiness(&self) -> AdminResponse {
         AdminResponse::ok(json!({
@@ -232,12 +236,13 @@ impl AdminState {
 
     /// Introspection: the effective runtime state.
     ///
-    /// What an operator needs when a request is failing and the config file
-    /// is three environments away: the three Telegram knobs actually in force
-    /// (after environment overrides and clamping), the port actually bound,
-    /// and what start-up reconciliation achieved. No database counts — those
-    /// would put a live query on an unauthenticated probe path, which is a
-    /// poor trade for a number nobody needs to make a decision.
+    /// An operator needs this when a request fails. The config file may be
+    /// three environments away. The document shows the three Telegram knobs in
+    /// force. Environment overrides and clamping set those knobs. It shows the
+    /// bound port. It shows what start-up reconciliation achieved. It omits
+    /// database counts. Database counts would put a live query on an
+    /// unauthenticated probe path. That is a poor trade for a number no one
+    /// needs to decide.
     #[must_use]
     pub fn introspection(&self) -> AdminResponse {
         AdminResponse::ok(json!({
@@ -260,8 +265,8 @@ impl AdminState {
         }))
     }
 
-    /// The start-up reconciliation section, shared by readiness and
-    /// introspection.
+    /// The start-up reconciliation section. Readiness and introspection share
+    /// it.
     fn startup_json(&self) -> Value {
         json!({
             "orphan_blob_reconciliation": reconciler_json(
@@ -286,8 +291,8 @@ fn reconciler_json(outcome: ReconcilerOutcome, error_type: &str) -> Value {
     }
 }
 
-/// An admin response, kept as plain data so every endpoint can be tested
-/// without a listener.
+/// An admin response. The code keeps it as plain data. Every endpoint can
+/// be tested without a listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminResponse {
     /// HTTP status code.
@@ -307,9 +312,10 @@ impl AdminResponse {
 
 /// A reserved path that names no endpoint.
 ///
-/// Answered here rather than by S3: an operator who mistypes
-/// `/.tele-s3/health` deserves a 404 naming the prefix, not an
-/// `InvalidBucketName` about a bucket they never asked for.
+/// The admin layer answers it. S3 does not. An operator who mistypes
+/// `/.tele-s3/health` deserves a 404 that names the prefix. The operator
+/// does not deserve an `InvalidBucketName` error about a bucket they never
+/// asked for.
 fn unknown_endpoint_response() -> AdminResponse {
     AdminResponse {
         status: StatusCode::NOT_FOUND,
@@ -322,8 +328,8 @@ fn unknown_endpoint_response() -> AdminResponse {
     }
 }
 
-/// Milliseconds in the IO timeout, saturating rather than wrapping: the value
-/// is a Duration an operator set, and an unreadable number is worse than a
+/// Milliseconds in the IO timeout. The value saturates. It does not wrap.
+/// An operator set the Duration. An unreadable number is worse than a
 /// clamped one.
 trait IoTimeoutMs {
     fn io_timeout_ms(&self) -> u64;
@@ -337,9 +343,9 @@ impl IoTimeoutMs for GrammersLimits {
 
 /// The `s3s` hook that answers admin requests before S3 does.
 ///
-/// Registered with `S3ServiceBuilder::set_route`. Every unmatched request is
-/// passed straight through to the S3 pipeline, so S3 traffic — including its
-/// authentication — is untouched.
+/// Register it with `S3ServiceBuilder::set_route`. The hook passes every
+/// unmatched request to the S3 pipeline. S3 traffic stays untouched. That
+/// includes authentication.
 #[derive(Debug, Clone, Copy)]
 pub struct AdminRoute {
     state: AdminState,
@@ -367,11 +373,11 @@ impl S3Route for AdminRoute {
 
     /// Admin probes are unauthenticated.
     ///
-    /// `s3s` verifies a signature only when one is present, so an unsigned
-    /// probe arrives here without credentials and the default implementation
-    /// would answer `AccessDenied`. That default is right for S3 operations
-    /// and wrong for a health check, so it is overridden — and only here: the
-    /// access stage of every S3 operation still runs exactly as before.
+    /// `s3s` verifies a signature only when one is present. An unsigned probe
+    /// arrives here without credentials. The default implementation would
+    /// answer `AccessDenied`. That default fits S3 operations. It does not fit
+    /// a health check. The code overrides it here only. The access stage of
+    /// every S3 operation still runs as before.
     async fn check_access(&self, _req: &mut S3Request<Body>) -> S3Result<()> {
         Ok(())
     }
@@ -418,7 +424,7 @@ mod tests {
     use crate::s3::helpers::validate_bucket_name;
     use serde_json::Value;
 
-    /// Sample state with both reconcilers healthy.
+    /// Sample state. Both reconcilers are healthy.
     fn state() -> AdminState {
         AdminState::new(
             8000,
@@ -472,10 +478,10 @@ mod tests {
         }
     }
 
-    /// The reason the prefix is reserved the way it is: it is not a name the
-    /// S3 API can ever accept, so it cannot shadow a bucket. Checked against
-    /// the crate's own validator rather than a copy of the rule, so this test
-    /// cannot drift from what `CreateBucket` enforces.
+    /// The prefix is reserved because the S3 API cannot accept it. The prefix
+    /// cannot shadow a bucket. This test checks the crate's validator. It does
+    /// not check a copy of the rule. The test cannot drift from what
+    /// `CreateBucket` enforces.
     #[test]
     #[allow(clippy::expect_used)]
     fn the_reserved_prefix_cannot_be_a_bucket_name() {
@@ -561,9 +567,9 @@ mod tests {
         );
     }
 
-    /// The redaction policy, enforced as a whitelist: the introspection
-    /// document has exactly these keys, so a future field that carried a
-    /// config value could not be added without failing this test.
+    /// The redaction policy is a whitelist. The introspection document has
+    /// exactly these keys. A future field that carries a config value cannot
+    /// be added without failing this test.
     #[test]
     #[allow(clippy::expect_used)]
     fn introspection_publishes_only_documented_fields() {
@@ -615,9 +621,9 @@ mod tests {
         );
     }
 
-    /// Every value in the document is a literal or a number. A string that
-    /// came from anywhere but this file would be the only way a secret could
-    /// escape, and there is nowhere for one to come from.
+    /// Every value in the document is a literal or a number. A string from any
+    /// other file would be the only way a secret could escape. There is
+    /// nowhere for one to come from.
     #[test]
     #[allow(clippy::expect_used)]
     fn introspection_contains_no_free_form_text() {

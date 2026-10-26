@@ -36,13 +36,7 @@ use crate::backend::{
 
 /// Map one [`ReadOutcome`] to the reader this read path needs.
 ///
-/// The metadata store resolved these blobs *before* the backend was asked
-/// for them, so both non-present variants are failures here: `Missing` means
-/// bytes that were promised are gone, and `Fault` means the backend cannot
-/// serve bytes it holds. Neither is a client error — the object was resolved,
-/// so it exists and a `NoSuchKey` would be a lie. Both answer
-/// [`S3ErrorCode::InternalError`] with that code's own generic text; what
-/// distinguished them reaches the server log, as the fault's error source.
+/// The metadata store resolved these blobs before the backend was asked for them. Both non-present variants are failures here. `Missing` means bytes that were promised are gone. `Fault` means the backend cannot serve bytes it holds. Neither is a client error. The object was resolved, so it exists. A `NoSuchKey` would be a lie. Both answer [`S3ErrorCode::InternalError`] with that code's own generic text. What distinguished them reaches the server log, as the fault's error source.
 pub(super) fn read_outcome_to_reader(outcome: ReadOutcome) -> S3Result<BoxedAsyncReader> {
     match outcome {
         ReadOutcome::Present(reader) => Ok(reader),
@@ -51,15 +45,12 @@ pub(super) fn read_outcome_to_reader(outcome: ReadOutcome) -> S3Result<BoxedAsyn
     }
 }
 
-/// Upper bound the S3 API applies to `max-keys`; larger client values are
-/// silently clamped rather than rejected.
+/// The S3 API applies this upper bound to `max-keys`. The code silently clamps larger client values. It does not reject them.
 pub(super) const MAX_KEYS_CEILING: i32 = 1000;
 
 /// Validate a client-supplied paging size and apply the S3 ceiling.
 ///
-/// `s3s` parses `max-keys` as a plain `i32` with no range check, so a
-/// negative value must be rejected here instead of being cast into a huge
-/// unsigned limit further down.
+/// `s3s` parses `max-keys` as a plain `i32` with no range check. The code must reject a negative value here. It must not cast that value into a huge unsigned limit further down.
 pub(super) fn checked_max_keys(max_keys: Option<i32>) -> S3Result<i32> {
     let raw = max_keys.unwrap_or(MAX_KEYS_CEILING);
     if raw < 0 {
@@ -70,9 +61,7 @@ pub(super) fn checked_max_keys(max_keys: Option<i32>) -> S3Result<i32> {
 
 /// Validate the `max-uploads` paging size of `ListMultipartUploads`.
 ///
-/// `max-uploads` is bounded by the same S3 ceiling as `max-keys` and has the
-/// same unset default, so the rule lives in one place; this alias keeps the
-/// call site in the multipart listing readable.
+/// `max-uploads` shares the same S3 ceiling as `max-keys`. It has the same unset default. The rule lives in one place. This alias keeps the call site in the multipart listing readable.
 pub(super) fn checked_max_uploads(max_uploads: Option<i32>) -> S3Result<i32> {
     checked_max_keys(max_uploads)
 }
@@ -84,15 +73,12 @@ pub(super) fn checked_content_length(content_length: Option<i64>) -> S3Result<u6
 
 /// The listing-row fields the rollup reads: key, size and last-modified.
 ///
-/// `ObjectListRow` lives in the repository module, so callers map their rows
-/// into this tuple rather than naming the DTO.
+/// `ObjectListRow` lives in the repository module. Callers map their rows into this tuple rather than naming the DTO.
 type ListRow<'a> = (&'a str, u32, chrono::DateTime<chrono::Utc>);
 
 /// The `CommonPrefix` a key rolls into, or `None` when it is listed whole.
 ///
-/// The part of `key` after `prefix` is split at its first `delimiter`; the
-/// common prefix is `prefix` plus the segment before it. A key with no
-/// delimiter after the prefix is its own `Object`.
+/// The code splits the part of `key` after `prefix` at its first `delimiter`. The common prefix is `prefix` plus the segment before it. A key with no delimiter after the prefix is its own `Object`.
 fn common_prefix_for(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
     let without_prefix = key.strip_prefix(prefix).unwrap_or(key);
 
@@ -101,12 +87,9 @@ fn common_prefix_for(key: &str, prefix: &str, delimiter: &str) -> Option<String>
         .map(|(sub_key, _)| format!("{prefix}{sub_key}{delimiter}"))
 }
 
-/// Roll one page of listing rows into `Object`s and `CommonPrefix`es, and
-/// derive the cursor that resumes the page after it.
+/// Roll one page of listing rows into `Object`s and `CommonPrefix`es, and derive the cursor that resumes the page after it.
 ///
-/// Both list shapes (v1 and v2) roll up identically, so the rule lives here
-/// once. `truncated` is the raw-row overflow flag; the cursor is the last
-/// row's key, and is present only when that flag is set.
+/// Both list shapes (v1 and v2) roll up identically. The rule lives here once. `truncated` is the raw-row overflow flag. The cursor is the last row's key. It is present only when that flag is set.
 fn rollup_list_page<'a>(
     rows: impl IntoIterator<Item = ListRow<'a>>,
     prefix: &str,
@@ -424,18 +407,11 @@ impl<B: Backend> TeleS3<B> {
         Ok(res)
     }
 
-    /// The latest object a copy is about to replace, or `None` when the
-    /// destination key holds nothing to release.
+    /// The latest object a copy is about to replace, or `None` when the destination key holds nothing to release.
     ///
-    /// `get_object` reports absence as `Err(NoSuchKey)` rather than
-    /// `Ok(None)`, so "the key is empty" and "the read failed" arrive on the
-    /// same error channel. Folding both into the old `if let Ok(..)` skipped
-    /// the blob release on every repository failure, leaking the previous
-    /// object's blob references; propagating both, on the other hand, turns
-    /// every copy onto a fresh key into a client-visible error.
+    /// `get_object` reports absence as `Err(NoSuchKey)` rather than `Ok(None)`. "The key is empty" and "the read failed" arrive on the same error channel. Folding both into the old `if let Ok(..)` skipped the blob release on every repository failure. That leaked the previous object's blob references. Propagating both turns every copy onto a fresh key into a client-visible error.
     ///
-    /// Only `NoSuchKey` is folded into `None`. Every other error propagates,
-    /// aborting the request. Do NOT simplify this into a blanket `?`.
+    /// The code folds only `NoSuchKey` into `None`. Every other error propagates. The request aborts. Do NOT simplify this into a blanket `?`.
     pub(crate) async fn replaced_object(
         &self,
         bucket: &str,
@@ -596,10 +572,7 @@ impl<B: Backend> TeleS3<B> {
 
     /// Resolve the object a read (`GetObject` / `HeadObject`) addresses.
     ///
-    /// Addressing a delete marker by version is `MethodNotAllowed` (405); a
-    /// latest-key read of one reads as `NoSuchKey`, but S3 still reports which
-    /// marker hides the key. Both operations answer from the same row, so the
-    /// rule lives here once.
+    /// Addressing a delete marker by version is `MethodNotAllowed` (405). A latest-key read of one reads as `NoSuchKey`. S3 still reports which marker hides the key. Both operations answer from the same row. The rule lives here once.
     async fn resolve_read_object(
         &self,
         bucket: &str,
@@ -1210,8 +1183,7 @@ impl<B: Backend> TeleS3<B> {
 
     /// Confirm the addressed object exists before answering an ACL request.
     ///
-    /// Both ACL verbs answer from the same canned grant and differ only in
-    /// whether they are addressed to a specific version.
+    /// Both ACL verbs answer from the same canned grant. They differ only in whether they are addressed to a specific version.
     async fn ensure_object_exists(
         &self,
         bucket: &str,
@@ -1227,8 +1199,7 @@ impl<B: Backend> TeleS3<B> {
 
     /// The version a tagging write reports back.
     ///
-    /// Without an explicit `versionId` the write applies to the latest
-    /// version, which is only reported on a versioned bucket.
+    /// Without an explicit `versionId`, the write applies to the latest version. That version is only reported on a versioned bucket.
     async fn tagging_write_version_id(
         &self,
         bucket: &str,
@@ -1374,8 +1345,7 @@ mod tests {
         TeleS3::init(Memory::default(), db).await.expect("init")
     }
 
-    /// A backend whose writes can be made to fail on demand, so what the
-    /// publish intent survives is observable.
+    /// A backend whose writes can fail on demand. The test observes what the publish intent survives.
     struct FlakyWrite {
         inner: Memory<8, 8>,
         fail_write: std::sync::atomic::AtomicBool,
@@ -1871,18 +1841,11 @@ mod tests {
         }
     }
 
-    /// Make every `get_bucket_versioning` query fail while leaving the rest of
-    /// the schema readable.
+    /// Make every `get_bucket_versioning` query fail while leaving the rest of the schema readable.
     ///
-    /// `get_bucket_versioning` reads `s3_bucket`, so renaming that table away
-    /// turns the versioning lookup into a hard SQL error while object reads
-    /// (which touch `s3_object`) keep succeeding. That isolates the exact
-    /// condition under test: the *query itself* fails, so a handler that
-    /// reports the bucket as unversioned is provably swallowing an error
-    /// rather than observing `Ok(None)`.
+    /// `get_bucket_versioning` reads `s3_bucket`. Renaming that table away turns the versioning lookup into a hard SQL error. Object reads touch `s3_object` and keep succeeding. That isolates the exact condition under test. The query itself fails. A handler that reports the bucket as unversioned is provably swallowing an error rather than observing `Ok(None)`.
     ///
-    /// The table is renamed rather than dropped because `s3_object` holds a
-    /// foreign key into it and SQLite refuses to drop a referenced parent.
+    /// The test renames the table rather than dropping it. `s3_object` holds a foreign key into it. SQLite refuses to drop a referenced parent.
     async fn break_versioning_lookup(svc: &TeleS3<Memory<1, 1>>) {
         svc.repo
             .db
@@ -1893,10 +1856,7 @@ mod tests {
 
     /// A versioning lookup that fails must surface, not read as "unversioned".
     ///
-    /// Before the fix each of these five sites did
-    /// `.unwrap_or(None)`, so a broken versioning query was indistinguishable
-    /// from a genuinely unversioned bucket -- and on the destructive paths
-    /// (bulk delete, tagging write) that meant silently discarding versions.
+    /// Before the fix each of these five sites did `.unwrap_or(None)`. A broken versioning query was indistinguishable from a genuinely unversioned bucket. On the destructive paths (bulk delete, tagging write) that meant silently discarding versions.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn versioned_read_paths_propagate_versioning_lookup_failure() {
@@ -1923,8 +1883,7 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::InternalError);
     }
 
-    /// The destructive sites: a failed versioning lookup must abort the whole
-    /// request rather than fall through to the non-versioned path.
+    /// The destructive sites: a failed versioning lookup must abort the whole request rather than fall through to the non-versioned path.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn destructive_paths_fail_closed_on_versioning_lookup_failure() {
@@ -1951,8 +1910,7 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::InternalError);
     }
 
-    /// The unversioned case must keep answering `Ok(None)`: the fix changes
-    /// error handling only, never a bucket that genuinely has no versioning.
+    /// The unversioned case must keep answering `Ok(None)`. The fix changes error handling only. It never changes a bucket that genuinely has no versioning.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn unversioned_bucket_still_reports_no_version_id() {
@@ -2017,8 +1975,7 @@ mod tests {
         }
     }
 
-    /// One page of `list_object_versions_inner` reduced to the fields a
-    /// delimiter-aware client actually reads.
+    /// One page of `list_object_versions_inner` reduced to the fields a delimiter-aware client actually reads.
     #[derive(Debug, PartialEq, Eq)]
     struct Page {
         prefixes: Vec<String>,
@@ -2166,8 +2123,7 @@ mod tests {
         put_body_req(bucket, key, content_length, Vec::new())
     }
 
-    /// A `PutObject` carrying `body`, so the write actually reaches the
-    /// backend (a zero-length body never calls it).
+    /// A `PutObject` carrying `body`. The write reaches the backend. A zero-length body never calls it.
     fn put_body_req(
         bucket: &str,
         key: &str,
@@ -2205,8 +2161,7 @@ mod tests {
         req
     }
 
-    /// Make every update of a publish intent fail, so a resolve failure is
-    /// observable without a broken database connection.
+    /// Make every update of a publish intent fail. A resolve failure becomes observable without a broken database connection.
     async fn refuse_publish_intent_updates(svc: &TeleS3<impl Backend>) {
         svc.repo
             .db
@@ -2678,19 +2633,11 @@ mod tests {
         }
     }
 
-    /// A read failure on the object a copy is about to replace must abort the
-    /// request, not silently skip releasing the old object's blobs.
+    /// A read failure on the object a copy is about to replace must abort the request. It must not silently skip releasing the old object's blobs.
     ///
-    /// Before the fix this lookup read `else if let Ok(old) = ...get_object()`,
-    /// so a repository failure was indistinguishable from "there is nothing to
-    /// replace" and the old object's blob references were never released.
+    /// Before the fix this lookup read `else if let Ok(old) = ...get_object()`. A repository failure was indistinguishable from "there is nothing to replace". The old object's blob references were never released.
     ///
-    /// The assertion is made on `replaced_object` rather than on the whole
-    /// request because a table-level fault cannot be isolated to this lookup:
-    /// the copy's *source* read hits `s3_object` too, so a broken table fails
-    /// the request earlier no matter how this site is written. The helper is
-    /// the exact expression both write paths evaluate, and the end-to-end
-    /// absence test below pins the branch that follows it.
+    /// The test asserts on `replaced_object` rather than on the whole request. A table-level fault cannot be isolated to this lookup. The copy's source read hits `s3_object` too. A broken table fails the request earlier no matter how this site is written. The helper is the exact expression both write paths evaluate. The end-to-end absence test below pins the branch that follows it.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn replaced_object_propagates_a_repository_read_failure() {
@@ -2709,12 +2656,9 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::InternalError);
     }
 
-    /// The absent case, at both levels: a key with nothing to replace is `None`
-    /// from the helper and a successful copy at request level.
+    /// The absent case, at both levels: a key with nothing to replace is `None` from the helper and a successful copy at request level.
     ///
-    /// `get_object` signals absence as `Err(NoSuchKey)`, so this is the guard
-    /// against over-correcting the fix into a blanket `?` that would break
-    /// copying onto a fresh key.
+    /// `get_object` signals absence as `Err(NoSuchKey)`. This guards against over-correcting the fix into a blanket `?` that would break copying onto a fresh key.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn replaced_object_is_none_for_an_absent_key_and_copy_still_succeeds() {

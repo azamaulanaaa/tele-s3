@@ -1,7 +1,8 @@
 //! Small helpers shared by the S3 request handlers, grouped by concern.
 //!
-//! Each submodule owns one cohesive concern and its tests; this module is
-//! only a facade so callers keep importing everything from `super::helpers`.
+//! Each submodule owns one cohesive concern and its tests. This module is
+//! only a facade. Callers keep importing everything from
+//! `super::helpers`.
 
 mod acl;
 mod bucket_name;

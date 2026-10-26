@@ -41,21 +41,20 @@ struct Args {
     config: String,
 }
 
-/// Outbound Telegram bounds, overridable from the environment so an operator
-/// can tune them without a rebuild. Unset or unparsable values keep the
+/// Outbound Telegram bounds. An operator can override them from the
+/// environment without a rebuild. Unset or unparsable values keep the
 /// built-in default.
 ///
-/// `TELEGRAM_MAX_CONCURRENT_REQUESTS`, `TELEGRAM_IO_TIMEOUT_SECS` and
-/// `TELEGRAM_MAX_ATTEMPTS` are read from the environment rather than the
-/// config file, so an operator can set them on a container without touching
-/// `config.toml`. They are read once, here, before the backend is built.
-/// What they bound, and their defaults, are documented in the README's
-/// configuration reference; the defaults themselves live in
-/// [`GrammersLimits::default`].
+/// `TELEGRAM_MAX_CONCURRENT_REQUESTS`, `TELEGRAM_IO_TIMEOUT_SECS`, and
+/// `TELEGRAM_MAX_ATTEMPTS` come from the environment, not the config file.
+/// An operator can set them on a container without touching `config.toml`.
+/// The code reads them once, here, before it builds the backend. The README's
+/// configuration reference documents what they bound and their defaults. The
+/// defaults live in [`GrammersLimits::default`].
 ///
-/// Out-of-range values are not rejected here — they are clamped later, by
-/// [`GrammersLimits::sanitized`] — so an absurd setting degrades instead of
-/// wedging the backend at start-up.
+/// The code does not reject out-of-range values here. [`GrammersLimits::sanitized`]
+/// clamps them later. An absurd setting degrades instead of wedging the
+/// backend at start-up.
 fn telegram_limits() -> GrammersLimits {
     let defaults = GrammersLimits::default();
 
@@ -94,7 +93,7 @@ fn telegram_limits() -> GrammersLimits {
 /// Line-oriented output format for the process log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogFormat {
-    /// `tracing-subscriber`'s human-readable renderer. The default, and the
+    /// `tracing-subscriber`'s human-readable renderer. The default. The
     /// only format that has always been available.
     Text,
     /// One self-describing JSON object per event, for ingestion.
@@ -111,9 +110,10 @@ impl LogFormat {
         }
     }
 
-    /// Read [`LOG_FORMAT_ENV`]. An unset variable, or one naming a format
-    /// this build does not have, keeps [`LogFormat::Text`], so a typo
-    /// degrades to the default rather than to a process that logs nothing.
+    /// Read [`LOG_FORMAT_ENV`]. An unset variable keeps [`LogFormat::Text`].
+    /// A variable that names a format this build lacks also keeps
+    /// [`LogFormat::Text`]. A typo degrades to the default rather than to a
+    /// process that logs nothing.
     fn from_env() -> Self {
         let Ok(raw) = env::var(LOG_FORMAT_ENV) else {
             return Self::Text;
@@ -137,18 +137,20 @@ const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
 /// Name this process reports to the collector, as `service.name`.
 const SERVICE_NAME: &str = "tele-s3";
 
-/// OTLP endpoint traces are exported to. Unset means trace export is off.
+/// OTLP endpoint that receives exported traces. Unset means trace export is
+/// off.
 ///
-/// Follows the same environment-variable convention as the log format and the
-/// Telegram limits: read once, here, before anything is built, so an operator
-/// can set it on a container without touching `config.toml`.
+/// This follows the same environment-variable convention as the log format and
+/// the Telegram limits. The code reads it once, here, before it builds
+/// anything. An operator can set it on a container without touching
+/// `config.toml`.
 const OTLP_ENDPOINT_ENV: &str = "TELE_S3_OTLP_ENDPOINT";
 
 /// The standard OpenTelemetry endpoint variable, honoured as a fallback.
 ///
 /// An operator who already points other services at a collector does not have
-/// to learn this crate's spelling. [`OTLP_ENDPOINT_ENV`] takes precedence, so
-/// the crate's own variable works standalone.
+/// to learn this crate's spelling. [`OTLP_ENDPOINT_ENV`] takes precedence.
+/// The crate's own variable works standalone.
 const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
 /// Fraction of traces to export, `0.0` to `1.0`. Unset means every trace.
@@ -156,19 +158,19 @@ const OTLP_SAMPLE_RATIO_ENV: &str = "TELE_S3_OTLP_SAMPLE_RATIO";
 
 /// The only transport built into this binary.
 ///
-/// `opentelemetry-otlp` is compiled without its gRPC client, so there is no
-/// code path that could speak gRPC even if a collector asked for it. The name
-/// is published at start-up so an operator can see which one they got.
+/// The build compiles `opentelemetry-otlp` without its gRPC client. No code
+/// path can speak gRPC, even if a collector asks for it. The code publishes
+/// the name at start-up. An operator can see which transport they got.
 const TRACE_TRANSPORT: &str = "otlp_http_protobuf";
 
-/// Every trace is exported unless the operator says otherwise.
+/// The crate exports every trace unless the operator says otherwise.
 const DEFAULT_SAMPLE_RATIO: f64 = 1.0;
 
 /// How often the meter provider pushes a collection to the collector.
 ///
-/// Sixty seconds, the SDK's own default, stated here so the number is
-/// visible next to the interval operator reads in the exporter's own
-/// documentation.
+/// Sixty seconds. This is the SDK's own default. The value appears here so
+/// the number sits next to the interval an operator reads in the exporter's
+/// own documentation.
 const METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// `error.type` for a telemetry setting that could not be read.
@@ -177,17 +179,17 @@ const TELEMETRY_CONFIG_ERROR_TYPE: &str = "unparsable_telemetry_config";
 /// `error.type` for spans that could not be flushed to the collector.
 const TELEMETRY_EXPORT_ERROR_TYPE: &str = "telemetry_export";
 
-/// Where and how much to export, read once from the environment.
+/// Where and how much to export. Read once from the environment.
 ///
-/// `None` — no endpoint configured — is the default and by far the common
-/// case. It is genuinely inert rather than merely quiet: with no endpoint
-/// nothing here builds an exporter, no batching thread is started, and the
-/// subscriber is the log-only one that shipped before this scope existed. A
-/// self-hosted operator who never configures telemetry pays nothing for the
-/// machinery.
+/// `None` means no endpoint is configured. This is the default and the common
+/// case. It is genuinely inert, not merely quiet. With no endpoint, nothing
+/// here builds an exporter. No batching thread starts. The subscriber is the
+/// log-only one that shipped before this scope existed. A self-hosted operator
+/// who never configures telemetry pays nothing for the machinery.
 #[derive(Debug, Clone, PartialEq)]
 struct TraceExport {
-    /// OTLP collector endpoint, HTTP scheme, protobuf-encoded payloads.
+    /// OTLP collector endpoint. It uses the HTTP scheme and protobuf-encoded
+    /// payloads.
     endpoint: String,
     /// Fraction of traces to keep.
     sample_ratio: f64,
@@ -208,11 +210,11 @@ impl TraceExport {
     }
 
     /// The first usable endpoint among the crate's own variable, then the
-    /// standard one. An unset *or blank* value is not a configuration: it
-    /// falls through rather than producing an endpoint of `""`.
+    /// standard one. An unset or blank value is not a configuration. It is
+    /// skipped rather than producing an endpoint of `""`.
     ///
-    /// Pure, so the precedence rule can be tested without mutating the process
-    /// environment, which every test in a binary shares.
+    /// Pure. The precedence rule can be tested without mutating the process
+    /// environment. Every test in a binary shares that environment.
     fn endpoint_from(own: Option<&str>, standard: Option<&str>) -> Option<String> {
         [own, standard]
             .into_iter()
@@ -224,9 +226,9 @@ impl TraceExport {
 
     /// A usable sample ratio, or `None` if `raw` is not one.
     ///
-    /// Out-of-range and non-finite values are rejected here rather than left
-    /// to the sampler's own clamping, so an absurd setting degrades to a
-    /// logged default instead of quietly meaning "export nothing".
+    /// The code rejects out-of-range and non-finite values here. They do not go
+    /// to the sampler's own clamping. An absurd setting degrades to a logged
+    /// default. It does not quietly mean "export nothing".
     fn sample_ratio(raw: &str) -> Option<f64> {
         let parsed = raw.trim().parse::<f64>().ok()?;
 
@@ -255,10 +257,10 @@ impl TraceExport {
 
     /// The resource every exported span carries.
     ///
-    /// The version is the crate version, so it cannot drift from the binary
-    /// that produced the span. Built empty rather than from the SDK's
-    /// detectors: this document is the identity of *this* process, and an
-    /// operator diffing two of them should not be reading SDK filler.
+    /// The version is the crate version. It cannot drift from the binary that
+    /// produced the span. Built empty rather than from the SDK's detectors.
+    /// This document is the identity of this process. An operator who diffs
+    /// two of them should not read SDK filler.
     fn resource(&self) -> Resource {
         Resource::builder_empty()
             .with_service_name(SERVICE_NAME)
@@ -268,9 +270,9 @@ impl TraceExport {
 
     /// Build the batching pipeline, or `None` if the exporter refuses.
     ///
-    /// An endpoint the exporter will not accept is a configuration error, not
-    /// a reason to refuse to serve S3. The caller logs it and continues with
-    /// the log-only subscriber.
+    /// An endpoint the exporter will not accept is a configuration error. It
+    /// is not a reason to refuse to serve S3. The caller logs it. The caller
+    /// continues with the log-only subscriber.
     fn build_pipeline(&self) -> Option<SdkTracerProvider> {
         let exporter = SpanExporter::builder()
             .with_http()
@@ -304,11 +306,11 @@ impl TraceExport {
 
     /// Build the metric pipeline, or `None` if the exporter refuses.
     ///
-    /// Same rule as [`TraceExport::build_pipeline`] and for the same reason:
-    /// an endpoint the exporter will not accept is a configuration error, not
-    /// a reason to refuse to serve S3. Metrics share the trace export
-    /// decision — one endpoint setting turns both on — so an operator never
-    /// has to work out which half of the pipeline is live.
+    /// Same rule as [`TraceExport::build_pipeline`], for the same reason. An
+    /// endpoint the exporter will not accept is a configuration error. It is
+    /// not a reason to refuse to serve S3. Metrics share the trace export
+    /// decision. One endpoint setting turns both on. An operator never has to
+    /// determine which half of the pipeline is live.
     fn build_meter_pipeline(&self) -> Option<SdkMeterProvider> {
         let exporter = MetricExporter::builder()
             .with_http()
@@ -344,24 +346,24 @@ impl TraceExport {
 
 /// Install the process-wide `tracing` subscriber.
 ///
-/// Returns the trace provider when export is on, which the caller keeps and
-/// flushes on the graceful-exit path. `None` means export is off — either no
-/// endpoint was configured or the exporter refused the one that was — and the
+/// Returns the trace provider when export is on. The caller keeps it. The
+/// caller flushes it on the graceful-exit path. `None` means export is off.
+/// No endpoint was configured, or the exporter refused the one that was. The
 /// subscriber installed is then byte for byte the one that shipped before
 /// trace export existed.
 ///
-/// An OTLP failure is never fatal. The exporter is built before the log layer
-/// so the reason for skipping it reaches the log; once the pipeline is up,
-/// export happens on its own background thread and a collector that is down,
-/// slow or gone cannot fail a request or panic the process.
+/// An OTLP failure is never fatal. The code builds the exporter before the log
+/// layer. The reason for skipping it reaches the log. Once the pipeline is
+/// up, export happens on its own background thread. A collector that is down,
+/// slow, or gone cannot fail a request. It cannot panic the process.
 ///
 /// # Field vocabulary
 ///
-/// Every event this crate emits carries its data as named fields rather than
-/// prose, so the same event can be counted, filtered and aggregated by a log
-/// pipeline. The names are the crate's contract: a downstream exporter binds
-/// to these strings, so they are appended to, never repurposed. One name
-/// means one thing in every file.
+/// Every event this crate emits carries its data as named fields, not prose.
+/// A log pipeline can count, filter, and aggregate the same event. The names
+/// are the crate's contract. A downstream exporter binds to these strings.
+/// The crate appends to them. It never repurposes them. One name means one
+/// thing in every file.
 ///
 /// ## Identity and location
 ///
@@ -370,7 +372,7 @@ impl TraceExport {
 /// | `bucket` | S3 bucket name. |
 /// | `key` | S3 object key. |
 /// | `blob_id` | Metadata-store id of a backend blob. |
-/// | `publish_id` | Durable publish intent id; names an upload that may exist in the chat. |
+/// | `publish_id` | Durable publish intent id that names an upload that may exist in the chat. |
 /// | `message_id` | Telegram message id holding the object. |
 /// | `file_id` | Telegram file id of an uploaded part set. |
 /// | `name` | Telegram part/file name of an upload. |
@@ -418,21 +420,21 @@ impl TraceExport {
 /// | `lock` | Name of the poisoned mutex. |
 /// | `env_var` / `value` | An environment override and the raw text it was set to. |
 ///
-/// Spans are the other half of the vocabulary: `#[instrument]` puts the
-/// function's arguments on the span, so `operation`-shaped fields such as
-/// `key`, `blob_id` and `publish_id` also arrive as span fields. Promote a
-/// field to the span rather than re-logging it if it is already there.
+/// Spans are the other half of the vocabulary. `#[instrument]` puts the
+/// function's arguments on the span. `operation`-shaped fields such as `key`,
+/// `blob_id`, and `publish_id` also arrive as span fields. Promote a field to
+/// the span rather than re-log it. Do this if it is already there.
 ///
 /// They are also the OTLP span attributes. The [`tracing-opentelemetry`]
-/// layer binds to these same names, so a field is spelled once for both a log
+/// layer binds to these same names. A field is spelled once for both a log
 /// line and a trace.
 ///
 /// # Metric vocabulary
 ///
-/// The same names are the attributes on the metrics below, so one query
-/// joins a log line and a data point. The span `telegram.flood_wait` is the
-/// one span added for this vocabulary: it exists so an individual
-/// rate-limit wait is navigable with its own duration.
+/// The same names are the attributes on the metrics below. One query joins a
+/// log line and a data point. The span `telegram.flood_wait` is the one span
+/// added for this vocabulary. It exists so an individual rate-limit wait is
+/// navigable with its own duration.
 ///
 /// | Instrument | Kind | Unit | Attributes |
 /// | --- | --- | --- | --- |
@@ -442,13 +444,13 @@ impl TraceExport {
 /// | `tele_s3.telegram.rpc_duration` | histogram | `s` | `operation`, `outcome` |
 ///
 /// `outcome` is a closed set on the RPC instruments: `ok`, `rpc_error`,
-/// `timeout`. All four are named with the `tele_s3.` prefix, so they cannot
-/// collide with another library's metrics in a shared collector.
+/// `timeout`. All four carry the `tele_s3.` prefix. They cannot collide with
+/// another library's metrics in a shared collector.
 ///
-/// Metrics and traces are one decision: no endpoint means no meter provider,
-/// no periodic reader and no background thread, exactly as it means no
+/// Metrics and traces are one decision. No endpoint means no meter provider.
+/// It means no periodic reader. It means no background thread. It means no
 /// tracer provider. Everything the crate records goes through the
-/// process-wide meter, so a later scope adds instruments without a second
+/// process-wide meter. A later scope adds instruments without a second
 /// configuration surface.
 fn init_tracing() -> Telemetry {
     let format = LogFormat::from_env();
@@ -494,9 +496,9 @@ fn init_tracing() -> Telemetry {
 
 /// The telemetry pipelines this process owns.
 ///
-/// Either half is absent when telemetry is off, which is the default. An
-/// absent provider is not a stub: nothing was constructed for it, so nothing
-/// runs in the background and nothing is flushed on exit.
+/// Either half is absent when telemetry is off. That is the default. An
+/// absent provider is not a stub. Nothing was constructed for it. Nothing
+/// runs in the background. Nothing is flushed on exit.
 #[derive(Default)]
 struct Telemetry {
     traces: Option<SdkTracerProvider>,
@@ -516,10 +518,9 @@ impl Telemetry {
 
     /// Drain both pipelines and stop their workers.
     ///
-    /// Both halves are attempted even if the first fails: draining the queue
-    /// is what saves the data, and stopping the thread is what lets the
-    /// process exit rather than wait on a socket that is never going to
-    /// answer.
+    /// Both halves are attempted even if the first fails. Draining the queue
+    /// saves the data. Stopping the thread lets the process exit. It does not
+    /// wait on a socket that never answers.
     fn flush(&self) {
         if let Some(traces) = &self.traces
             && let Err(err) = traces.force_flush().and(traces.shutdown())
@@ -545,17 +546,17 @@ impl Telemetry {
 
 /// `RUST_LOG`, or the crate's own default when it is unset or unreadable.
 ///
-/// Built per layer rather than once and shared: [`EnvFilter`] is not `Clone`,
-/// and each layer needs its own copy.
+/// Built per layer, not once and shared. [`EnvFilter`] is not `Clone`. Each
+/// layer needs its own copy.
 fn env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tele_s3=info"))
 }
 
 /// Install the log layer on its own.
 ///
-/// This is the whole subscriber for a process with no trace export: the same
-/// `fmt` renderer, the same environment filter, the same default of pretty
-/// text.
+/// This is the whole subscriber for a process with no trace export. It uses
+/// the same `fmt` renderer. It uses the same environment filter. It uses the
+/// same default of pretty text.
 fn init_log_subscriber(format: LogFormat) {
     match format {
         LogFormat::Text => FmtSubscriber::builder()
@@ -569,18 +570,16 @@ fn init_log_subscriber(format: LogFormat) {
     }
 }
 
-/// Install the log layer *and* the OTLP trace layer.
+/// Install the log layer and the OTLP trace layer.
 ///
-/// The log layer is `tracing-subscriber`'s own `fmt` renderer — the same one
-/// [`init_log_subscriber`] installs, only expressed as a layer rather than as
-/// a whole subscriber, because a trace layer can only be composed onto a
-/// [`Registry`]. Both log formats therefore keep working exactly as before,
-/// and the trace layer writes nothing to stdout: it observes spans on their
-/// way to the collector.
+/// The log layer is `tracing-subscriber`'s own `fmt` renderer. It is the same
+/// one [`init_log_subscriber`] installs. It is expressed as a layer, not as a
+/// whole subscriber. A trace layer can only compose onto a [`Registry`]. Both
+/// log formats keep working as before. The trace layer writes nothing to
+/// stdout. It observes spans on their way to the collector.
 ///
-/// Both layers are filtered by the same `RUST_LOG`. Filtering only the log
-/// layer would let a `tele_s3=info` operator export the debug spans they
-/// asked not to see.
+/// Both layers use the same `RUST_LOG`. Filtering only the log layer would let
+/// a `tele_s3=info` operator export debug spans they asked not to see.
 fn init_otel_subscriber(format: LogFormat, tracer: SdkTracer) {
     let logs: Box<dyn Layer<Registry> + Send + Sync> = match format {
         LogFormat::Text => Box::new(
@@ -616,8 +615,8 @@ const SERVICE_UNAVAILABLE_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r
 /// Hold the permits that bound inbound S3 connections.
 ///
 /// One connection holds one permit until the connection ends. When no permit
-/// is free, the accept loop sends `503 Service Unavailable` and closes the
-/// socket. It does not queue the connection, so a slow client cannot exhaust
+/// is free, the accept loop sends `503 Service Unavailable`. It closes the
+/// socket. It does not queue the connection. A slow client cannot exhaust
 /// the listener.
 #[derive(Debug)]
 struct ConnectionLimiter {
@@ -627,8 +626,8 @@ struct ConnectionLimiter {
 impl ConnectionLimiter {
     /// Create a limiter with `max` permits.
     ///
-    /// The value is clamped to at least 1, because a limiter with no permits
-    /// would refuse every connection.
+    /// The code clamps the value to at least 1. A limiter with no permits would
+    /// refuse every connection.
     fn new(max: usize) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max.clamp(1, Semaphore::MAX_PERMITS))),
@@ -652,16 +651,16 @@ const CONNECTION_LIMIT_ENV: &str = "TELE_S3_MAX_CONCURRENT_CONNECTIONS";
 /// Resolve the inbound connection limit.
 ///
 /// Read [`CONNECTION_LIMIT_ENV`] when it is set. An unset or unparsable value
-/// uses `config_value`, and a warning names the bad value. The result is
-/// clamped to `1..=Semaphore::MAX_PERMITS`.
+/// uses `config_value`. A warning names the bad value. The code clamps the
+/// result to `1..=Semaphore::MAX_PERMITS`.
 fn inbound_connection_limit(config_value: usize) -> usize {
     connection_limit_from(env::var(CONNECTION_LIMIT_ENV).ok().as_deref(), config_value)
 }
 
 /// Resolve a connection limit from a raw environment value.
 ///
-/// Pure, so the parsing rule can be tested without changing the process
-/// environment, which every test in the binary shares.
+/// Pure. The parsing rule can be tested without changing the process
+/// environment. Every test in the binary shares that environment.
 fn connection_limit_from(raw: Option<&str>, config_value: usize) -> usize {
     let fallback = config_value.clamp(1, Semaphore::MAX_PERMITS);
     let Some(raw) = raw else {
@@ -866,11 +865,10 @@ mod tests {
 
     use tele_s3::admin::ReconcilerOutcome;
 
-    /// The introspection document is built from the port, the Telegram limits
-    /// and two closed enums — no argument of [`AdminState::new`] can carry a
-    /// credential. Proved here against a real [`config::Config`], so the
-    /// guarantee is about the config an operator actually writes rather than
-    /// about a hypothetical one.
+    /// The code builds the introspection document from the port, the Telegram limits,
+    /// and two closed enums. No argument of [`AdminState::new`] can carry a
+    /// credential. This test uses a real [`config::Config`]. The guarantee
+    /// covers the config an operator actually writes, not a hypothetical one.
     #[test]
     #[allow(clippy::expect_used)]
     fn admin_endpoints_publish_no_config_credentials() {
@@ -939,7 +937,7 @@ mod tests {
     /// The limiter refuses the second connection until the first permit is
     /// free.
     ///
-    /// A limit of 0 is not a valid configuration, so it resolves to one
+    /// A limit of 0 is not a valid configuration. It resolves to one
     /// permit instead of refusing every connection.
     #[test]
     fn the_connection_limiter_refuses_a_connection_when_no_permit_is_free() {
@@ -952,7 +950,7 @@ mod tests {
     }
 
     /// A valid override wins over the config value. An unset or unparsable
-    /// value falls back to the config value. Both ends are clamped to at
+    /// value falls back to the config value. The code clamps both ends to at
     /// least one.
     #[test]
     fn the_connection_limit_override_falls_back_and_clamps() {
@@ -979,7 +977,7 @@ mod tests {
         );
     }
 
-    /// The default has to stay the human-readable renderer: nothing about an
+    /// The default stays the human-readable renderer. Nothing about an
     /// operator's existing output changes unless they ask for it.
     #[test]
     #[allow(clippy::expect_used)]
@@ -987,7 +985,7 @@ mod tests {
         assert_eq!(LogFormat::from_env(), LogFormat::Text);
     }
 
-    /// `json` is the opt-in, and the spelling an operator will guess. Case
+    /// `json` is the opt-in. It is the spelling an operator will guess. Case
     /// and surrounding whitespace do not matter.
     #[test]
     #[allow(clippy::expect_used)]
@@ -997,8 +995,8 @@ mod tests {
         }
     }
 
-    /// An unrecognised value degrades to the default rather than to a process
-    /// that logs nothing.
+    /// An unrecognised value degrades to the default. It does not degrade to a
+    /// process that logs nothing.
     #[test]
     #[allow(clippy::expect_used)]
     fn an_unknown_log_format_falls_back_to_text() {
@@ -1007,13 +1005,12 @@ mod tests {
         }
     }
 
-    /// The default, and the one that has to stay free: no endpoint means
-    /// export is off, so no exporter, no batching thread and no trace layer
-    /// are ever built.
+    /// The default stays free. No endpoint means export is off. The code never
+    /// builds an exporter, a batching thread, or a trace layer.
     ///
-    /// This is the whole zero-cost argument, so it is asserted on the decision
-    /// itself rather than on any side effect: [`TraceExport::from_env`] is
-    /// the only thing that reads the environment, and it returns nothing.
+    /// This is the whole zero-cost argument. It is asserted on the decision
+    /// itself, not on any side effect. [`TraceExport::from_env`] is the only
+    /// thing that reads the environment. It returns nothing.
     #[test]
     #[allow(clippy::expect_used)]
     fn trace_export_stays_off_without_a_configured_endpoint() {
@@ -1033,9 +1030,9 @@ mod tests {
         telemetry.flush();
     }
 
-    /// The crate's own variable works standalone; the standard one is honoured
-    /// when it is the only one set; and when both are set the crate's own
-    /// spelling wins, so an operator can override a cluster-wide default.
+    /// The crate's own variable works standalone. The code honours the standard
+    /// one when it is the only one set. When both are set, the crate's own
+    /// spelling wins. An operator can override a cluster-wide default.
     #[test]
     #[allow(clippy::expect_used)]
     fn the_crates_own_endpoint_variable_takes_precedence() {
@@ -1062,11 +1059,11 @@ mod tests {
         );
     }
 
-    /// A configured endpoint is enough to build the pipeline. Nothing is
-    /// exported and nothing is sent: the batching processor owns a queue and
-    /// only talks to the collector when a span arrives, and the periodic
-    /// reader only collects when an instrument records, so this needs no
-    /// collector and no network.
+    /// A configured endpoint is enough to build the pipeline. The code exports
+    /// nothing and sends nothing. The batching processor owns a queue. It
+    /// talks to the collector only when a span arrives. The periodic reader
+    /// collects only when an instrument records. This needs no collector and
+    /// no network.
     #[test]
     #[allow(clippy::expect_used)]
     fn a_configured_endpoint_initialises_the_pipeline() {
@@ -1093,13 +1090,14 @@ mod tests {
     }
 
     /// Telemetry must never take the server down. A collector that is not
-    /// there is the ordinary case — the service starts before its collector
-    /// does — so the end of the graceful-exit path is exercised against a
-    /// port nothing is listening on.
+    /// there is the ordinary case. The service starts before its collector
+    /// does. The end of the graceful-exit path is exercised against a port
+    /// nothing is listening on.
     ///
-    /// The export attempt fails on the exporter's own worker thread and is
-    /// reported to [`Telemetry::flush`], which logs it and returns. No panic,
-    /// and no error handed back to the caller that is trying to shut down.
+    /// The export attempt fails on the exporter's own worker thread. It is
+    /// reported to [`Telemetry::flush`]. That logs it and returns. No panic
+    /// occurs. The code hands no error back to the caller that is trying to
+    /// exit.
     #[test]
     #[allow(clippy::expect_used)]
     fn an_unreachable_collector_cannot_break_shutdown() {
@@ -1121,9 +1119,9 @@ mod tests {
         .flush();
     }
 
-    /// The resource is what tells a collector which service a trace belongs
-    /// to. The version is the crate version, so it cannot drift from the
-    /// binary that produced the span.
+    /// The resource tells a collector which service a trace belongs to. The
+    /// version is the crate version. It cannot drift from the binary that
+    /// produced the span.
     #[test]
     #[allow(clippy::expect_used)]
     fn the_resource_carries_the_service_name_and_crate_version() {
@@ -1148,7 +1146,7 @@ mod tests {
         );
     }
 
-    /// Every trace is exported unless the operator says otherwise, and every
+    /// The crate exports every trace unless the operator says otherwise. Every
     /// spelling of "otherwise" that a shell would produce is accepted.
     #[test]
     #[allow(clippy::expect_used)]
@@ -1165,8 +1163,8 @@ mod tests {
         }
     }
 
-    /// A ratio that cannot be used falls back to the documented default and
-    /// says so, rather than panicking or quietly meaning "export nothing".
+    /// A ratio that cannot be used falls back to the documented default. It
+    /// says so. It does not panic. It does not quietly mean "export nothing".
     #[test]
     #[allow(clippy::expect_used)]
     fn an_unusable_sample_ratio_falls_back_to_the_default() {

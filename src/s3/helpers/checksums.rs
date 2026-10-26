@@ -1,26 +1,26 @@
-//! The expected checksums of an object or object part, and how they are
-//! validated and verified against streamed digests.
+//! The expected checksums of an object or object part. This module
+//! validates and verifies them against streamed digests.
 //!
-//! Owns both directions of the checksum concept: the *expected* side, built
-//! from request headers or read back from a stored document, and the
-//! comparison against digests computed while the body was being written.
-//! Computing those digests is not here — it happens in the backend read and
-//! write paths, which hand this module finished values.
+//! This module owns both sides of a checksum. It builds the expected side
+//! from request headers. It reads that side from a stored document.
+//! It compares the expected side to digests. The backend read and write
+//! paths compute those digests. Those paths hand this module finished
+//! values.
 
 use base64::Engine;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 
 /// The four expected checksums of an object or object part.
 ///
-/// One named type serves both directions the concept is used in:
-/// [`ExpectedChecksums::new`] builds it from request headers, and
-/// [`ExpectedChecksums::from_json`] reads it back out of a stored
-/// checksums document (which [`ExpectedChecksums::to_json`] wrote).
+/// One type serves both directions. [`ExpectedChecksums::new`] builds
+/// the type from request headers. [`ExpectedChecksums::from_json`] reads
+/// the type back from a stored checksums document.
+/// [`ExpectedChecksums::to_json`] writes that document.
 ///
-/// Each field is an optional standard-base64 digest; `None` means the
-/// client did not supply that algorithm. The fields are named rather
-/// than positional because all four have the same type: a swapped pair
-/// used to compile cleanly and silently corrupt checksums.
+/// Each field holds an optional standard-base64 digest. `None` means the
+/// client did not supply that algorithm. The fields use names, not
+/// positions, because all four fields share one type. Positional fields
+/// could let a swapped pair compile and corrupt checksums without an error.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExpectedChecksums {
     pub(crate) crc32: Option<String>,
@@ -60,8 +60,8 @@ impl ExpectedChecksums {
         .into_iter()
     }
 
-    /// Each value must be standard base64 decoding to the algorithm's
-    /// digest length.
+    /// Each value must be standard base64. It must decode to the
+    /// algorithm's digest length.
     pub(crate) fn to_json(&self) -> S3Result<serde_json::Value> {
         let mut map = serde_json::Map::new();
 
@@ -88,10 +88,11 @@ impl ExpectedChecksums {
 
 /// Verify client-supplied checksums against streaming digests.
 ///
-/// Each supplied value is base64-decoded (already length-validated by
-/// `ExpectedChecksums::to_json`) and compared to the computed digest
-/// bytes. CRC values are the 4-byte big-endian encoding per S3. Mismatch
-/// -> `BadDigest` so corrupt archive uploads fail instead of being stored.
+/// Decode each supplied value from base64. `ExpectedChecksums::to_json`
+/// already validated its length. Compare the decoded value to the
+/// computed digest bytes. Encode CRC values as 4 bytes in big-endian
+/// order, as S3 requires. Return `BadDigest` on a mismatch. This makes
+/// corrupt archive uploads fail instead of being stored.
 pub(crate) fn verify_checksums(
     computed_crc32: u32,
     computed_crc32c: u32,
@@ -129,8 +130,9 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
 
-    /// Base64 digests of the right length for each algorithm, deliberately
-    /// distinct so a mis-mapped field is visible in a failure message.
+    /// Base64 digests with the right length for each algorithm. They
+    /// differ on purpose, so a mis-mapped field shows in a failure
+    /// message.
     const CRC32: &str = "3q2+7w=="; // de ad be ef
     const CRC32C: &str = "AQIDBA=="; // 01 02 03 04
     const SHA1: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQ="; // 01..14

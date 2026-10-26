@@ -10,8 +10,8 @@ use super::{Backend, BackendError, BoxedAsyncReader, ReadOutcome, ReclaimOutcome
 
 /// Number of shards for the in-memory object table.
 ///
-/// A small fixed count keeps lock contention low without turning every
-/// lookup into a long shard walk.
+/// A small fixed count keeps lock contention low. It also avoids a long
+/// shard walk for each lookup.
 const TABLE_SHARDS: usize = 16;
 
 struct Object<const M: usize> {
@@ -27,8 +27,9 @@ struct ObjectReader<const M: usize> {
 }
 
 impl<const M: usize> ObjectReader<M> {
-    /// `limit` is a byte count relative to `start`; it is converted to an
-    /// absolute end position so remaining-length math can never underflow.
+    /// `limit` is a byte count relative to `start`. The code converts it
+    /// to an absolute end position. This prevents underflow when computing
+    /// remaining length.
     fn new(object: Arc<Object<M>>, start: usize, limit: Option<usize>) -> Self {
         let end = limit.map(|limit| start.saturating_add(limit));
 
@@ -331,7 +332,7 @@ mod tests {
 
     use crate::backend::grammers::capture_log;
 
-    /// A stored object is announced at `debug` with its size.
+    /// The backend announces a stored object at `debug` level with its size.
     #[test]
     fn a_write_is_announced_with_its_publish_id_and_size() {
         let log = capture_log(|| {
@@ -350,7 +351,7 @@ mod tests {
         assert!(log.contains("DEBUG"), "{log}");
     }
 
-    /// A read is announced at `debug` with the range it was asked for.
+    /// The backend announces a read at `debug` level with the requested range.
     #[test]
     fn a_read_is_announced_with_its_range() {
         let log = capture_log(|| {
@@ -372,7 +373,8 @@ mod tests {
         assert!(log.contains("DEBUG"), "{log}");
     }
 
-    /// An unaddressable key is a fault, not an absence.
+    /// The backend treats an unaddressable key as a fault. It does not
+    /// treat it as an absence.
     #[test]
     fn an_unparseable_key_is_logged_as_its_own_error_type() {
         let log = capture_log(|| {
