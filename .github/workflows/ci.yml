@@ -193,6 +193,11 @@ jobs:
             exit 1
           fi
 
+          if grep -q 'gh release create.*--target' "$workflow"; then
+            echo "::error::$workflow passes --target to gh release create. Remove --target."
+            exit 1
+          fi
+
           echo "release workflow is gated on CI"
 
       # Smoke test that the config resolves, so a typo in dist-workspace.toml
