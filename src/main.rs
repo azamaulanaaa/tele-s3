@@ -3,7 +3,6 @@ use std::{env, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
-use sea_orm::Database;
 use tokio::{net::TcpListener, signal, sync::Semaphore};
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -30,6 +29,7 @@ use tele_s3::{
     },
     backend::{Grammers, GrammersConfig, GrammersLimits},
     s3::TeleS3,
+    storage::Store,
 };
 
 mod config;
@@ -695,7 +695,7 @@ async fn main() -> anyhow::Result<()> {
         config::Config::try_from(config_path)?
     };
 
-    let db = Database::connect(config.database_uri).await?;
+    let store = Store::open(&config.database_path)?;
 
     // Resolved once, here, so the admin endpoints publish the limits actually
     // in force rather than a second reading of the environment.
@@ -710,7 +710,7 @@ async fn main() -> anyhow::Result<()> {
             app_id: config.api_id,
             app_hash: config.api_hash,
             bot_token: config.bot_token,
-            db: db.clone(),
+            store: store.clone(),
             username: config.username,
             limits,
         };
@@ -719,7 +719,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let s3_service = {
-        let teles3 = TeleS3::init(grammers.clone(), db.clone()).await?;
+        let teles3 = TeleS3::init(grammers.clone(), store.clone()).await?;
 
         // Two bounded, non-fatal reconciliation passes before any traffic.
         // They are independent of each other and either may be skipped.
@@ -852,7 +852,6 @@ async fn main() -> anyhow::Result<()> {
     // the ones most likely to be sitting in the batch queue.
     telemetry.flush();
 
-    db.close().await?;
     grammers.close();
 
     tracing::info!("exited gracefully");
@@ -887,7 +886,7 @@ mod tests {
             api_hash: SENTINELS[2].to_string(),
             bot_token: SENTINELS[3].to_string(),
             username: "tele_s3_channel".to_string(),
-            database_uri: SENTINELS[4].to_string(),
+            database_path: SENTINELS[4].to_string(),
             listen_port: 8000,
             auth_access_key: SENTINELS[0].to_string(),
             auth_secret_key: SENTINELS[1].to_string(),
@@ -923,7 +922,7 @@ mod tests {
                 "auth_secret_key",
                 "api_hash",
                 "bot_token",
-                "database_uri",
+                "database_path",
                 "password",
                 "secret",
                 "token",

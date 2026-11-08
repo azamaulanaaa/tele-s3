@@ -180,7 +180,7 @@ impl fmt::Debug for ReadOutcome {
 /// what is stated here.
 ///
 /// A key is opaque. The backend never parses it. The backend stores it
-/// verbatim as the `s3_blob.id` primary key. The backend reference-counts
+/// verbatim as the blob row id. The backend reference-counts
 /// it. The backend returns it
 /// to `read` and `delete`. A backend must accept exactly the strings it
 /// produced. A backend must not issue a key that collides with another live
@@ -212,7 +212,7 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// `size` is the authoritative object length, not a hint.
     /// It decides how capacity is tracked.
-    /// It decides the recorded `s3_blob.size`.
+    /// It decides the recorded blob row size.
     /// It decides how every later `read` calculates ranges.
     /// The reader must yield exactly that many bytes.
     /// A short body is an error. The backend returns the capacity.

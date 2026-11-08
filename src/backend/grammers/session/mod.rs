@@ -1,7 +1,4 @@
-use std::{
-    net::{Ipv4Addr, SocketAddrV4, SocketAddrV6},
-    ops::Deref,
-};
+use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 
 use grammers_session::{
     BoxFuture, Session,
@@ -10,59 +7,82 @@ use grammers_session::{
         UpdatesState,
     },
 };
-pub(super) use sea_orm::DbErr;
-use sea_orm::{
-    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, ExprTrait,
-    QueryFilter, Set, TransactionTrait,
-};
+use redb::{ReadableDatabase, ReadableTable};
 use tracing::{error, instrument};
 
-mod entity;
+use crate::storage::{
+    CHANNEL_STATE, ChannelStateRow, DC_HOME, DC_OPTIONS, DcHomeRow, DcOptionRow, PEER_INFO,
+    PeerInfoRow, Store, StoreError, UPDATE_STATE, UpdateStateRow, decode, encode,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SessionStorageError {
-    #[error("SeaOrm : {0}")]
-    SeaOrm(#[from] DbErr),
-    #[error("IO : {0}")]
-    IO(#[from] std::io::Error),
+    #[error("Store : {0}")]
+    Store(#[from] StoreError),
 }
 
+impl From<redb::DatabaseError> for SessionStorageError {
+    fn from(err: redb::DatabaseError) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+impl From<redb::TransactionError> for SessionStorageError {
+    fn from(err: redb::TransactionError) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+impl From<redb::TableError> for SessionStorageError {
+    fn from(err: redb::TableError) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+impl From<redb::StorageError> for SessionStorageError {
+    fn from(err: redb::StorageError) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+impl From<redb::CommitError> for SessionStorageError {
+    fn from(err: redb::CommitError) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+impl From<serde_json::Error> for SessionStorageError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+/// Telegram MTProto session state over the shared redb store.
 pub(super) struct SessionStorage {
-    inner: DatabaseConnection,
+    store: Store,
 }
 
 impl SessionStorage {
-    #[instrument(skip(connection), level = "debug", err)]
-    pub(super) async fn init(connection: DatabaseConnection) -> Result<Self, SessionStorageError> {
-        Self::sync_table(&connection).await?;
-
-        Ok(Self { inner: connection })
+    #[instrument(skip(store), level = "debug", err)]
+    pub(super) async fn init(store: Store) -> Result<Self, SessionStorageError> {
+        Ok(Self { store })
     }
 
-    #[instrument(skip(connection), level = "debug", err)]
-    async fn sync_table(connection: &DatabaseConnection) -> Result<(), DbErr> {
-        connection
-            .get_schema_registry(concat!(module_path!(), "::entity"))
-            .sync(connection)
-            .await?;
-
-        Ok(())
-    }
-
-    fn run_blocking<F, R>(&self, future: F) -> R
-    where
-        F: std::future::Future<Output = R> + Send,
-        R: Send,
-    {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
-    }
-}
-
-impl Deref for SessionStorage {
-    type Target = DatabaseConnection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+    fn run_sync<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, SessionStorageError>,
+    ) -> Result<T, SessionStorageError> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if matches!(
+                    handle.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                tokio::task::block_in_place(f)
+            }
+            _ => f(),
+        }
     }
 }
 
@@ -140,11 +160,17 @@ impl Session for SessionStorage {
 
     #[instrument(skip(self), level = "debug", ret)]
     fn home_dc_id(&self) -> Result<i32, Self::Error> {
-        let result = self.run_blocking(async {
-            entity::dc_home::Entity::find()
-                .one(&self.inner)
-                .await
-                .map(|v| v.map(|v| v.dc_id))
+        let result = self.run_sync(|| {
+            let txn = self.store.read()?;
+            let table = txn.open_table(DC_HOME)?;
+            let row = table
+                .get(0)?
+                .map(|value| decode::<DcHomeRow>(value.value()));
+            match row {
+                Some(Ok(row)) => Ok(Some(row.dc_id)),
+                Some(Err(err)) => Err(err.into()),
+                None => Ok(None),
+            }
         });
 
         match result {
@@ -153,7 +179,7 @@ impl Session for SessionStorage {
             Err(e) => {
                 error!(operation = "query_home_dc", error.type = "session_store", error.message = ?e, "Failed to query Home DC");
 
-                Err(e.into())
+                Err(e)
             }
         }
     }
@@ -161,45 +187,65 @@ impl Session for SessionStorage {
     #[instrument(skip(self), level = "debug")]
     fn set_home_dc_id(&self, dc_id: i32) -> BoxFuture<'_, Result<(), Self::Error>> {
         Box::pin(async move {
-            let txn = self.begin().await?;
+            self.store
+                .run(move |db| {
+                    let txn = db.begin_write()?;
+                    {
+                        let mut table = txn.open_table(DC_HOME)?;
+                        let row = DcHomeRow { dc_id };
+                        let bytes = encode(&row)?;
+                        table.insert(0, bytes.as_slice())?;
+                    }
+                    txn.commit()?;
 
-            let _ = entity::dc_home::Entity::delete_many().exec(&txn).await?;
-            let _ = entity::dc_home::ActiveModel { dc_id: Set(dc_id) }
-                .insert(&txn)
-                .await?;
-
-            txn.commit().await?;
-
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
     }
 
     #[instrument(skip(self), level = "debug", ret)]
     fn dc_option(&self, dc_id: i32) -> Result<Option<DcOption>, Self::Error> {
-        let row: Option<entity::dc_option::Model> = self.run_blocking(async {
-            entity::dc_option::Entity::find()
-                .filter(entity::dc_option::Column::DcId.eq(dc_id))
-                .one(&self.inner)
-                .await
+        let row: Option<DcOptionRow> = self.run_sync(|| {
+            let txn = self.store.read()?;
+            let table = txn.open_table(DC_OPTIONS)?;
+            let Some(value) = table.get(dc_id)? else {
+                return Ok(None);
+            };
+            Ok(Some(decode(value.value())?))
         })?;
 
         let dc_option = row.and_then(|v| {
             let ipv4 = v.ipv4.parse();
             let ipv6 = v.ipv6.parse();
 
-            let (ipv4, ipv6) = if let (Ok(v4), Ok(v6)) = (ipv4, ipv6) { (v4, v6) } else {
-                error!(dc_id, error.type = "corrupt_dc_option", "Corrupted IP address in database. Ignoring row.");
+            let (ipv4, ipv6) = if let (Ok(v4), Ok(v6)) = (ipv4, ipv6) {
+                (v4, v6)
+            } else {
+                error!(
+                    dc_id,
+                    error.type = "corrupt_dc_option",
+                    "Corrupted IP address in database. Ignoring row."
+                );
 
                 return None;
             };
 
             let auth_key = match v.auth_key {
                 None => None,
-                Some(bytes) => if let Ok(key) = bytes.try_into() { Some(key) } else {
-                    error!(dc_id, error.type = "corrupt_dc_option", "Corrupted auth key in database. Ignoring row.");
+                Some(bytes) => {
+                    if let Ok(key) = bytes.try_into() {
+                        Some(key)
+                    } else {
+                        error!(
+                            dc_id,
+                            error.type = "corrupt_dc_option",
+                            "Corrupted auth key in database. Ignoring row."
+                        );
 
-                    return None;
-                },
+                        return None;
+                    }
+                }
             };
 
             Some(DcOption {
@@ -226,47 +272,64 @@ impl Session for SessionStorage {
     fn set_dc_option(&self, dc_option: &DcOption) -> BoxFuture<'_, Result<(), Self::Error>> {
         let dc_option = dc_option.clone();
         Box::pin(async move {
-            let txn = self.begin().await?;
+            self.store
+                .run(move |db| {
+                    let txn = db.begin_write()?;
+                    {
+                        let mut table = txn.open_table(DC_OPTIONS)?;
+                        let row = DcOptionRow {
+                            dc_id: dc_option.id,
+                            ipv4: dc_option.ipv4.to_string(),
+                            ipv6: dc_option.ipv6.to_string(),
+                            auth_key: dc_option.auth_key.map(|v| v.to_vec()),
+                        };
+                        let bytes = encode(&row)?;
+                        table.insert(row.dc_id, bytes.as_slice())?;
+                    }
+                    txn.commit()?;
 
-            entity::dc_option::Entity::delete_many()
-                .filter(entity::dc_option::Column::DcId.eq(dc_option.id))
-                .exec(&txn)
-                .await?;
-            entity::dc_option::ActiveModel {
-                dc_id: Set(dc_option.id),
-                ipv4: Set(dc_option.ipv4.to_string()),
-                ipv6: Set(dc_option.ipv6.to_string()),
-                auth_key: Set(dc_option.auth_key.map(|v| v.to_vec())),
-            }
-            .insert(&txn)
-            .await?;
-
-            txn.commit().await?;
-
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
     }
 
     #[instrument(skip(self), level = "debug", ret)]
     fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, Self::Error>> {
         Box::pin(async move {
-            let row = if let Some(dialog_id) = peer.bot_api_dialog_id() {
-                entity::peer_info::Entity::find()
-                    .filter(entity::peer_info::Column::PeerId.eq(dialog_id))
-                    .one(&self.inner)
-                    .await?
-            } else {
-                // Sentinel self-user id without a known identifier: find the
-                // cached self user via its subtype bit instead.
-                entity::peer_info::Entity::find()
-                    .filter(
-                        entity::peer_info::Column::Subtype
-                            .into_expr()
-                            .bit_and(PeerSubtype::UserSelf as i32),
-                    )
-                    .one(&self.inner)
-                    .await?
-            };
+            let dialog_id = peer.bot_api_dialog_id();
+            let row = self
+                .store
+                .run(
+                    move |db| -> Result<Option<PeerInfoRow>, SessionStorageError> {
+                        let txn = db.begin_read()?;
+                        let table = txn.open_table(PEER_INFO)?;
+                        let value = match dialog_id {
+                            Some(dialog_id) => table.get(dialog_id)?,
+                            None => {
+                                let mut found = None;
+                                for entry in table.iter()? {
+                                    let (_, value) = entry?;
+                                    let row: PeerInfoRow = decode(value.value())?;
+                                    if row
+                                        .subtype
+                                        .is_some_and(|v| v & PeerSubtype::UserSelf as u8 != 0)
+                                    {
+                                        found = Some(value);
+                                        break;
+                                    }
+                                }
+                                found
+                            }
+                        };
+
+                        let Some(value) = value else {
+                            return Ok(None);
+                        };
+                        Ok(Some(decode::<PeerInfoRow>(value.value())?))
+                    },
+                )
+                .await?;
 
             let Some(row) = row else {
                 return Ok(None);
@@ -305,8 +368,9 @@ impl Session for SessionStorage {
     fn cache_peer(&self, peer: &PeerInfo) -> BoxFuture<'_, Result<(), Self::Error>> {
         let peer = peer.clone();
         Box::pin(async move {
-            // Merge with any previously-cached info, as upstream's `PeerInfo::extend_info`
-            // does: cached fields win, so a sparse update never clears a known value.
+            // Merge with any previously-cached info, as upstream's
+            // `PeerInfo::extend_info` does: cached fields win, so a sparse
+            // update never clears a known value.
             let peer = if let Some(mut existing) = self.peer(peer.id()).await? {
                 existing.extend_info(&peer);
                 existing
@@ -332,38 +396,58 @@ impl Session for SessionStorage {
             };
 
             let hash = peer.auth().map(grammers_session::types::PeerAuth::hash);
+            let row = PeerInfoRow {
+                peer_id: peer.id().bot_api_dialog_id_unchecked(),
+                subtype: subtype.map(|v| v as u8),
+                hash,
+            };
 
-            let txn = self.begin().await?;
+            self.store
+                .run(move |db| {
+                    let txn = db.begin_write()?;
+                    {
+                        let mut table = txn.open_table(PEER_INFO)?;
+                        let bytes = encode(&row)?;
+                        table.insert(row.peer_id, bytes.as_slice())?;
+                    }
+                    txn.commit()?;
 
-            entity::peer_info::Entity::delete_many()
-                .filter(
-                    entity::peer_info::Column::PeerId.eq(peer.id().bot_api_dialog_id_unchecked()),
-                )
-                .exec(&txn)
-                .await?;
-            entity::peer_info::ActiveModel {
-                peer_id: Set(peer.id().bot_api_dialog_id_unchecked()),
-                subtype: Set(subtype.map(|v| v as u8)),
-                hash: Set(hash),
-            }
-            .insert(&txn)
-            .await?;
-
-            txn.commit().await?;
-
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
     }
 
     #[instrument(skip(self), level = "debug", ret)]
     fn updates_state(&self) -> BoxFuture<'_, Result<UpdatesState, Self::Error>> {
         Box::pin(async move {
-            let txn = self.begin().await?;
+            let (update_state, channels) = self
+                .store
+                .run(
+                    |db| -> Result<
+                        (Option<UpdateStateRow>, Vec<ChannelStateRow>),
+                        SessionStorageError,
+                    > {
+                        let txn = db.begin_read()?;
+                        let updates = txn.open_table(UPDATE_STATE)?;
+                        let channels = txn.open_table(CHANNEL_STATE)?;
 
-            let update_state = entity::update_state::Entity::find().one(&txn).await?;
-            let channels = entity::channel_state::Entity::find().all(&txn).await?;
+                        let update_state = updates
+                            .get(0)?
+                            .map(|value| decode::<UpdateStateRow>(value.value()))
+                            .transpose()?;
+                        let channels = channels
+                            .iter()?
+                            .map(|entry| {
+                                let (_, value) = entry?;
+                                decode::<ChannelStateRow>(value.value())
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
 
-            txn.commit().await?;
+                        Ok((update_state, channels))
+                    },
+                )
+                .await?;
 
             let mut update_state = update_state
                 .map(|v| UpdatesState {
@@ -392,105 +476,97 @@ impl Session for SessionStorage {
         update_state: UpdateState,
     ) -> BoxFuture<'_, Result<(), Self::Error>> {
         Box::pin(async move {
-            let txn = self.begin().await?;
-
-            match update_state {
-                UpdateState::All(updates_state) => {
-                    entity::update_state::Entity::delete_many()
-                        .exec(&txn)
-                        .await?;
-                    entity::update_state::ActiveModel {
-                        id: NotSet,
-                        pts: Set(updates_state.pts),
-                        qts: Set(updates_state.qts),
-                        date: Set(updates_state.date),
-                        seq: Set(updates_state.seq),
-                    }
-                    .insert(&txn)
-                    .await?;
-
-                    entity::channel_state::Entity::delete_many()
-                        .exec(&txn)
-                        .await?;
-                    let channel_states = updates_state
-                        .channels
-                        .into_iter()
-                        .map(|v| entity::channel_state::ActiveModel {
-                            peer_id: Set(v.id),
-                            pts: Set(v.pts),
-                        })
-                        .collect::<Vec<_>>();
-                    entity::channel_state::Entity::insert_many(channel_states)
-                        .exec(&txn)
-                        .await?;
-                }
-                UpdateState::Primary { pts, date, seq } => {
-                    let update_state = entity::update_state::Entity::find().one(&txn).await?;
-
-                    if update_state.is_some() {
-                        entity::update_state::ActiveModel {
-                            id: NotSet,
-                            pts: Set(pts),
-                            date: Set(date),
-                            seq: Set(seq),
-                            qts: NotSet,
+            self.store
+                .run(move |db| {
+                    let txn = db.begin_write()?;
+                    match update_state {
+                        UpdateState::All(updates_state) => {
+                            {
+                                let mut table = txn.open_table(UPDATE_STATE)?;
+                                let row = UpdateStateRow {
+                                    pts: updates_state.pts,
+                                    qts: updates_state.qts,
+                                    date: updates_state.date,
+                                    seq: updates_state.seq,
+                                };
+                                let bytes = encode(&row)?;
+                                table.insert(0, bytes.as_slice())?;
+                            }
+                            {
+                                let mut table = txn.open_table(CHANNEL_STATE)?;
+                                table.retain(|_, _| false)?;
+                                for channel in updates_state.channels {
+                                    let row = ChannelStateRow {
+                                        peer_id: channel.id,
+                                        pts: channel.pts,
+                                    };
+                                    let bytes = encode(&row)?;
+                                    table.insert(row.peer_id, bytes.as_slice())?;
+                                }
+                            }
                         }
-                        .update(&txn)
-                        .await?;
-                    } else {
-                        entity::update_state::ActiveModel {
-                            id: NotSet,
-                            pts: Set(pts),
-                            date: Set(date),
-                            seq: Set(seq),
-                            qts: Set(0),
+                        UpdateState::Primary { pts, date, seq } => {
+                            let current = {
+                                let table = txn.open_table(UPDATE_STATE)?;
+                                table
+                                    .get(0)?
+                                    .map(|value| decode::<UpdateStateRow>(value.value()))
+                                    .transpose()?
+                            };
+                            let row = match current {
+                                Some(mut row) => {
+                                    row.pts = pts;
+                                    row.date = date;
+                                    row.seq = seq;
+                                    row
+                                }
+                                None => UpdateStateRow {
+                                    pts,
+                                    qts: 0,
+                                    date,
+                                    seq,
+                                },
+                            };
+                            let bytes = encode(&row)?;
+                            let mut table = txn.open_table(UPDATE_STATE)?;
+                            table.insert(0, bytes.as_slice())?;
                         }
-                        .insert(&txn)
-                        .await?;
-                    }
-                }
-                UpdateState::Secondary { qts } => {
-                    let update_state = entity::update_state::Entity::find().one(&txn).await?;
-
-                    if update_state.is_some() {
-                        entity::update_state::ActiveModel {
-                            id: NotSet,
-                            pts: NotSet,
-                            date: NotSet,
-                            seq: NotSet,
-                            qts: Set(qts),
+                        UpdateState::Secondary { qts } => {
+                            let current = {
+                                let table = txn.open_table(UPDATE_STATE)?;
+                                table
+                                    .get(0)?
+                                    .map(|value| decode::<UpdateStateRow>(value.value()))
+                                    .transpose()?
+                            };
+                            let row = match current {
+                                Some(mut row) => {
+                                    row.qts = qts;
+                                    row
+                                }
+                                None => UpdateStateRow {
+                                    pts: 0,
+                                    qts,
+                                    date: 0,
+                                    seq: 0,
+                                },
+                            };
+                            let bytes = encode(&row)?;
+                            let mut table = txn.open_table(UPDATE_STATE)?;
+                            table.insert(0, bytes.as_slice())?;
                         }
-                        .update(&txn)
-                        .await?;
-                    } else {
-                        entity::update_state::ActiveModel {
-                            id: NotSet,
-                            pts: Set(0),
-                            date: Set(0),
-                            seq: Set(0),
-                            qts: Set(qts),
+                        UpdateState::Channel { id, pts } => {
+                            let row = ChannelStateRow { peer_id: id, pts };
+                            let bytes = encode(&row)?;
+                            let mut table = txn.open_table(CHANNEL_STATE)?;
+                            table.insert(row.peer_id, bytes.as_slice())?;
                         }
-                        .insert(&txn)
-                        .await?;
                     }
-                }
-                UpdateState::Channel { id, pts } => {
-                    entity::channel_state::Entity::delete_many()
-                        .filter(entity::channel_state::Column::PeerId.eq(id))
-                        .exec(&txn)
-                        .await?;
-                    entity::channel_state::ActiveModel {
-                        peer_id: Set(id),
-                        pts: Set(pts),
-                    }
-                    .insert(&txn)
-                    .await?;
-                }
-            }
+                    txn.commit()?;
 
-            txn.commit().await?;
-
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
     }
 }

@@ -15,7 +15,6 @@ use grammers_client::{
 };
 use grammers_mtsender::{InvocationError, SenderPool, SenderPoolFatHandle};
 use grammers_session::types::PeerRef;
-use sea_orm::DatabaseConnection;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -322,11 +321,11 @@ pub struct GrammersConfig {
     pub bot_token: String,
     /// Where the `MTProto` session (auth keys and DC state) is persisted.
     ///
-    /// Not the object metadata store. `main` passes it the same connection.
-    /// The tables are created on first use. Losing this database costs a
-    /// re-login rather than data. The bytes are messages in the peer. Only
-    /// the keys naming them live in the metadata store.
-    pub db: DatabaseConnection,
+    /// Not a separate database: `main` passes the same redb store that holds
+    /// the object metadata. Losing this database costs a re-login rather than
+    /// data. The bytes are messages in the peer. Only the keys naming them
+    /// live in the metadata store.
+    pub store: crate::storage::Store,
     /// The chat every object is stored in.
     ///
     /// Resolved once at [`Grammers::init`]. A key is a message id in this
@@ -892,7 +891,7 @@ impl Grammers {
         );
 
         let session = {
-            let session = session::SessionStorage::init(config.db).await?;
+            let session = session::SessionStorage::init(config.store).await?;
 
             Arc::new(session)
         };
@@ -2146,7 +2145,12 @@ pub(crate) fn capture_log(f: impl FnOnce()) -> String {
         .finish();
     let sink = Arc::clone(&buffer.0);
 
-    tracing::subscriber::with_default(subscriber, f);
+    tracing::subscriber::with_default(subscriber, || {
+        // A parallel test can cache a callsite as disabled before this local
+        // subscriber exists. Rebuild the cache so every event reaches it.
+        tracing::callsite::rebuild_interest_cache();
+        f();
+    });
 
     let bytes = sink
         .lock()
