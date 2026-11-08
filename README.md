@@ -2,9 +2,11 @@
 
 S3-compatible gateway backed by Telegram — store S3 objects as Telegram messages.
 
-Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](https://github.com/Lonami/grammers) (Telegram client), [`sea-orm`](https://github.com/SeaQL/sea-orm) (SQLite metadata), and `tokio`/`hyper`.
+Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](https://github.com/Lonami/grammers) (Telegram client), [`redb`](https://github.com/cberner/redb) (embedded metadata store), and `tokio`/`hyper`.
 
-> **Telegram as S3:** Each `PutObject`/`UploadPart` is written to Telegram via the `grammers` MTProto client (bot-token login, objects stored as message media); metadata (buckets, objects, versions, multipart state, blob ref-counts) lives in SQLite. The `Memory` backend is available for tests and local dev.
+> **Telegram as S3:** Each `PutObject`/`UploadPart` is written to Telegram via the `grammers` MTProto client (bot-token login, objects stored as message media); metadata (buckets, objects, versions, multipart state, blob ref-counts) lives in one redb file. The `Memory` backend is available for tests and local dev.
+
+> **Clean cut:** This release replaces SQLite and SeaORM with redb. An existing `storage.db` file is ignored. The service does not read or import SQLite data.
 
 ## Features
 
@@ -36,7 +38,7 @@ api_hash = "344583e45741c457fe1862106095a5eb"
 bot_token = "1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0"
 # Destination chat/channel/peer objects are sent to (resolved via `resolve_username`, `send_message` to this peer).
 username = "your_storage_channel_username"
-database_uri = "sqlite://storage.db?mode=rwc"
+database_path = "storage.redb"
 listen_port = 8000
 auth_access_key = "YOUR_ACCESS_KEY"
 auth_secret_key = "YOUR_SECRET_KEY"
@@ -145,7 +147,7 @@ aws --endpoint-url $AWS_ENDPOINT_URL s3api delete-object --bucket my-bucket --ke
 |-----|-------------|
 | `api_id` / `api_hash` / `bot_token` | Telegram bot credentials (MTProto login) |
 | `username` | Storage destination: chat/channel/peer username objects are sent to |
-| `database_uri` | SeaORM URI, e.g. `sqlite://storage.db?mode=rwc` or `sqlite::memory:` for tests |
+| `database_path` | Path to the redb metadata file, e.g. `storage.redb`. The code creates the file when it does not exist. An existing SQLite file is not read. |
 | `listen_port` | HTTP listen port |
 | `auth_access_key` / `auth_secret_key` | S3 `SimpleAuth` credentials (used for both header and presigned URL verification) |
 
@@ -205,7 +207,7 @@ TELE_S3_OTLP_ENDPOINT=http://collector:4318/v1/traces cargo run -- --config conf
 
 ### Admin endpoints
 
-Three JSON endpoints share the S3 listener and are answered before any request reaches the S3 handlers. They are **unauthenticated** — a probe that has to sign a request is a probe that stops working when the signature expires — so they publish no credential material: no access key, secret key, `api_hash`, `bot_token` or `database_uri`, and no error message that might quote one.
+Three JSON endpoints share the S3 listener and are answered before any request reaches the S3 handlers. They are **unauthenticated** — a probe that has to sign a request is a probe that stops working when the signature expires — so they publish no credential material: no access key, secret key, `api_hash`, `bot_token` or `database_path`, and no error message that might quote one.
 
 | Path | Answers |
 |------|---------|
@@ -228,8 +230,8 @@ curl -s localhost:8000/.tele-s3/introspect # {"status":"ok","version":"0.7.1","l
 Client (aws-cli/sdk, curl) -> hyper -> S3ServiceBuilder{ TeleS3<Grammers>, SimpleAuth } -> TeleS3 (S3 trait)
                                                                                      |
                                                                                      v
-                                                                           Repository (sea-orm, SQLite)
-                                                                     s3_bucket / s3_object (versioned) / s3_blob (ref-count) / s3_multipart_upload_state
+                                                                           Repository (redb store)
+                                                                     buckets / objects (versioned) / blobs (ref-count) / multipart uploads
                                                                                      |
                                                                                      v
                                                                                Backend (Grammers -> Telegram MTProto, Memory -> HashMap)
@@ -242,11 +244,13 @@ Blob ref-counting keeps shared slices (e.g. `UploadPartCopy` ranges, `CopyObject
 ## Development
 
 ```bash
-cargo test --locked --all-targets # 21 lib + 36 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yaml`)
+cargo test --locked --all-targets # 199 lib + 14 main + 36 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yaml`)
 cargo test --test presigned -- --nocapture # presigned generation only (no endpoint)
 ```
 
-`tests/config.rs` provides `config::<N,M>()` helper that spins an in-memory `TeleS3<Memory<N,M>>` + `s3s_aws::Client` for integration tests — no real Telegram or network needed.
+`tests/config.rs` provides a `config::<N,M>()` helper that spins an in-memory `TeleS3<Memory<N,M>>` + `s3s_aws::Client` for integration tests — no real Telegram or network needed. Each test gets its own isolated in-memory redb store.
+
+The store is synchronous. Repository methods remain `async` and run redb work through `tokio::task::spawn_blocking`. The code never holds a redb transaction across an `.await`.
 
 ## License
 
