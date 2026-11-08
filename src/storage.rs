@@ -402,11 +402,6 @@ pub(crate) fn inverted_timestamp(timestamp: DateTime<Utc>) -> u64 {
     u64::MAX - millis
 }
 
-/// The first key that is greater than every key with `prefix`.
-pub(crate) fn prefix_upper(prefix: &str) -> String {
-    format!("{prefix}\u{10FFFF}")
-}
-
 #[cfg(test)]
 mod test_support {
     #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]

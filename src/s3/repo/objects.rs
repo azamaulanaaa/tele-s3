@@ -568,16 +568,10 @@ impl Repository {
                         Bound::Included((bucket.as_str(), prefix.as_deref().unwrap_or_default()))
                     }
                 };
-                let upper = prefix.as_deref().map(crate::storage::prefix_upper);
-                let end = match upper.as_deref() {
-                    Some(upper) => Bound::Excluded((bucket.as_str(), upper)),
-                    None => Bound::Unbounded,
-                };
-
                 let mut rows = Vec::new();
                 let mut rolled: HashSet<String> = HashSet::new();
 
-                for entry in latest.range((start, end)).store()? {
+                for entry in latest.range((start, Bound::Unbounded)).store()? {
                     let (key, value) = entry.store()?;
                     let (entry_bucket, key) = key.value();
                     if entry_bucket != bucket {
@@ -586,7 +580,10 @@ impl Repository {
                     if let Some(prefix) = prefix.as_deref()
                         && !key.starts_with(prefix)
                     {
-                        continue;
+                        if key < prefix {
+                            continue;
+                        }
+                        break;
                     }
 
                     let version_id = value.value();
@@ -671,16 +668,13 @@ impl Repository {
                     .or(prefix.as_deref())
                     .unwrap_or_default();
 
-                let upper = prefix.as_deref().map(crate::storage::prefix_upper);
-                let end = match upper.as_deref() {
-                    Some(upper) => Bound::Excluded((bucket.as_str(), upper, 0_u64, "")),
-                    None => Bound::Unbounded,
-                };
-
                 let mut page = Vec::new();
 
                 for entry in versions
-                    .range((Bound::Included((bucket.as_str(), start, 0_u64, "")), end))
+                    .range((
+                        Bound::Included((bucket.as_str(), start, 0_u64, "")),
+                        Bound::Unbounded,
+                    ))
                     .store()?
                 {
                     let (key, _) = entry.store()?;
@@ -691,7 +685,10 @@ impl Repository {
                     if let Some(prefix) = prefix.as_deref()
                         && !key.starts_with(prefix)
                     {
-                        continue;
+                        if key < prefix {
+                            continue;
+                        }
+                        break;
                     }
 
                     if let Some(key_marker) = key_marker.as_deref()

@@ -160,15 +160,9 @@ impl Repository {
                     (Some(key_marker), None) => Bound::Included((bucket.as_str(), key_marker, "")),
                     _ => Bound::Included((bucket.as_str(), "", "")),
                 };
-                let upper = prefix.as_deref().map(crate::storage::prefix_upper);
-                let end = match upper.as_deref() {
-                    Some(upper) => Bound::Excluded((bucket.as_str(), upper, "")),
-                    None => Bound::Unbounded,
-                };
-
                 let mut rows = Vec::new();
 
-                for entry in table.range((start, end)).store()? {
+                for entry in table.range((start, Bound::Unbounded)).store()? {
                     let (key, value) = entry.store()?;
                     let (entry_bucket, key, _) = key.value();
                     if entry_bucket != bucket {
@@ -183,7 +177,10 @@ impl Repository {
                     if let Some(prefix) = prefix.as_deref()
                         && !key.starts_with(prefix)
                     {
-                        continue;
+                        if key < prefix {
+                            continue;
+                        }
+                        break;
                     }
 
                     rows.push(decode(value.value()).store()?);
