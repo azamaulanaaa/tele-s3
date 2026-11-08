@@ -1,5 +1,4 @@
 use s3s::{S3Error, S3ErrorCode, S3Result};
-use sea_orm::{DatabaseConnection, DbErr};
 use tracing::instrument;
 
 mod blobs;
@@ -7,9 +6,9 @@ mod buckets;
 mod multipart;
 mod objects;
 
-pub(super) mod entity;
-
 pub(crate) use multipart::{MultipartCompletion, MultipartUploadStateUpdate};
+
+use crate::storage::Store;
 
 /// Precondition for a compare-and-swap object write.
 pub(crate) enum PutCondition {
@@ -26,8 +25,9 @@ pub(crate) enum PutCondition {
     IfNoneMatch(String),
 }
 
+/// S3 metadata repository over one shared redb store.
 pub(crate) struct Repository {
-    pub db: DatabaseConnection,
+    pub(crate) store: Store,
 }
 
 /// Field bundle for writing an object row.
@@ -46,20 +46,9 @@ pub(crate) struct ObjectWrite {
 }
 
 impl Repository {
-    #[instrument(skip(db), level = "debug")]
-    pub(crate) async fn init(db: DatabaseConnection) -> anyhow::Result<Self> {
-        Self::sync_table(&db).await?;
-
-        Ok(Self { db })
-    }
-
-    #[instrument(skip(db), level = "debug", err)]
-    async fn sync_table(db: &DatabaseConnection) -> Result<(), DbErr> {
-        db.get_schema_registry(concat!(module_path!(), "::entity"))
-            .sync(db)
-            .await?;
-
-        Ok(())
+    #[instrument(skip(store), level = "debug")]
+    pub(crate) async fn init(store: Store) -> anyhow::Result<Self> {
+        Ok(Self { store })
     }
 
     /// The `size` columns are 32-bit. Reject anything larger instead of
@@ -67,18 +56,61 @@ impl Repository {
     pub(super) fn checked_size(size: u64) -> S3Result<u32> {
         u32::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))
     }
+
+    /// Fail when a test fault is active. Always a no-op in production.
+    pub(super) fn inject(&self, fault: crate::storage::Fault) -> S3Result<()> {
+        if self.store.fault(fault) {
+            return Err(S3Error::internal_error(std::io::Error::other(
+                "injected storage failure",
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+impl From<crate::storage::StoreError> for S3Error {
+    fn from(err: crate::storage::StoreError) -> Self {
+        S3Error::internal_error(err)
+    }
+}
+
+/// Convert a redb or JSON result into an S3 result.
+pub(super) trait StoreResultExt<T> {
+    /// Map any stored error to an S3 internal error.
+    fn store(self) -> S3Result<T>;
+}
+
+impl<T, E> StoreResultExt<T> for Result<T, E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn store(self) -> S3Result<T> {
+        self.map_err(S3Error::internal_error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
+    use crate::storage::Store;
 
     async fn repo() -> Repository {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        Repository::init(db).await.expect("init")
+        let store = Store::in_memory().expect("store");
+        Repository::init(store).await.expect("init")
+    }
+
+    fn write(etag: &str) -> ObjectWrite {
+        ObjectWrite {
+            size: 1,
+            content_type: None,
+            etag: Some(etag.into()),
+            content: serde_json::json!({}),
+            user_metadata: serde_json::json!({}),
+            checksums: serde_json::json!({}),
+            tags: serde_json::json!([]),
+        }
     }
 
     #[tokio::test]
@@ -89,40 +121,20 @@ mod tests {
             .await
             .expect("create bucket");
 
-        let first = repo
-            .cas_put_object(
-                "b".into(),
-                "k".into(),
-                ObjectWrite {
-                    size: 1,
-                    content_type: None,
-                    etag: Some("e1".into()),
-                    content: serde_json::json!({}),
-                    user_metadata: serde_json::json!({}),
-                    checksums: serde_json::json!({}),
-                    tags: serde_json::json!([]),
-                },
-                PutCondition::IfNoneMatchAny,
-            )
-            .await;
-        assert!(
-            first.is_ok(),
-            "first create-only put should succeed: {first:?}"
-        );
+        repo.cas_put_object(
+            "b".into(),
+            "k".into(),
+            write("e1"),
+            PutCondition::IfNoneMatchAny,
+        )
+        .await
+        .expect("first create-only put should succeed");
 
         let second = repo
             .cas_put_object(
                 "b".into(),
                 "k".into(),
-                ObjectWrite {
-                    size: 1,
-                    content_type: None,
-                    etag: Some("e2".into()),
-                    content: serde_json::json!({}),
-                    user_metadata: serde_json::json!({}),
-                    checksums: serde_json::json!({}),
-                    tags: serde_json::json!([]),
-                },
+                write("e2"),
                 PutCondition::IfNoneMatchAny,
             )
             .await;
@@ -158,15 +170,7 @@ mod tests {
                 repo.cas_put_object(
                     "b".into(),
                     "k".into(),
-                    ObjectWrite {
-                        size: 1,
-                        content_type: None,
-                        etag: Some(format!("e{i}")),
-                        content: serde_json::json!({}),
-                        user_metadata: serde_json::json!({}),
-                        checksums: serde_json::json!({}),
-                        tags: serde_json::json!([]),
-                    },
+                    write(&format!("e{i}")),
                     PutCondition::None,
                 )
                 .await
@@ -178,8 +182,6 @@ mod tests {
             "all concurrent puts should succeed: {results:?}"
         );
 
-        // Interleaved demote+insert must never leave zero or two latests
-        // (which would make every later read fail).
         let (versions, markers) = repo
             .list_object_versions("b", None, None, None, None, None)
             .await
@@ -192,7 +194,6 @@ mod tests {
             "exactly one latest"
         );
 
-        // Latest-key reads still work.
         repo.get_object("b", "k").await.expect("get latest");
     }
 }

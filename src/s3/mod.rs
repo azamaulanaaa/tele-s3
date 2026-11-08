@@ -20,10 +20,10 @@ use s3s::{
         UploadPartOutput,
     },
 };
-use sea_orm::DatabaseConnection;
 use tracing::instrument;
 
 use crate::backend::{Backend, BackendError, ReclaimOutcome};
+use crate::storage::Store;
 
 mod buckets;
 // Visible crate-wide so the admin endpoints can assert their reserved path
@@ -65,7 +65,7 @@ enum IntentDisposition {
 
 /// Whether an intent recorded at `created_at` is old enough to act on at `now`.
 ///
-/// This function is pure. It is the single definition of the rule. The SQL that selects candidates and this function must agree. This text states the boundary here once. The code documents the query as applying it.
+/// This function is pure. It is the single definition of the rule. The store range that selects candidates and this function must agree. This text states the boundary here once. The code documents the range as applying it.
 ///
 /// The check uses strictly older, matching [`ORPHAN_BLOB_MIN_AGE`]'s own rule. The code does not sweep an intent exactly at the threshold.
 fn publish_intent_is_due(
@@ -90,10 +90,10 @@ fn intent_disposition(outcome: &Result<ReclaimOutcome, BackendError>) -> IntentD
 }
 
 impl<B: Backend> TeleS3<B> {
-    /// Initialize the S3 service with a backend and database.
-    #[instrument(skip(backend, db), level = "debug", err)]
-    pub async fn init(backend: B, db: DatabaseConnection) -> anyhow::Result<Self> {
-        let repo = repo::Repository::init(db).await?;
+    /// Initialize the S3 service with a backend and store.
+    #[instrument(skip(backend, store), level = "debug", err)]
+    pub async fn init(backend: B, store: Store) -> anyhow::Result<Self> {
+        let repo = repo::Repository::init(store).await?;
 
         Ok(Self { backend, repo })
     }
@@ -217,7 +217,7 @@ impl<B: Backend> TeleS3<B> {
     ///
     /// The two passes are independent. Either may be skipped.
     ///
-    /// - They scan different tables: `s3_publish_intent` versus `s3_blob`. They repair different leak classes: bytes nobody can name versus rows nobody references.
+    /// - They scan different tables: publish intents versus blob rows. They repair different leak classes: bytes nobody can name versus rows nobody references.
     /// - Neither reads the other's state. Neither blocks the other. Running one does not require the other to have run.
     /// - They run independently at start-up. Each keeps its own age threshold and its own bounds. The code logs a failure in one. It does not stop the other.
     ///
@@ -589,11 +589,9 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use sea_orm::EntityTrait;
-
-    use super::repo::entity;
     use super::*;
     use crate::backend::{BoxedAsyncReader, Memory, ReadOutcome};
+    use crate::storage::{PublishIntentRow, Store};
 
     /// A backend whose deletes can fail on demand. The test observes release ordering.
     struct FlakyDelete {
@@ -762,27 +760,23 @@ mod tests {
     }
 
     async fn service(fail_delete: bool) -> TeleS3<FlakyDelete> {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        TeleS3::init(FlakyDelete::new(fail_delete), db)
+        let store = Store::in_memory().expect("store");
+        TeleS3::init(FlakyDelete::new(fail_delete), store)
             .await
             .expect("init")
     }
 
     async fn paused_service() -> TeleS3<PausedDelete> {
-        let db = sea_orm::Database::connect("sqlite::memory:")
+        let store = Store::in_memory().expect("store");
+        TeleS3::init(PausedDelete::new(), store)
             .await
-            .expect("connect");
-        TeleS3::init(PausedDelete::new(), db).await.expect("init")
+            .expect("init")
     }
 
     /// A service over a scripted backend, so every reclaim arm is reachable.
     async fn scripted(outcome: Result<ReclaimOutcome, BackendError>) -> TeleS3<ScriptedReclaim> {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        TeleS3::init(ScriptedReclaim::answering(outcome), db)
+        let store = Store::in_memory().expect("store");
+        TeleS3::init(ScriptedReclaim::answering(outcome), store)
             .await
             .expect("init")
     }
@@ -793,31 +787,26 @@ mod tests {
         publish_id: &str,
         age: chrono::Duration,
     ) {
-        use sea_orm::ActiveValue::Set;
-
         let created_at = chrono::Local::now().to_utc() - age;
 
-        entity::publish_intent::Entity::insert(entity::publish_intent::ActiveModel {
-            publish_id: Set(publish_id.to_string()),
-            bucket_id: Set("b".into()),
-            object_id: Set("k".into()),
-            size: Set(1),
-            blob_id: Set(None),
-            created_at: Set(created_at),
-            resolved_at: Set(None),
-        })
-        .exec(&svc.repo.db)
-        .await
-        .expect("record intent");
+        svc.repo.store.seed_publish_intent(&PublishIntentRow {
+            publish_id: publish_id.to_string(),
+            bucket_id: "b".into(),
+            object_id: "k".into(),
+            size: 1,
+            blob_id: None,
+            created_at,
+            resolved_at: None,
+        });
     }
 
     async fn pending_intents<B: Backend>(svc: &TeleS3<B>) -> Vec<String> {
-        let mut ids: Vec<String> = entity::publish_intent::Entity::find()
-            .all(&svc.repo.db)
-            .await
-            .expect("load intents")
+        let mut ids: Vec<String> = svc
+            .repo
+            .store
+            .all_publish_intents()
             .into_iter()
-            .map(|m| m.publish_id)
+            .map(|row| row.publish_id)
             .collect();
         ids.sort_unstable();
 
@@ -1018,12 +1007,12 @@ mod tests {
     }
 
     async fn blob_rows<B: Backend>(svc: &TeleS3<B>) -> Vec<i64> {
-        let mut rows: Vec<i64> = entity::blob::Entity::find()
-            .all(&svc.repo.db)
-            .await
-            .expect("load blob rows")
+        let mut rows: Vec<i64> = svc
+            .repo
+            .store
+            .all_blobs()
             .into_iter()
-            .map(|m| m.refs)
+            .map(|row| row.refs)
             .collect();
         rows.sort_unstable();
         rows

@@ -28,7 +28,8 @@ pub(crate) struct Config {
     pub bot_token: String,
     pub username: String,
 
-    pub database_uri: String,
+    /// Path to the redb metadata file, for example `"storage.redb"`.
+    pub database_path: String,
 
     pub listen_port: u16,
     pub auth_access_key: String,

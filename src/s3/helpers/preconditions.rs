@@ -8,8 +8,8 @@
 //! compare-and-set atomically.
 //!
 //! Keep repository-side execution out of this module. The translation
-//! ends at [`PutCondition`]. The SQL that handles [`PutCondition`]
-//! belongs to the repository.
+//! ends at [`PutCondition`]. The store transaction that handles
+//! [`PutCondition`] belongs to the repository.
 
 use s3s::{
     S3Error, S3ErrorCode, S3Result,

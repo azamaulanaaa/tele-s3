@@ -1,51 +1,34 @@
+use std::{collections::HashSet, ops::Bound};
+
+use chrono::{DateTime, Utc};
+use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
 use s3s::{S3Error, S3ErrorCode, S3Result};
-use sea_orm::{
-    ColumnTrait, Condition, DatabaseTransaction, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
-    QuerySelect, QueryTrait, Set, TransactionTrait,
-    prelude::Expr,
-    sea_query::{IntoCondition, OnConflict, Query},
-};
 use tracing::instrument;
 
-use super::entity;
-use super::{ObjectWrite, PutCondition, Repository};
+use super::{ObjectWrite, PutCondition, Repository, StoreResultExt};
 use crate::s3::objects::MAX_KEYS_CEILING;
+use crate::storage::{
+    BUCKETS, BucketRow, Fault, LATEST, OBJECTS, ObjectRow, StoreError, VERSIONS, decode, encode,
+    inverted_timestamp,
+};
 
-/// Columns that `list_objects` projects. They are exactly what
-/// `list_objects_inner` and `list_objects_v2_inner` read from a row.
-const LIST_OBJECT_COLUMNS: [entity::object::Column; 3] = [
-    entity::object::Column::Id,
-    entity::object::Column::Size,
-    entity::object::Column::LastModified,
-];
-
-/// Columns that `list_object_versions` projects. They are exactly what
-/// `list_object_versions_inner` reads from a row.
-const OBJECT_VERSION_COLUMNS: [entity::object::Column; 7] = [
-    entity::object::Column::Id,
-    entity::object::Column::VersionId,
-    entity::object::Column::IsLatest,
-    entity::object::Column::IsDeleteMarker,
-    entity::object::Column::Size,
-    entity::object::Column::LastModified,
-    entity::object::Column::Etag,
-];
+type ObjectKey = (&'static str, &'static str, &'static str);
+type ObjectValue = &'static [u8];
+type LatestKey = (&'static str, &'static str);
+type LatestValue = &'static str;
 
 /// One row of a `ListObjects` or `ListObjectsV2` page.
-///
-/// This is a projection of [`entity::object::Model`]. It is not a replacement.
-/// Point reads still materialise the whole row. They genuinely need `content`.
-#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectListRow {
     /// The key. It is also the `next_marker` cursor. It is also the input to
     /// the handler's `CommonPrefix` rollup.
     pub id: String,
     pub size: u32,
-    pub last_modified: chrono::DateTime<chrono::Utc>,
+    pub last_modified: DateTime<Utc>,
 }
 
 /// One row of a `ListObjectVersions` page.
-#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectVersionRow {
     /// The key. It is also the `next_key_marker` cursor. It is also the
     /// `CommonPrefix` input.
@@ -53,29 +36,245 @@ pub(crate) struct ObjectVersionRow {
     /// Also the `next_version_id_marker` cursor.
     pub version_id: String,
     pub is_latest: bool,
-    /// Splits the page into versions and delete markers. A listed marker's
-    /// `x-amz-delete-marker` and `x-amz-version-id` rest on it.
+    /// Splits the page into versions and delete markers.
     pub is_delete_marker: bool,
     pub size: u32,
-    pub last_modified: chrono::DateTime<chrono::Utc>,
+    pub last_modified: DateTime<Utc>,
     /// Rendered as the version's `e_tag`.
     pub etag: Option<String>,
 }
 
+fn bucket_row<T>(table: &T, name: &str) -> Result<Option<BucketRow>, StoreError>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    let Some(value) = table.get(name)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(decode(value.value())?))
+}
+
+fn object_row<T>(
+    table: &T,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<ObjectRow>, StoreError>
+where
+    T: ReadableTable<ObjectKey, ObjectValue>,
+{
+    let Some(value) = table.get((bucket, key, version_id))? else {
+        return Ok(None);
+    };
+
+    Ok(Some(decode(value.value())?))
+}
+
+fn latest_id<T>(table: &T, bucket: &str, key: &str) -> Result<Option<String>, StoreError>
+where
+    T: ReadableTable<LatestKey, LatestValue>,
+{
+    Ok(table
+        .get((bucket, key))?
+        .map(|value| value.value().to_owned()))
+}
+
+fn latest_model<T, U>(
+    latest: &T,
+    objects: &U,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<ObjectRow>, StoreError>
+where
+    T: ReadableTable<LatestKey, LatestValue>,
+    U: ReadableTable<ObjectKey, ObjectValue>,
+{
+    let Some(version_id) = latest_id(latest, bucket, key)? else {
+        return Ok(None);
+    };
+
+    object_row(objects, bucket, key, &version_id)
+}
+
+fn version_key(row: &ObjectRow) -> (&str, &str, u64, &str) {
+    (
+        &row.bucket_id,
+        &row.id,
+        inverted_timestamp(row.last_modified),
+        &row.version_id,
+    )
+}
+
+fn set_latest(
+    txn: &WriteTransaction,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<(), StoreError> {
+    let mut table = txn.open_table(LATEST)?;
+    table.insert((bucket, key), version_id)?;
+
+    Ok(())
+}
+
+fn clear_latest(txn: &WriteTransaction, bucket: &str, key: &str) -> Result<(), StoreError> {
+    let mut table = txn.open_table(LATEST)?;
+    table.remove((bucket, key))?;
+
+    Ok(())
+}
+
+/// Write a row, its version index entry, and the latest pointer.
+fn insert_object_row(txn: &WriteTransaction, row: &ObjectRow) -> Result<(), StoreError> {
+    {
+        let mut objects = txn.open_table(OBJECTS)?;
+        let bytes = encode(row)?;
+        objects.insert(
+            (
+                row.bucket_id.as_str(),
+                row.id.as_str(),
+                row.version_id.as_str(),
+            ),
+            bytes.as_slice(),
+        )?;
+    }
+    {
+        let mut versions = txn.open_table(VERSIONS)?;
+        versions.insert(version_key(row), &())?;
+    }
+    set_latest(txn, &row.bucket_id, &row.id, &row.version_id)?;
+
+    Ok(())
+}
+
+/// Replace an existing version row and keep its index entry in step.
+fn replace_object_row(txn: &WriteTransaction, row: &ObjectRow) -> Result<(), StoreError> {
+    {
+        let objects = txn.open_table(OBJECTS)?;
+        if let Some(old) = object_row(&objects, &row.bucket_id, &row.id, &row.version_id)? {
+            let mut versions = txn.open_table(VERSIONS)?;
+            versions.remove(version_key(&old))?;
+        }
+    }
+    insert_object_row(txn, row)
+}
+
+/// Delete one row and its version index entry.
+fn delete_object_row(
+    txn: &WriteTransaction,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<ObjectRow>, StoreError> {
+    let old = {
+        let objects = txn.open_table(OBJECTS)?;
+        object_row(&objects, bucket, key, version_id)?
+    };
+
+    if let Some(old) = &old {
+        {
+            let mut objects = txn.open_table(OBJECTS)?;
+            objects.remove((bucket, key, version_id))?;
+        }
+        {
+            let mut versions = txn.open_table(VERSIONS)?;
+            versions.remove(version_key(old))?;
+        }
+    }
+
+    Ok(old)
+}
+
+/// Set `is_latest = false` on the current latest row, when one exists.
+fn demote_latest(txn: &WriteTransaction, bucket: &str, key: &str) -> Result<(), StoreError> {
+    let mut row = {
+        let latest = txn.open_table(LATEST)?;
+        let objects = txn.open_table(OBJECTS)?;
+        latest_model(&latest, &objects, bucket, key)?
+    };
+
+    if let Some(row) = row.as_mut()
+        && row.is_latest
+    {
+        row.is_latest = false;
+        let bytes = encode(row)?;
+        let mut objects = txn.open_table(OBJECTS)?;
+        objects.insert(
+            (
+                row.bucket_id.as_str(),
+                row.id.as_str(),
+                row.version_id.as_str(),
+            ),
+            bytes.as_slice(),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Promote the newest remaining version of a key, or clear the pointer.
+fn promote_newest(txn: &WriteTransaction, bucket: &str, key: &str) -> Result<(), StoreError> {
+    let next = {
+        let versions = txn.open_table(VERSIONS)?;
+        match versions.range((bucket, key, 0_u64, "")..)?.next() {
+            Some(entry) => {
+                let (entry_key, _) = entry?;
+                let (entry_bucket, entry_key, _, version_id) = entry_key.value();
+                if entry_bucket == bucket && entry_key == key {
+                    Some(version_id.to_owned())
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+
+    let Some(version_id) = next else {
+        clear_latest(txn, bucket, key)?;
+        return Ok(());
+    };
+
+    {
+        let mut row = {
+            let objects = txn.open_table(OBJECTS)?;
+            object_row(&objects, bucket, key, &version_id)?
+        };
+        if let Some(row) = row.as_mut() {
+            row.is_latest = true;
+            let bytes = encode(row)?;
+            let mut objects = txn.open_table(OBJECTS)?;
+            objects.insert(
+                (
+                    row.bucket_id.as_str(),
+                    row.id.as_str(),
+                    row.version_id.as_str(),
+                ),
+                bytes.as_slice(),
+            )?;
+        }
+    }
+    set_latest(txn, bucket, key, &version_id)?;
+
+    Ok(())
+}
+
 impl Repository {
-    async fn get_latest_model(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> S3Result<Option<entity::object::Model>> {
-        let m = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .filter(entity::object::Column::Id.eq(key))
-            .filter(entity::object::Column::IsLatest.eq(true))
-            .one(&self.db)
+    async fn get_latest_model(&self, bucket: &str, key: &str) -> S3Result<Option<ObjectRow>> {
+        self.inject(Fault::ObjectRead)?;
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let latest = txn.open_table(LATEST).store()?;
+                let objects = txn.open_table(OBJECTS).store()?;
+
+                latest_model(&latest, &objects, &bucket, &key).store()
+            })
             .await
-            .map_err(S3Error::internal_error)?;
-        Ok(m)
     }
 
     pub(crate) async fn get_object_version(
@@ -83,24 +282,30 @@ impl Repository {
         bucket: &str,
         key: &str,
         version_id: &str,
-    ) -> S3Result<entity::object::Model> {
-        let m = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .filter(entity::object::Column::Id.eq(key))
-            .filter(entity::object::Column::VersionId.eq(version_id))
-            .one(&self.db)
+    ) -> S3Result<ObjectRow> {
+        self.inject(Fault::ObjectRead)?;
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let version_id = version_id.to_owned();
+
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let objects = txn.open_table(OBJECTS).store()?;
+
+                object_row(&objects, &bucket, &key, &version_id)
+                    .store()?
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))
+            })
             .await
-            .map_err(S3Error::internal_error)?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
-        Ok(m)
     }
 
     /// Atomic compare-and-swap object write.
     ///
-    /// The condition check and the demote-plus-insert run in one database
-    /// transaction. Concurrent writers serialize on the write lock. They do not
-    /// interleave into zero or two `is_latest` rows. A crash between demote
-    /// and insert cannot orphan the key.
+    /// The condition check and the demote-plus-insert run in one redb write
+    /// transaction. Concurrent writers serialize on that transaction. They do
+    /// not interleave into zero or two `is_latest` rows. A crash between
+    /// demote and insert cannot orphan the key.
     #[instrument(skip(self, data, condition), level = "debug", err)]
     pub(crate) async fn cas_put_object(
         &self,
@@ -109,42 +314,25 @@ impl Repository {
         data: ObjectWrite,
         condition: PutCondition,
     ) -> S3Result<String> {
-        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
 
-        let result = self
-            .cas_put_object_txn(&txn, bucket, key, data, condition)
-            .await;
-
-        match result {
-            Ok(version_id) => {
-                txn.commit().await.map_err(S3Error::internal_error)?;
-                Ok(version_id)
-            }
-            Err(err) => {
-                txn.rollback().await.map_err(S3Error::internal_error)?;
-                Err(err)
-            }
-        }
+                let result = cas_put_object_txn(&txn, &bucket, &key, data, condition);
+                match result {
+                    Ok(version_id) => {
+                        txn.commit().store()?;
+                        Ok(version_id)
+                    }
+                    Err(err) => Err(err),
+                }
+            })
+            .await
     }
 
-    /// Atomic publish. Record the new blob row, the object row, and the resolved
-    /// publish intent in one transaction. The intent is recorded only when
-    /// `publish_id` is set.
-    ///
-    /// `PutObject` used to run [`Self::cas_put_object`] as a second transaction
-    /// after `register_new_blob`. The backend blob already existed. A crash or
-    /// error between the two left a `s3_blob` row with `refs = 1`. Nothing
-    /// referenced that row. It was invisible to listings. It was never reclaimed.
-    /// Composing the blob insert with `cas_put_object_txn` closes that window.
-    /// Both rows appear together or not at all.
-    ///
-    /// The intent resolves in the same transaction for the same reason. A
-    /// resolve after commit could fail. It would leave a pending row for a live
-    /// object. The reclaim pass would then delete its bytes. If the resolve
-    /// fails here, the whole publish rolls back.
-    ///
-    /// Error mapping is unchanged. The condition check, the versioning branches,
-    /// and their codes all come from `cas_put_object_txn`.
+    /// Atomic publish. Record the new blob row, the object row, and the
+    /// resolved publish intent in one transaction. The intent is recorded only
+    /// when `publish_id` is set.
     #[instrument(skip(self, data, condition), level = "debug", err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn publish_object_with_new_blob(
@@ -156,260 +344,40 @@ impl Repository {
         data: ObjectWrite,
         condition: PutCondition,
     ) -> S3Result<String> {
-        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
-        let blob_size = data.size;
-
-        let result = async {
-            Self::insert_blob(&txn, blob_id.clone(), blob_size).await?;
-            let version_id = self
-                .cas_put_object_txn(&txn, bucket, key, data, condition)
-                .await?;
-
-            if let Some(publish_id) = publish_id {
-                Self::resolve_publish_intent_txn(&txn, publish_id, blob_id).await?;
-            }
-
-            Ok(version_id)
+        if publish_id.is_some() {
+            self.inject(Fault::PublishIntentUpdate)?;
         }
-        .await;
+        let publish_id = publish_id.map(str::to_owned);
 
-        match result {
-            Ok(version_id) => {
-                txn.commit().await.map_err(S3Error::internal_error)?;
-                Ok(version_id)
-            }
-            Err(err) => {
-                txn.rollback().await.map_err(S3Error::internal_error)?;
-                Err(err)
-            }
-        }
-    }
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                let blob_size = data.size;
 
-    pub(super) async fn cas_put_object_txn(
-        &self,
-        txn: &DatabaseTransaction,
-        bucket: String,
-        key: String,
-        data: ObjectWrite,
-        condition: PutCondition,
-    ) -> S3Result<String> {
-        let bucket_model = Self::get_bucket_txn(txn, &bucket).await?;
-        let versioning = bucket_model.versioning_status.clone();
+                let result = (|| {
+                    super::blobs::insert_blob_in_txn(&txn, &blob_id, blob_size)?;
+                    let version_id = cas_put_object_txn(&txn, &bucket, &key, data, condition)?;
 
-        let now = chrono::Local::now().to_utc();
+                    if let Some(publish_id) = &publish_id {
+                        super::blobs::resolve_publish_intent_in_txn(
+                            &txn,
+                            publish_id,
+                            blob_id.clone(),
+                        )?;
+                    }
 
-        let latest_opt = Self::get_latest_model_txn(txn, &bucket, &key).await?;
-        let exists_not_deleted = latest_opt.as_ref().is_some_and(|m| !m.is_delete_marker);
-        let current_etag = if exists_not_deleted {
-            latest_opt.as_ref().and_then(|m| m.etag.clone())
-        } else {
-            None
-        };
+                    Ok(version_id)
+                })();
 
-        match &condition {
-            PutCondition::IfMatch(expected) => {
-                if !exists_not_deleted {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                match result {
+                    Ok(version_id) => {
+                        txn.commit().store()?;
+                        Ok(version_id)
+                    }
+                    Err(err) => Err(err),
                 }
-                if current_etag.as_deref() != Some(expected.as_str()) {
-                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-                }
-            }
-            PutCondition::IfMatchAny => {
-                if !exists_not_deleted {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-                }
-            }
-            PutCondition::IfNoneMatchAny => {
-                if exists_not_deleted {
-                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-                }
-            }
-            PutCondition::IfNoneMatch(expected) => {
-                if exists_not_deleted && current_etag.as_deref() == Some(expected.as_str()) {
-                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-                }
-            }
-            PutCondition::None => {}
-        }
-
-        let version_id = self
-            .put_object_internal(txn, bucket, key, data, versioning, now)
-            .await?;
-        Ok(version_id)
-    }
-
-    async fn get_bucket_txn(
-        txn: &DatabaseTransaction,
-        name: &str,
-    ) -> S3Result<entity::bucket::Model> {
-        let bucket = entity::bucket::Entity::find_by_id(name)
-            .one(txn)
+            })
             .await
-            .map_err(S3Error::internal_error)?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?;
-
-        Ok(bucket)
-    }
-
-    async fn get_latest_model_txn(
-        txn: &DatabaseTransaction,
-        bucket: &str,
-        key: &str,
-    ) -> S3Result<Option<entity::object::Model>> {
-        let m = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .filter(entity::object::Column::Id.eq(key))
-            .filter(entity::object::Column::IsLatest.eq(true))
-            .one(txn)
-            .await
-            .map_err(S3Error::internal_error)?;
-        Ok(m)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn put_object_internal(
-        &self,
-        txn: &DatabaseTransaction,
-        bucket: String,
-        key: String,
-        data: ObjectWrite,
-        versioning: Option<String>,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> S3Result<String> {
-        if versioning.is_none() {
-            let version_id = "null".to_string();
-            let active_model = entity::object::ActiveModel {
-                bucket_id: Set(bucket.clone()),
-                id: Set(key.clone()),
-                version_id: Set(version_id.clone()),
-                is_latest: Set(true),
-                is_delete_marker: Set(false),
-                size: Set(Self::checked_size(data.size)?),
-                last_modified: Set(now),
-                content_type: Set(data.content_type),
-                etag: Set(data.etag),
-                user_metadata: Set(data.user_metadata),
-                tags: Set(data.tags),
-                checksums: Set(data.checksums),
-                content: Set(data.content),
-            };
-
-            entity::object::Entity::insert(active_model)
-                .on_conflict(
-                    OnConflict::columns([
-                        entity::object::Column::BucketId,
-                        entity::object::Column::Id,
-                        entity::object::Column::VersionId,
-                    ])
-                    .update_columns([
-                        entity::object::Column::Size,
-                        entity::object::Column::LastModified,
-                        entity::object::Column::ContentType,
-                        entity::object::Column::Etag,
-                        entity::object::Column::Content,
-                        entity::object::Column::UserMetadata,
-                        entity::object::Column::Tags,
-                        entity::object::Column::Checksums,
-                        entity::object::Column::IsLatest,
-                        entity::object::Column::IsDeleteMarker,
-                    ])
-                    .to_owned(),
-                )
-                .exec(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            Ok(version_id)
-        } else if versioning.as_deref() == Some("Enabled") {
-            let version_id = uuid::Uuid::new_v4().to_string();
-
-            entity::object::Entity::update_many()
-                .col_expr(entity::object::Column::IsLatest, Expr::value(false))
-                .filter(entity::object::Column::BucketId.eq(bucket.clone()))
-                .filter(entity::object::Column::Id.eq(key.clone()))
-                .filter(entity::object::Column::IsLatest.eq(true))
-                .exec(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            let active_model = entity::object::ActiveModel {
-                bucket_id: Set(bucket),
-                id: Set(key),
-                version_id: Set(version_id.clone()),
-                is_latest: Set(true),
-                is_delete_marker: Set(false),
-                size: Set(Self::checked_size(data.size)?),
-                last_modified: Set(now),
-                content_type: Set(data.content_type),
-                etag: Set(data.etag),
-                user_metadata: Set(data.user_metadata),
-                tags: Set(data.tags),
-                checksums: Set(data.checksums),
-                content: Set(data.content),
-            };
-
-            entity::object::Entity::insert(active_model)
-                .exec(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            Ok(version_id)
-        } else {
-            // Demote old latest (including null if it was latest, we will re-enable it)
-            entity::object::Entity::update_many()
-                .col_expr(entity::object::Column::IsLatest, Expr::value(false))
-                .filter(entity::object::Column::BucketId.eq(bucket.clone()))
-                .filter(entity::object::Column::Id.eq(key.clone()))
-                .filter(entity::object::Column::IsLatest.eq(true))
-                .exec(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            let version_id = "null".to_string();
-            let active_model = entity::object::ActiveModel {
-                bucket_id: Set(bucket.clone()),
-                id: Set(key.clone()),
-                version_id: Set(version_id.clone()),
-                is_latest: Set(true),
-                is_delete_marker: Set(false),
-                size: Set(Self::checked_size(data.size)?),
-                last_modified: Set(now),
-                content_type: Set(data.content_type),
-                etag: Set(data.etag),
-                user_metadata: Set(data.user_metadata),
-                tags: Set(data.tags),
-                checksums: Set(data.checksums),
-                content: Set(data.content),
-            };
-
-            entity::object::Entity::insert(active_model)
-                .on_conflict(
-                    OnConflict::columns([
-                        entity::object::Column::BucketId,
-                        entity::object::Column::Id,
-                        entity::object::Column::VersionId,
-                    ])
-                    .update_columns([
-                        entity::object::Column::Size,
-                        entity::object::Column::LastModified,
-                        entity::object::Column::ContentType,
-                        entity::object::Column::Etag,
-                        entity::object::Column::Content,
-                        entity::object::Column::UserMetadata,
-                        entity::object::Column::Tags,
-                        entity::object::Column::Checksums,
-                        entity::object::Column::IsLatest,
-                        entity::object::Column::IsDeleteMarker,
-                    ])
-                    .to_owned(),
-                )
-                .exec(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            Ok(version_id)
-        }
     }
 
     pub(crate) async fn set_object_tags_versioned(
@@ -419,23 +387,45 @@ impl Repository {
         version_id: Option<&str>,
         tags: serde_json::Value,
     ) -> S3Result<()> {
-        let mut query = entity::object::Entity::update_many()
-            .col_expr(entity::object::Column::Tags, Expr::value(tags))
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .filter(entity::object::Column::Id.eq(key));
-        if let Some(vid) = version_id {
-            query = query.filter(entity::object::Column::VersionId.eq(vid));
-        } else {
-            query = query.filter(entity::object::Column::IsLatest.eq(true));
-        }
-        let result = query
-            .exec(&self.db)
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let version_id = version_id.map(str::to_owned);
+
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                {
+                    let mut objects = txn.open_table(OBJECTS).store()?;
+                    let target = match &version_id {
+                        Some(version_id) => {
+                            object_row(&objects, &bucket, &key, version_id).store()?
+                        }
+                        None => {
+                            let latest = txn.open_table(LATEST).store()?;
+                            latest_model(&latest, &objects, &bucket, &key).store()?
+                        }
+                    };
+                    let Some(mut row) = target else {
+                        return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                    };
+                    row.tags = tags;
+                    let bytes = encode(&row).store()?;
+                    objects
+                        .insert(
+                            (
+                                row.bucket_id.as_str(),
+                                row.id.as_str(),
+                                row.version_id.as_str(),
+                            ),
+                            bytes.as_slice(),
+                        )
+                        .store()?;
+                }
+                txn.commit().store()?;
+
+                Ok(())
+            })
             .await
-            .map_err(S3Error::internal_error)?;
-        if result.rows_affected == 0 {
-            return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-        }
-        Ok(())
     }
 
     /// Version id of the current latest entry for a key, if any.
@@ -447,18 +437,17 @@ impl Repository {
         Ok(self
             .get_latest_model(bucket, key)
             .await?
-            .map(|m| m.version_id))
+            .map(|row| row.version_id))
     }
 
     /// Latest version row, even if it is a delete marker. Returns `None` when
-    /// the key has no versions. Used to attach delete-marker headers to GET
-    /// and HEAD errors.
+    /// the key has no versions.
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn get_latest_raw(
         &self,
         bucket: &str,
         key: &str,
-    ) -> S3Result<Option<entity::object::Model>> {
+    ) -> S3Result<Option<ObjectRow>> {
         self.get_latest_model(bucket, key).await
     }
 
@@ -469,48 +458,48 @@ impl Repository {
         key: String,
         data: ObjectWrite,
     ) -> S3Result<String> {
-        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                let versioning = {
+                    let buckets = txn.open_table(BUCKETS).store()?;
+                    bucket_row(&buckets, &bucket)
+                        .store()?
+                        .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?
+                        .versioning_status
+                };
+                let now = chrono::Local::now().to_utc();
+                let result = put_object_internal(&txn, &bucket, &key, data, versioning, now);
 
-        let bucket_model = Self::get_bucket_txn(&txn, &bucket).await?;
-        let versioning = bucket_model.versioning_status;
-        let now = chrono::Local::now().to_utc();
-        let result = self
-            .put_object_internal(&txn, bucket, key, data, versioning, now)
-            .await;
-
-        match result {
-            Ok(version_id) => {
-                txn.commit().await.map_err(S3Error::internal_error)?;
-                Ok(version_id)
-            }
-            Err(err) => {
-                txn.rollback().await.map_err(S3Error::internal_error)?;
-                Err(err)
-            }
-        }
+                match result {
+                    Ok(version_id) => {
+                        txn.commit().store()?;
+                        Ok(version_id)
+                    }
+                    Err(err) => Err(err),
+                }
+            })
+            .await
     }
 
     #[allow(dead_code)]
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> S3Result<bool> {
-        let m = self.get_latest_model(bucket, key).await?;
-        Ok(m.is_some_and(|v| !v.is_delete_marker))
+        let row = self.get_latest_model(bucket, key).await?;
+        Ok(row.is_some_and(|value| !value.is_delete_marker))
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub(crate) async fn get_object(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> S3Result<entity::object::Model> {
-        let m = self
+    pub(crate) async fn get_object(&self, bucket: &str, key: &str) -> S3Result<ObjectRow> {
+        let row = self
             .get_latest_model(bucket, key)
             .await?
             .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
-        if m.is_delete_marker {
+        if row.is_delete_marker {
             return Err(S3Error::new(S3ErrorCode::NoSuchKey));
         }
-        Ok(m)
+
+        Ok(row)
     }
 
     /// Versioned delete.
@@ -520,265 +509,39 @@ impl Repository {
     /// permanently delete the null version. Returns (`deleted_model`,
     /// `is_delete_marker_created`).
     ///
-    /// Every statement runs in one transaction. See [`Self::cas_put_object`].
-    /// "At most one row per key has `is_latest = true`" is enforced by the
-    /// transaction, not by the schema. The primary key is `(bucket_id, id,
-    /// version_id)`. There is no unique index on `is_latest`. sea-orm cannot
-    /// express a partial unique index. A plain unique index on `(bucket_id, id)`
-    /// would be wrong. Every non-latest version shares those two columns. The
-    /// invariant is upheld by holding the write lock across demote, insert, and
-    /// promote. A concurrent transaction serializes behind this one. It never
-    /// observes an intermediate state. Running these statements as separate
-    /// implicit transactions would let a crash strand the key with zero
-    /// `is_latest` rows. `ListObjectVersions` would still list them. `GetObject`
-    /// would never see them. It would also let two `is_latest` rows appear.
+    /// Every change runs in one redb write transaction. "At most one row per
+    /// key has `is_latest = true`" is upheld by holding that transaction
+    /// across demote, insert, and promote. A concurrent transaction serializes
+    /// behind this one. It never observes an intermediate state.
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn delete_object_versioned(
         &self,
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-    ) -> S3Result<(Option<entity::object::Model>, bool)> {
-        let txn = self.db.begin().await.map_err(S3Error::internal_error)?;
+    ) -> S3Result<(Option<ObjectRow>, bool)> {
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let version_id = version_id.map(str::to_owned);
 
-        let result = self
-            .delete_object_versioned_txn(&txn, bucket, key, version_id)
-            .await;
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                let result =
+                    delete_object_versioned_txn(&txn, &bucket, &key, version_id.as_deref());
 
-        match result {
-            Ok(out) => {
-                txn.commit().await.map_err(S3Error::internal_error)?;
-                Ok(out)
-            }
-            Err(err) => {
-                txn.rollback().await.map_err(S3Error::internal_error)?;
-                Err(err)
-            }
-        }
-    }
-
-    async fn delete_object_versioned_txn(
-        &self,
-        txn: &DatabaseTransaction,
-        bucket: &str,
-        key: &str,
-        version_id: Option<&str>,
-    ) -> S3Result<(Option<entity::object::Model>, bool)> {
-        if let Some(vid) = version_id {
-            let model_opt = entity::object::Entity::find()
-                .filter(entity::object::Column::BucketId.eq(bucket))
-                .filter(entity::object::Column::Id.eq(key))
-                .filter(entity::object::Column::VersionId.eq(vid))
-                .one(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            let model = match model_opt {
-                Some(m) => m,
-                None => return Err(S3Error::new(S3ErrorCode::NoSuchKey)),
-            };
-
-            let was_latest = model.is_latest;
-
-            entity::object::Entity::delete_many()
-                .filter(entity::object::Column::BucketId.eq(bucket))
-                .filter(entity::object::Column::Id.eq(key))
-                .filter(entity::object::Column::VersionId.eq(vid))
-                .exec(txn)
-                .await
-                .map_err(S3Error::internal_error)?;
-
-            if was_latest {
-                let next = entity::object::Entity::find()
-                    .filter(entity::object::Column::BucketId.eq(bucket))
-                    .filter(entity::object::Column::Id.eq(key))
-                    .order_by_desc(entity::object::Column::LastModified)
-                    .one(txn)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-                if let Some(next_model) = next {
-                    entity::object::Entity::update_many()
-                        .col_expr(entity::object::Column::IsLatest, Expr::value(true))
-                        .filter(entity::object::Column::BucketId.eq(bucket))
-                        .filter(entity::object::Column::Id.eq(key))
-                        .filter(entity::object::Column::VersionId.eq(next_model.version_id.clone()))
-                        .exec(txn)
-                        .await
-                        .map_err(S3Error::internal_error)?;
+                match result {
+                    Ok(output) => {
+                        txn.commit().store()?;
+                        Ok(output)
+                    }
+                    Err(err) => Err(err),
                 }
-            }
-
-            Ok((Some(model), false))
-        } else {
-            let bucket_model = Self::get_bucket_txn(txn, bucket).await?;
-            let status = bucket_model.versioning_status;
-            if status.is_none() {
-                let m = entity::object::Entity::find()
-                    .filter(entity::object::Column::BucketId.eq(bucket))
-                    .filter(entity::object::Column::Id.eq(key))
-                    .filter(entity::object::Column::VersionId.eq("null"))
-                    .one(txn)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-                if let Some(model) = m.clone() {
-                    entity::object::Entity::delete_many()
-                        .filter(entity::object::Column::BucketId.eq(bucket))
-                        .filter(entity::object::Column::Id.eq(key))
-                        .filter(entity::object::Column::VersionId.eq("null"))
-                        .exec(txn)
-                        .await
-                        .map_err(S3Error::internal_error)?;
-                    Ok((Some(model), false))
-                } else {
-                    // No such key; S3 delete is idempotent, return Ok with no model
-                    Ok((None, false))
-                }
-            } else {
-                let version_id = uuid::Uuid::new_v4().to_string();
-                let now = chrono::Local::now().to_utc();
-
-                entity::object::Entity::update_many()
-                    .col_expr(entity::object::Column::IsLatest, Expr::value(false))
-                    .filter(entity::object::Column::BucketId.eq(bucket))
-                    .filter(entity::object::Column::Id.eq(key))
-                    .filter(entity::object::Column::IsLatest.eq(true))
-                    .exec(txn)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-
-                let active = entity::object::ActiveModel {
-                    bucket_id: Set(bucket.to_string()),
-                    id: Set(key.to_string()),
-                    version_id: Set(version_id.clone()),
-                    is_latest: Set(true),
-                    is_delete_marker: Set(true),
-                    size: Set(0),
-                    last_modified: Set(now),
-                    content_type: Set(None),
-                    etag: Set(None),
-                    user_metadata: Set(serde_json::json!({})),
-                    tags: Set(serde_json::json!([])),
-                    checksums: Set(serde_json::json!({})),
-                    content: Set(serde_json::json!({"item": []})),
-                };
-                entity::object::Entity::insert(active)
-                    .exec(txn)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-
-                // Read the marker back so the caller gets the row as stored.
-                let marker_model = entity::object::Entity::find()
-                    .filter(entity::object::Column::BucketId.eq(bucket))
-                    .filter(entity::object::Column::Id.eq(key))
-                    .filter(entity::object::Column::VersionId.eq(version_id.clone()))
-                    .one(txn)
-                    .await
-                    .map_err(S3Error::internal_error)?
-                    .ok_or_else(|| {
-                        S3Error::internal_error(std::io::Error::other(
-                            "delete marker vanished immediately after insert",
-                        ))
-                    })?;
-
-                Ok((Some(marker_model), true))
-            }
-        }
-    }
-
-    /// Filter and order half of [`Self::list_objects`]. Split out so the rendered
-    /// SQL is assertable without a database.
-    fn list_objects_query(
-        bucket: &str,
-        prefix: Option<&str>,
-        delimiter: Option<&str>,
-        marker: Option<&str>,
-    ) -> sea_orm::Select<entity::object::Entity> {
-        // Only list latest, non-delete-marker versions
-        let mut query = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            .filter(entity::object::Column::IsLatest.eq(true))
-            .filter(entity::object::Column::IsDeleteMarker.eq(false))
-            .filter(
-                Condition::all()
-                    .add_option(marker.map(|marker| entity::object::Column::Id.gt(marker)))
-                    .add_option(
-                        prefix.map(|prefix| entity::object::Column::Id.starts_with(prefix)),
-                    ),
-            )
-            .order_by_asc(entity::object::Column::Id);
-
-        if let Some(delimiter) = delimiter {
-            let prefix_len = prefix.map(str::len).unwrap_or_default() as u32;
-
-            query =
-                query.filter(
-                    Condition::any()
-                        .add(
-                            Expr::cust_with_exprs(
-                                "INSTR(SUBSTR(?, ?), ?)",
-                                [
-                                    entity::object::Column::Id.into_expr(),
-                                    (prefix_len + 1).into(),
-                                    delimiter.to_owned().into(),
-                                ],
-                            )
-                            .eq(0),
-                        )
-                        .add(
-                            entity::object::Column::Id.in_subquery(
-                                Query::select()
-                                    .expr(entity::object::Column::Id.min())
-                                    .from(entity::object::Entity)
-                                    .distinct()
-                                    .cond_where(
-                                        Condition::all()
-                                            .add(entity::object::Column::BucketId.eq(bucket))
-                                            .add(entity::object::Column::IsLatest.eq(true))
-                                            .add(entity::object::Column::IsDeleteMarker.eq(false))
-                                            .add_option(marker.map(|marker| {
-                                                entity::object::Column::Id.gt(marker)
-                                            }))
-                                            .add_option(prefix.map(|prefix| {
-                                                entity::object::Column::Id.starts_with(prefix)
-                                            }))
-                                            .add(
-                                                Expr::cust_with_exprs(
-                                                    "INSTR(SUBSTR(?, ?), ?)",
-                                                    [
-                                                        entity::object::Column::Id.into_expr(),
-                                                        (prefix_len + 1).into(),
-                                                        delimiter.to_owned().into(),
-                                                    ],
-                                                )
-                                                .ne(0),
-                                            ),
-                                    )
-                                    .add_group_by([Expr::cust_with_exprs(
-                                        "SUBSTR(?, 1, ? + INSTR(SUBSTR(?, ?), ?))",
-                                        [
-                                            entity::object::Column::Id.into_expr(),
-                                            prefix_len.into(),
-                                            entity::object::Column::Id.into_expr(),
-                                            (prefix_len + 1).into(),
-                                            delimiter.to_owned().into(),
-                                        ],
-                                    )])
-                                    .to_owned(),
-                            ),
-                        ),
-                );
-        }
-
-        query
+            })
+            .await
     }
 
     /// List the latest, non-delete-marker version of every key in a page.
-    ///
-    /// Projected to [`LIST_OBJECT_COLUMNS`]: `id`, `size`, `last_modified`. That
-    /// is exactly what `list_objects_inner` and `list_objects_v2_inner` read
-    /// from a row. The key doubles as the `next_marker` cursor. It is also the
-    /// input to the `CommonPrefix` rollup. The heavy JSON columns are never read
-    /// by that handler. Fetching a full page of them wastes work.
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn list_objects(
         &self,
@@ -788,92 +551,89 @@ impl Repository {
         marker: Option<String>,
         limit: u64,
     ) -> S3Result<Vec<ObjectListRow>> {
-        let rows = Self::list_objects_query(
-            bucket,
-            prefix.as_deref(),
-            delimiter.as_deref(),
-            marker.as_deref(),
-        )
-        .select_only()
-        .columns(LIST_OBJECT_COLUMNS)
-        .limit(Some(limit))
-        .into_model::<ObjectListRow>()
-        .all(&self.db)
-        .await
-        .map_err(S3Error::internal_error)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bucket = bucket.to_owned();
 
-        Ok(rows)
-    }
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let latest = txn.open_table(LATEST).store()?;
+                let objects = txn.open_table(OBJECTS).store()?;
 
-    /// Build the bounded page query for [`Self::list_object_versions`].
-    ///
-    /// `limit` is the SQL `LIMIT`. It is the caller's fetch cap. `version_cursor`
-    /// is the resolved `(key_marker, last_modified)` position of
-    /// `version_id_marker`. Both markers must be supplied and resolved. Split
-    /// out so the rendered SQL is assertable without a database. The SQL
-    /// includes `LIMIT` and the marker predicate.
-    fn object_versions_page_query(
-        bucket: &str,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        version_cursor: Option<(String, chrono::DateTime<chrono::Utc>)>,
-        limit: u64,
-    ) -> sea_orm::Select<entity::object::Entity> {
-        entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(bucket))
-            // "Strictly after the cursor": rows past the marker key, plus the
-            // marker key's own versions older than the cursor version.
-            .filter(match version_cursor {
-                Some((km, marker_modified)) => Condition::any()
-                    .add(entity::object::Column::Id.gt(km.clone()))
-                    .add(
-                        Condition::all()
-                            .add(entity::object::Column::Id.eq(km))
-                            .add(entity::object::Column::LastModified.lt(marker_modified)),
-                    )
-                    .into_condition(),
-                None => key_marker.map_or_else(
-                    || Condition::all().into_condition(),
-                    |km| entity::object::Column::Id.gt(km).into_condition(),
-                ),
+                let start = match marker.as_deref() {
+                    Some(marker) => Bound::Excluded((bucket.as_str(), marker)),
+                    None => {
+                        Bound::Included((bucket.as_str(), prefix.as_deref().unwrap_or_default()))
+                    }
+                };
+                let upper = prefix.as_deref().map(crate::storage::prefix_upper);
+                let end = match upper.as_deref() {
+                    Some(upper) => Bound::Excluded((bucket.as_str(), upper)),
+                    None => Bound::Unbounded,
+                };
+
+                let mut rows = Vec::new();
+                let mut rolled: HashSet<String> = HashSet::new();
+
+                for entry in latest.range((start, end)).store()? {
+                    let (key, value) = entry.store()?;
+                    let (entry_bucket, key) = key.value();
+                    if entry_bucket != bucket {
+                        break;
+                    }
+                    if let Some(prefix) = prefix.as_deref()
+                        && !key.starts_with(prefix)
+                    {
+                        continue;
+                    }
+
+                    let version_id = value.value();
+                    let Some(row) = object_row(&objects, &bucket, key, version_id).store()? else {
+                        continue;
+                    };
+                    if row.is_delete_marker {
+                        continue;
+                    }
+
+                    if let Some(delimiter) = delimiter.as_deref()
+                        && let Some(common) =
+                            common_prefix_for(key, prefix.as_deref().unwrap_or_default(), delimiter)
+                        && !rolled.insert(common)
+                    {
+                        continue;
+                    }
+
+                    rows.push(ObjectListRow {
+                        id: row.id,
+                        size: row.size,
+                        last_modified: row.last_modified,
+                    });
+
+                    if rows.len() as u64 == limit {
+                        break;
+                    }
+                }
+
+                Ok(rows)
             })
-            .order_by_asc(entity::object::Column::Id)
-            .order_by_desc(entity::object::Column::LastModified)
-            // Final tiebreaker: makes the page order total, so the marker
-            // predicate above lands on the same boundary the walk starts from
-            // even when two versions share a `last_modified`.
-            .order_by_asc(entity::object::Column::VersionId)
-            .limit(limit)
-            .apply_if(prefix, |query, p| {
-                query.filter(entity::object::Column::Id.starts_with(p))
-            })
+            .await
     }
 
     /// List one page of a bucket's object versions.
     ///
-    /// Rows come back ordered `Id ASC, LastModified DESC, VersionId ASC`. That
-    /// is the S3 version-listing order. The page is bounded by a SQL `LIMIT`.
-    /// At most `max_keys` rows are materialised. A recursive
-    /// `ListObjectVersions` walk costs one indexed page per request. It does
-    /// not cost a full-table materialisation per page.
+    /// Rows come back ordered `Id ASC, LastModified DESC, VersionId ASC`.
+    /// That is the S3 version-listing order. The page is bounded by the
+    /// caller's fetch cap.
     ///
-    /// Pagination is a SQL predicate, not a post-fetch filter. Rows at or
-    /// before the marker are never read. With only `key_marker`, the cursor is
-    /// the key. With `key_marker` plus `version_id_marker`, the cursor is that
-    /// exact row. Rows after it have a greater key or a smaller
-    /// `last_modified`. An unknown `version_id_marker` degrades to the
-    /// key-only boundary.
+    /// With only `key_marker`, the cursor is the key. With `key_marker` plus
+    /// `version_id_marker`, the cursor is that exact row. Rows after it have a
+    /// greater key or an older `last_modified`. An unknown `version_id_marker`
+    /// degrades to the key-only boundary.
     ///
     /// Callers pass `max_keys + 1`. They use the extra row as the truncation
-    /// sentinel. `len() > max_keys` means another page exists. The sentinel row
-    /// is dropped. The last returned row supplies the continuation markers.
-    ///
-    /// `delimiter` is ignored. The handler folds the returned page into
-    /// `CommonPrefix` entries. The page boundary bounds that rollup.
-    ///
-    /// Returns `(versions, delete_markers)`. Both come from the single ordered
-    /// page. They are projected to [`OBJECT_VERSION_COLUMNS`]. That is exactly
-    /// what `list_object_versions_inner` reads from a row.
+    /// sentinel.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_object_versions(
         &self,
@@ -886,94 +646,313 @@ impl Repository {
     ) -> S3Result<(Vec<ObjectVersionRow>, Vec<ObjectVersionRow>)> {
         let limit = usize::try_from(max_keys.unwrap_or(MAX_KEYS_CEILING))
             .map_err(|_| S3Error::new(S3ErrorCode::InvalidArgument))?;
+        if limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let bucket = bucket.to_owned();
 
-        // Resolve the version cursor to its sort position first: a primary-key
-        // probe, so the page query below never loads rows at/before the
-        // marker just to find where to cut. Only the marker's `last_modified`
-        // is selected -- an unresolvable marker still degrades to the
-        // key-only boundary, exactly as the full-row probe did.
-        let version_cursor = match (key_marker.as_deref(), version_id_marker.as_deref()) {
-            (Some(km), Some(vid)) => {
-                let cursor_at = entity::object::Entity::find()
-                    .select_only()
-                    .column(entity::object::Column::LastModified)
-                    .filter(entity::object::Column::BucketId.eq(bucket))
-                    .filter(entity::object::Column::Id.eq(km))
-                    .filter(entity::object::Column::VersionId.eq(vid))
-                    .into_tuple::<(chrono::DateTime<chrono::Utc>,)>()
-                    .one(&self.db)
-                    .await
-                    .map_err(S3Error::internal_error)?;
-                cursor_at.map(|(last_modified,)| (km.to_owned(), last_modified))
-            }
-            _ => None,
-        };
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let objects = txn.open_table(OBJECTS).store()?;
+                let versions = txn.open_table(VERSIONS).store()?;
 
-        let query = Self::object_versions_page_query(
-            bucket,
-            prefix.as_deref(),
-            key_marker.as_deref(),
-            version_cursor,
-            limit as u64,
-        );
+                let cursor_at = match (key_marker.as_deref(), version_id_marker.as_deref()) {
+                    (Some(key_marker), Some(version_id_marker)) => {
+                        object_row(&objects, &bucket, key_marker, version_id_marker)
+                            .store()?
+                            .map(|row| (row.last_modified, row.version_id))
+                    }
+                    _ => None,
+                };
 
-        let page = query
-            .select_only()
-            .columns(OBJECT_VERSION_COLUMNS)
-            .into_model::<ObjectVersionRow>()
-            .all(&self.db)
+                let start = key_marker
+                    .as_deref()
+                    .or(prefix.as_deref())
+                    .unwrap_or_default();
+
+                let upper = prefix.as_deref().map(crate::storage::prefix_upper);
+                let end = match upper.as_deref() {
+                    Some(upper) => Bound::Excluded((bucket.as_str(), upper, 0_u64, "")),
+                    None => Bound::Unbounded,
+                };
+
+                let mut page = Vec::new();
+
+                for entry in versions
+                    .range((Bound::Included((bucket.as_str(), start, 0_u64, "")), end))
+                    .store()?
+                {
+                    let (key, _) = entry.store()?;
+                    let (entry_bucket, key, inverted, version_id) = key.value();
+                    if entry_bucket != bucket {
+                        break;
+                    }
+                    if let Some(prefix) = prefix.as_deref()
+                        && !key.starts_with(prefix)
+                    {
+                        continue;
+                    }
+
+                    if let Some(key_marker) = key_marker.as_deref()
+                        && key == key_marker
+                    {
+                        let Some((cursor_at, _)) = &cursor_at else {
+                            continue;
+                        };
+                        if inverted <= inverted_timestamp(*cursor_at) {
+                            continue;
+                        }
+                    }
+
+                    let Some(row) = object_row(&objects, &bucket, key, version_id).store()? else {
+                        continue;
+                    };
+                    page.push(ObjectVersionRow {
+                        id: row.id,
+                        version_id: row.version_id,
+                        is_latest: row.is_latest,
+                        is_delete_marker: row.is_delete_marker,
+                        size: row.size,
+                        last_modified: row.last_modified,
+                        etag: row.etag,
+                    });
+
+                    if page.len() == limit {
+                        break;
+                    }
+                }
+
+                let mut versions = Vec::new();
+                let mut delete_markers = Vec::new();
+                for row in page {
+                    if row.is_delete_marker {
+                        delete_markers.push(row);
+                    } else {
+                        versions.push(row);
+                    }
+                }
+
+                Ok((versions, delete_markers))
+            })
             .await
-            .map_err(S3Error::internal_error)?;
+    }
+}
 
-        // Split into versions vs delete markers, preserving page order.
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-        for m in page {
-            if m.is_delete_marker {
-                delete_markers.push(m);
-            } else {
-                versions.push(m);
+fn common_prefix_for(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+    let without_prefix = key.strip_prefix(prefix).unwrap_or(key);
+
+    without_prefix
+        .split_once(delimiter)
+        .map(|(sub_key, _)| format!("{prefix}{sub_key}{delimiter}"))
+}
+
+pub(super) fn cas_put_object_txn(
+    txn: &WriteTransaction,
+    bucket: &str,
+    key: &str,
+    data: ObjectWrite,
+    condition: PutCondition,
+) -> S3Result<String> {
+    let versioning = {
+        let buckets = txn.open_table(BUCKETS).store()?;
+        bucket_row(&buckets, bucket)
+            .store()?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?
+            .versioning_status
+    };
+
+    let latest_opt = {
+        let latest = txn.open_table(LATEST).store()?;
+        let objects = txn.open_table(OBJECTS).store()?;
+        latest_model(&latest, &objects, bucket, key).store()?
+    };
+    let exists_not_deleted = latest_opt.as_ref().is_some_and(|row| !row.is_delete_marker);
+    let current_etag = if exists_not_deleted {
+        latest_opt.as_ref().and_then(|row| row.etag.clone())
+    } else {
+        None
+    };
+
+    match &condition {
+        PutCondition::IfMatch(expected) => {
+            if !exists_not_deleted {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            if current_etag.as_deref() != Some(expected.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
         }
-
-        Ok((versions, delete_markers))
+        PutCondition::IfMatchAny => {
+            if !exists_not_deleted {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+        }
+        PutCondition::IfNoneMatchAny => {
+            if exists_not_deleted {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
+        PutCondition::IfNoneMatch(expected) => {
+            if exists_not_deleted && current_etag.as_deref() == Some(expected.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
+        PutCondition::None => {}
     }
+
+    let now = chrono::Local::now().to_utc();
+    put_object_internal(txn, bucket, key, data, versioning, now)
+}
+
+fn put_object_internal(
+    txn: &WriteTransaction,
+    bucket: &str,
+    key: &str,
+    data: ObjectWrite,
+    versioning: Option<String>,
+    now: DateTime<Utc>,
+) -> S3Result<String> {
+    let size = Repository::checked_size(data.size)?;
+    let make_row = |version_id: String| ObjectRow {
+        bucket_id: bucket.to_owned(),
+        id: key.to_owned(),
+        version_id,
+        is_latest: true,
+        is_delete_marker: false,
+        size,
+        last_modified: now,
+        content_type: data.content_type.clone(),
+        etag: data.etag.clone(),
+        user_metadata: data.user_metadata.clone(),
+        tags: data.tags.clone(),
+        checksums: data.checksums.clone(),
+        content: data.content.clone(),
+    };
+
+    match versioning.as_deref() {
+        None => {
+            let version_id = "null".to_owned();
+            replace_object_row(txn, &make_row(version_id.clone())).store()?;
+            Ok(version_id)
+        }
+        Some("Enabled") => {
+            demote_latest(txn, bucket, key).store()?;
+            let version_id = uuid::Uuid::new_v4().to_string();
+            insert_object_row(txn, &make_row(version_id.clone())).store()?;
+            Ok(version_id)
+        }
+        Some(_) => {
+            demote_latest(txn, bucket, key).store()?;
+            let version_id = "null".to_owned();
+            replace_object_row(txn, &make_row(version_id.clone())).store()?;
+            Ok(version_id)
+        }
+    }
+}
+
+fn delete_object_versioned_txn(
+    txn: &WriteTransaction,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<(Option<ObjectRow>, bool)> {
+    if let Some(version_id) = version_id {
+        let model = delete_object_row(txn, bucket, key, version_id)
+            .store()?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchKey))?;
+
+        if model.is_latest {
+            promote_newest(txn, bucket, key).store()?;
+        }
+
+        return Ok((Some(model), false));
+    }
+
+    let status = {
+        let buckets = txn.open_table(BUCKETS).store()?;
+        bucket_row(&buckets, bucket)
+            .store()?
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?
+            .versioning_status
+    };
+
+    if status.is_none() {
+        let model = delete_object_row(txn, bucket, key, "null").store()?;
+        if model.is_some() {
+            clear_latest(txn, bucket, key).store()?;
+            return Ok((model, false));
+        }
+
+        // No such key; S3 delete is idempotent, return Ok with no model.
+        return Ok((None, false));
+    }
+
+    demote_latest(txn, bucket, key).store()?;
+    let version_id = uuid::Uuid::new_v4().to_string();
+    let marker = ObjectRow {
+        bucket_id: bucket.to_owned(),
+        id: key.to_owned(),
+        version_id: version_id.clone(),
+        is_latest: true,
+        is_delete_marker: true,
+        size: 0,
+        last_modified: chrono::Local::now().to_utc(),
+        content_type: None,
+        etag: None,
+        user_metadata: serde_json::json!({}),
+        tags: serde_json::json!([]),
+        checksums: serde_json::json!({}),
+        content: serde_json::json!({"item": []}),
+    };
+    insert_object_row(txn, &marker).store()?;
+
+    Ok((Some(marker), true))
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
-    use crate::s3::repo::PutCondition;
+    use crate::storage::{BlobRow, PublishIntentRow, Store};
 
     async fn repo() -> Repository {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        Repository::init(db).await.expect("init")
+        let store = Store::in_memory().expect("store");
+        Repository::init(store).await.expect("init")
     }
 
-    /// Seed a versioned bucket with `keys`, one version each.
-    async fn versioned_bucket_with_keys(repo: &Repository, keys: &[&str]) {
+    fn write(content: serde_json::Value, etag: &str) -> ObjectWrite {
+        ObjectWrite {
+            size: 1,
+            content_type: None,
+            etag: Some(etag.into()),
+            content,
+            user_metadata: serde_json::json!({}),
+            checksums: serde_json::json!({}),
+            tags: serde_json::json!([]),
+        }
+    }
+
+    fn content_for(blob_id: &str) -> serde_json::Value {
+        serde_json::json!({"item": [{"id": blob_id, "offset": 0, "size": 1}]})
+    }
+
+    async fn versioned_bucket(repo: &Repository) {
         repo.create_bucket("b".into(), None)
             .await
             .expect("create bucket");
         repo.put_bucket_versioning("b", Some("Enabled".into()))
             .await
             .expect("enable versioning");
+    }
+
+    async fn versioned_bucket_with_keys(repo: &Repository, keys: &[&str]) {
+        versioned_bucket(repo).await;
         for key in keys {
             repo.cas_put_object(
                 "b".into(),
                 (*key).to_string(),
-                ObjectWrite {
-                    size: 1,
-                    content_type: None,
-                    etag: Some(format!("etag-{key}")),
-                    content: serde_json::json!({"item": []}),
-                    user_metadata: serde_json::json!({}),
-                    checksums: serde_json::json!({}),
-                    tags: serde_json::json!([]),
-                },
+                write(serde_json::json!({"item": []}), &format!("etag-{key}")),
                 PutCondition::None,
             )
             .await
@@ -981,52 +960,135 @@ mod tests {
         }
     }
 
-    fn page_sql(
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        version_cursor: Option<(String, chrono::DateTime<chrono::Utc>)>,
-        limit: u64,
-    ) -> String {
-        Repository::object_versions_page_query("b", prefix, key_marker, version_cursor, limit)
-            .build(sea_orm::DbBackend::Sqlite)
-            .to_string()
-    }
-
-    #[test]
-    fn version_page_query_carries_sql_limit() {
-        let sql = page_sql(None, None, None, 3);
-        assert!(
-            sql.contains("LIMIT 3"),
-            "version page query must bound rows in SQL: {sql}"
-        );
-    }
-
-    #[test]
-    fn version_page_query_pushes_markers_into_sql() {
-        let cursor_at = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+    fn seed_row(
+        repo: &Repository,
+        key: &str,
+        version_id: &str,
+        at: &str,
+        is_latest: bool,
+        is_delete_marker: bool,
+    ) {
+        let last_modified = chrono::DateTime::parse_from_rfc3339(at)
             .expect("timestamp")
             .with_timezone(&chrono::Utc);
+        repo.store.seed_object(&ObjectRow {
+            bucket_id: "b".into(),
+            id: key.into(),
+            version_id: version_id.into(),
+            is_latest,
+            is_delete_marker,
+            size: 7,
+            last_modified,
+            content_type: Some("text/plain".into()),
+            etag: Some(format!("etag-{version_id}")),
+            user_metadata: serde_json::json!({"x-amz-meta-a": "1"}),
+            tags: serde_json::json!([{"key": "t", "value": "v"}]),
+            checksums: serde_json::json!({"sha256": "abc"}),
+            content: serde_json::json!({"item": [{"id": "blob-1", "size": 7}]}),
+        });
+    }
 
-        let sql = page_sql(Some("a/"), Some("a/2"), Some(("a/2".into(), cursor_at)), 5);
-        assert!(sql.contains("LIMIT 5"), "missing limit: {sql}");
-        assert!(
-            sql.contains(r#""id" > $1"#) || sql.contains(r#""id" > "#),
-            "key marker must be a SQL predicate, not a post-fetch filter: {sql}"
+    fn seed_version(repo: &Repository, version_id: &str, at: &str, is_latest: bool) {
+        let last_modified = chrono::DateTime::parse_from_rfc3339(at)
+            .expect("timestamp")
+            .with_timezone(&chrono::Utc);
+        repo.store.seed_object(&ObjectRow {
+            bucket_id: "b".into(),
+            id: "k".into(),
+            version_id: version_id.into(),
+            is_latest,
+            is_delete_marker: false,
+            size: 1,
+            last_modified,
+            content_type: None,
+            etag: Some(format!("etag-{version_id}")),
+            user_metadata: serde_json::json!({}),
+            tags: serde_json::json!([]),
+            checksums: serde_json::json!({}),
+            content: serde_json::json!({"item": []}),
+        });
+    }
+
+    fn rows_for_key(repo: &Repository) -> Vec<ObjectRow> {
+        repo.store
+            .all_objects("b")
+            .into_iter()
+            .filter(|row| row.id == "k")
+            .collect()
+    }
+
+    fn blob_rows(repo: &Repository) -> Vec<BlobRow> {
+        repo.store.all_blobs()
+    }
+
+    #[tokio::test]
+    async fn list_objects_returns_prefix_and_delimiter_shapes() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        seed_row(&repo, "a", "v1", "2024-01-01T00:00:00Z", true, false);
+        seed_row(&repo, "a/x", "v1", "2024-01-02T00:00:00Z", true, false);
+        seed_row(&repo, "a/y", "v1", "2024-01-03T00:00:00Z", true, false);
+        seed_row(&repo, "b", "v1", "2024-01-04T00:00:00Z", true, false);
+
+        let rows = repo
+            .list_objects("b", None, None, None, 1000)
+            .await
+            .expect("list");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "a/x", "a/y", "b"]
         );
-        assert!(
-            sql.contains(r#""last_modified" <"#),
-            "version marker must be a SQL predicate: {sql}"
-        );
-        assert!(
-            sql.contains(r#""id" LIKE"#) || sql.contains("LIKE"),
-            "prefix must stay in SQL: {sql}"
+        assert!(rows.iter().all(|r| r.size == 7));
+
+        let rows = repo
+            .list_objects("b", Some("a/".into()), None, None, 1000)
+            .await
+            .expect("list prefix");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a/x", "a/y"]
         );
 
-        // The version cursor is only meaningful together with its key.
-        let sql = page_sql(None, Some("a/2"), None, 5);
-        assert!(
-            !sql.contains(r#""last_modified" <"#),
-            "key-only marker must not emit a last_modified bound: {sql}"
+        let rows = repo
+            .list_objects("b", None, Some("/".into()), None, 1000)
+            .await
+            .expect("list delimiter");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "a/x", "b"],
+            "the delimiter keeps the first key per common prefix"
+        );
+
+        let rows = repo
+            .list_objects("b", None, None, Some("a".into()), 1000)
+            .await
+            .expect("list marker");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a/x", "a/y", "b"],
+            "the marker skips keys at or before itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_objects_bounds_the_page() {
+        let repo = repo().await;
+        repo.create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        for key in ["a", "b", "c"] {
+            seed_row(&repo, key, "v1", "2024-01-01T00:00:00Z", true, false);
+        }
+
+        let rows = repo
+            .list_objects("b", None, None, None, 2)
+            .await
+            .expect("page");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
         );
     }
 
@@ -1042,8 +1104,7 @@ mod tests {
         assert!(markers.is_empty());
         assert_eq!(
             versions.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            ["a/1", "a/2"],
-            "SQL limit must cap the returned page"
+            ["a/1", "a/2"]
         );
     }
 
@@ -1131,343 +1192,46 @@ mod tests {
         assert!(markers.is_empty());
     }
 
-    // ---- Column projection on the listing paths ----
-
-    /// The JSON columns no listing query may fetch. Each is a whole JSON
-    /// document per row. A 1000-row page used to mean 1000 documents pulled
-    /// across the wire and thrown away unread.
-    const JSON_COLUMNS: [&str; 4] = ["content", "user_metadata", "tags", "checksums"];
-
-    /// Rendered SQL of the projected `list_objects` query. `into_model` only
-    /// picks the row decoder. It emits no SQL of its own. The statement built
-    /// here is the one `list_objects` executes.
-    fn list_sql(
-        prefix: Option<&str>,
-        delimiter: Option<&str>,
-        marker: Option<&str>,
-        limit: u64,
-    ) -> String {
-        Repository::list_objects_query("b", prefix, delimiter, marker)
-            .select_only()
-            .columns(LIST_OBJECT_COLUMNS)
-            .limit(Some(limit))
-            .build(sea_orm::DbBackend::Sqlite)
-            .to_string()
-    }
-
-    /// Rendered SQL of the projected version-listing query.
-    fn version_list_sql(
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        version_cursor: Option<(String, chrono::DateTime<chrono::Utc>)>,
-        limit: u64,
-    ) -> String {
-        Repository::object_versions_page_query("b", prefix, key_marker, version_cursor, limit)
-            .select_only()
-            .columns(OBJECT_VERSION_COLUMNS)
-            .build(sea_orm::DbBackend::Sqlite)
-            .to_string()
-    }
-
-    #[test]
-    fn list_objects_query_fetches_only_rendered_columns() {
-        for (prefix, delimiter) in [
-            (None, None),
-            (Some("a/"), None),
-            (None, Some("/")),
-            (Some("a/"), Some("/")),
-        ] {
-            let sql = list_sql(prefix, delimiter, None, 1000);
-            for rendered in [r#""id""#, r#""size""#, r#""last_modified""#] {
-                assert!(
-                    sql.contains(rendered),
-                    "listing must select {rendered}: {sql}"
-                );
-            }
-            for json_column in JSON_COLUMNS {
-                assert!(
-                    !sql.contains(&format!("\"{json_column}\"")),
-                    "listing SQL must not fetch `{json_column}`: {sql}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn version_listing_query_fetches_only_rendered_columns() {
-        let sql = version_list_sql(None, None, None, 1000);
-        for rendered in [
-            r#""id""#,
-            r#""version_id""#,
-            r#""is_latest""#,
-            r#""is_delete_marker""#,
-            r#""size""#,
-            r#""last_modified""#,
-            r#""etag""#,
-        ] {
-            assert!(
-                sql.contains(rendered),
-                "version listing must select {rendered}: {sql}"
-            );
-        }
-        for json_column in JSON_COLUMNS {
-            assert!(
-                !sql.contains(&format!("\"{json_column}\"")),
-                "version listing SQL must not fetch `{json_column}`: {sql}"
-            );
-        }
-    }
-
-    /// Seed one row with every heavy JSON column populated. A listing that
-    /// drops or garbles one of them shows up as wrong data. It does not look
-    /// like a silently smaller payload.
-    async fn seed_row(
-        repo: &Repository,
-        key: &str,
-        version_id: &str,
-        at: &str,
-        is_latest: bool,
-        is_delete_marker: bool,
-    ) {
-        let last_modified = chrono::DateTime::parse_from_rfc3339(at)
-            .expect("timestamp")
-            .with_timezone(&chrono::Utc);
-        let active = entity::object::ActiveModel {
-            bucket_id: Set("b".into()),
-            id: Set(key.into()),
-            version_id: Set(version_id.into()),
-            is_latest: Set(is_latest),
-            is_delete_marker: Set(is_delete_marker),
-            size: Set(7),
-            last_modified: Set(last_modified),
-            content_type: Set(Some("text/plain".into())),
-            etag: Set(Some(format!("etag-{version_id}"))),
-            user_metadata: Set(serde_json::json!({"x-amz-meta-a": "1"})),
-            tags: Set(serde_json::json!([{"key": "t", "value": "v"}])),
-            checksums: Set(serde_json::json!({"sha256": "abc"})),
-            content: Set(serde_json::json!({"item": [{"id": "blob-1", "size": 7}]})),
-        };
-        entity::object::Entity::insert(active)
-            .exec(&repo.db)
-            .await
-            .expect("seed row");
-    }
-
-    /// The same query as `list_objects` minus the projection. It is exactly
-    /// what a pre-projection listing returned, row for row.
-    async fn list_objects_unprojected(
-        repo: &Repository,
-        prefix: Option<&str>,
-        delimiter: Option<&str>,
-        marker: Option<&str>,
-        limit: u64,
-    ) -> Vec<entity::object::Model> {
-        Repository::list_objects_query("b", prefix, delimiter, marker)
-            .limit(Some(limit))
-            .all(&repo.db)
-            .await
-            .expect("unprojected listing")
-    }
-
-    async fn list_object_versions_unprojected(
-        repo: &Repository,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        version_id_marker: Option<&str>,
-        max_keys: i32,
-    ) -> (Vec<entity::object::Model>, Vec<entity::object::Model>) {
-        let cursor = match (key_marker, version_id_marker) {
-            (Some(km), Some(vid)) => {
-                let full: Option<chrono::DateTime<chrono::Utc>> = entity::object::Entity::find()
-                    .select_only()
-                    .column(entity::object::Column::LastModified)
-                    .filter(entity::object::Column::BucketId.eq("b"))
-                    .filter(entity::object::Column::Id.eq(km))
-                    .filter(entity::object::Column::VersionId.eq(vid))
-                    .into_tuple()
-                    .one(&repo.db)
-                    .await
-                    .expect("cursor probe");
-                full.map(|last_modified| (km.to_owned(), last_modified))
-            }
-            _ => None,
-        };
-        let page = Repository::object_versions_page_query(
-            "b",
-            prefix,
-            key_marker,
-            cursor,
-            max_keys as u64,
-        )
-        .all(&repo.db)
-        .await
-        .expect("unprojected version listing");
-
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-        for m in page {
-            if m.is_delete_marker {
-                delete_markers.push(m);
-            } else {
-                versions.push(m);
-            }
-        }
-        (versions, delete_markers)
-    }
-
     #[tokio::test]
-    async fn list_objects_projection_matches_the_unprojected_rows() {
+    async fn delete_markers_stay_out_of_a_plain_listing() {
         let repo = repo().await;
-        repo.create_bucket("b".into(), None)
-            .await
-            .expect("create bucket");
-        seed_row(&repo, "a", "v1", "2024-01-01T00:00:00Z", true, false).await;
-        seed_row(&repo, "a/x", "v1", "2024-01-02T00:00:00Z", true, false).await;
-        seed_row(&repo, "a/y", "v1", "2024-01-03T00:00:00Z", true, false).await;
-        seed_row(&repo, "b", "v1", "2024-01-04T00:00:00Z", true, false).await;
+        versioned_bucket(&repo).await;
+        seed_row(&repo, "k", "v1", "2024-01-01T00:00:00Z", false, false);
+        seed_row(&repo, "k", "marker-1", "2024-01-02T00:00:00Z", true, true);
 
-        // Every listing shape the handler can ask for, each compared row for
-        // row against the unprojected query.
-        for (prefix, delimiter, marker) in [
-            (None, None, None),
-            (Some("a/"), None, None),
-            (None, None, Some("a")),
-            (Some("a/"), Some("/"), None),
-            (None, Some("/"), None),
-        ] {
-            let rows = repo
-                .list_objects(
-                    "b",
-                    prefix.map(str::to_owned),
-                    delimiter.map(str::to_owned),
-                    marker.map(str::to_owned),
-                    1000,
-                )
-                .await
-                .expect("list");
-            let baseline = list_objects_unprojected(&repo, prefix, delimiter, marker, 1000).await;
-
-            assert_eq!(
-                rows.len(),
-                baseline.len(),
-                "row count must be unchanged for prefix={prefix:?} delimiter={delimiter:?} marker={marker:?}"
-            );
-            for (row, full) in rows.iter().zip(&baseline) {
-                assert_eq!(row.id, full.id, "keys must be identical and in order");
-                assert_eq!(row.size, full.size, "size must match for {}", full.id);
-                assert_eq!(
-                    row.last_modified, full.last_modified,
-                    "last_modified must match for {}",
-                    full.id
-                );
-            }
-        }
-
-        // The projected values are the ones the handler renders, for the right
-        // rows: keys ascending, sizes and timestamps straight off the rows.
         let rows = repo
             .list_objects("b", None, None, None, 1000)
             .await
             .expect("list");
-        assert_eq!(
-            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["a", "a/x", "a/y", "b"]
-        );
-        assert!(
-            rows.iter().all(|r| r.size == 7),
-            "sizes come from the row, not from a dropped column: {rows:?}"
-        );
-        assert_eq!(
-            rows[0].last_modified,
-            chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-                .expect("timestamp")
-                .with_timezone(&chrono::Utc)
-        );
-
-        // A prefix narrows the page.
-        let rows = repo
-            .list_objects("b", Some("a/".into()), None, None, 1000)
-            .await
-            .expect("list prefix");
-        assert_eq!(
-            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["a/x", "a/y"]
-        );
-
-        // A delimiter collapses the nested keys to one representative row per
-        // prefix; the rollup into `CommonPrefix` happens in the handler, off
-        // the projected `id`, so that is what has to be unchanged.
-        let rows = repo
-            .list_objects("b", None, Some("/".into()), None, 1000)
-            .await
-            .expect("list delimiter");
-        let collapsed: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
-        let baseline_rows = list_objects_unprojected(&repo, None, Some("/"), None, 1000).await;
-        let baseline: Vec<_> = baseline_rows.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(collapsed, baseline);
-        assert!(
-            collapsed.contains(&"a/x"),
-            "one representative row per prefix must survive: {collapsed:?}"
-        );
-        assert!(
-            !collapsed.contains(&"a/y"),
-            "nested keys collapse: {collapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_markers_survive_the_projection() {
-        let repo = repo().await;
-        versioned_bucket(&repo).await;
-        seed_row(&repo, "k", "v1", "2024-01-01T00:00:00Z", false, false).await;
-        seed_row(&repo, "k", "marker-1", "2024-01-02T00:00:00Z", true, true).await;
+        assert!(rows.is_empty(), "a delete marker is not an object");
 
         let (versions, markers) = repo
             .list_object_versions("b", None, None, None, None, Some(10))
             .await
             .expect("list versions");
-        let (base_versions, base_markers) =
-            list_object_versions_unprojected(&repo, None, None, None, 10).await;
-
-        assert_eq!(versions.len(), base_versions.len());
+        assert_eq!(versions.len(), 1);
         assert_eq!(markers.len(), 1, "the delete marker must still be listed");
-        assert_eq!(markers.len(), base_markers.len());
 
         let marker = &markers[0];
-        let full = &base_markers[0];
-        assert!(marker.is_delete_marker, "delete markers stay split out");
+        assert!(marker.is_delete_marker);
         assert!(marker.is_latest);
-        assert_eq!(marker.id, full.id);
         assert_eq!(marker.version_id, "marker-1");
-        assert_eq!(marker.version_id, full.version_id);
-        assert_eq!(marker.size, full.size);
-        assert_eq!(marker.last_modified, full.last_modified);
-        assert_eq!(marker.etag, full.etag);
-
-        // The marker is still a real row on disk, JSON columns and all.
-        assert!(
-            !full
-                .content
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty)
-        );
+        assert_eq!(marker.size, 7);
     }
 
     #[tokio::test]
     async fn version_listing_keeps_newest_first_order_per_key() {
         let repo = repo().await;
         versioned_bucket(&repo).await;
-        seed_row(&repo, "k", "v1", "2024-01-01T00:00:00Z", false, false).await;
-        seed_row(&repo, "k", "v3", "2024-01-03T00:00:00Z", true, false).await;
-        seed_row(&repo, "k", "v2", "2024-01-02T00:00:00Z", false, false).await;
-        seed_row(&repo, "other", "o1", "2024-01-04T00:00:00Z", true, false).await;
+        seed_row(&repo, "k", "v1", "2024-01-01T00:00:00Z", false, false);
+        seed_row(&repo, "k", "v3", "2024-01-03T00:00:00Z", true, false);
+        seed_row(&repo, "k", "v2", "2024-01-02T00:00:00Z", false, false);
+        seed_row(&repo, "other", "o1", "2024-01-04T00:00:00Z", true, false);
 
         let (versions, markers) = repo
             .list_object_versions("b", None, None, None, None, Some(10))
             .await
             .expect("list versions");
-        let (base_versions, _) =
-            list_object_versions_unprojected(&repo, None, None, None, 10).await;
 
         assert!(markers.is_empty());
         assert_eq!(
@@ -1481,158 +1245,20 @@ mod tests {
         assert_eq!(
             versions
                 .iter()
-                .map(|m| m.version_id.as_str())
-                .collect::<Vec<_>>(),
-            base_versions
-                .iter()
-                .map(|m| m.version_id.as_str())
-                .collect::<Vec<_>>(),
-            "ordering must be identical to the unprojected query"
-        );
-        assert_eq!(
-            versions
-                .iter()
                 .filter(|m| m.is_latest)
                 .map(|m| m.version_id.as_str())
                 .collect::<Vec<_>>(),
             ["v3", "o1"]
         );
-        for (row, full) in versions.iter().zip(&base_versions) {
-            assert_eq!(row.size, full.size);
-            assert_eq!(row.last_modified, full.last_modified);
-            assert_eq!(row.etag, full.etag);
-        }
-    }
-
-    /// The runtime counterpart of the rendered-SQL assertions. Strip the four
-    /// JSON columns off the table. List against it. SQLite refuses to run a
-    /// statement that names a missing column. A listing that still fetched
-    /// `content`, `user_metadata`, `tags`, or `checksums` could not return
-    /// rows here.
-    #[tokio::test]
-    async fn listing_never_names_the_json_columns_at_runtime() {
-        use sea_orm::ConnectionTrait;
-
-        let repo = repo().await;
-        versioned_bucket(&repo).await;
-        seed_row(&repo, "k", "v1", "2024-01-01T00:00:00Z", true, false).await;
-        seed_row(&repo, "m", "v2", "2024-01-02T00:00:00Z", true, true).await;
-
-        for column in JSON_COLUMNS {
-            repo.db
-                .execute_unprepared(&format!("ALTER TABLE s3_object DROP COLUMN {column}"))
-                .await
-                .unwrap_or_else(|e| panic!("drop {column}: {e}"));
-        }
-
-        let rows = repo
-            .list_objects("b", None, None, None, 1000)
-            .await
-            .expect("listing must not touch the JSON columns");
-        assert_eq!(
-            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["k"],
-            "delete markers stay filtered out of a plain listing"
-        );
-
-        let (versions, markers) = repo
-            .list_object_versions("b", None, None, None, None, Some(10))
-            .await
-            .expect("version listing must not touch the JSON columns");
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].id, "k");
-        assert_eq!(versions[0].version_id, "v1");
-        assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].id, "m");
-        assert_eq!(markers[0].version_id, "v2");
-        assert!(markers[0].is_delete_marker);
-
-        // The cursor probe is a primary-key lookup, not a listing, but it runs
-        // inside every paged version walk -- it must stay off the JSON columns
-        // too.
-        let paged = repo
-            .list_object_versions(
-                "b",
-                None,
-                None,
-                Some("m".into()),
-                Some("v2".into()),
-                Some(10),
-            )
-            .await
-            .expect("paged version listing");
-        assert!(
-            paged.0.is_empty() && paged.1.is_empty(),
-            "the cursor probe resolved and the page past `m` is empty: {paged:?}"
-        );
-
-        // ...and the assertion above is not vacuous: the unprojected query
-        // really does fail on this schema.
-        let err = Repository::list_objects_query("b", None, None, None)
-            .limit(Some(1000))
-            .all(&repo.db)
-            .await
-            .expect_err("the unprojected query still needs the JSON columns");
-        assert!(
-            format!("{err}").contains("no such column"),
-            "expected a missing-column error, got {err}"
-        );
-    }
-
-    // ---- Atomicity of the versioned delete path ----
-
-    /// Insert one version row with an explicit timestamp. "Most recent" becomes
-    /// unambiguous. It does not depend on clock resolution.
-    async fn seed_version(repo: &Repository, version_id: &str, at: &str, is_latest: bool) {
-        let last_modified = chrono::DateTime::parse_from_rfc3339(at)
-            .expect("timestamp")
-            .with_timezone(&chrono::Utc);
-        let active = entity::object::ActiveModel {
-            bucket_id: Set("b".into()),
-            id: Set("k".into()),
-            version_id: Set(version_id.into()),
-            is_latest: Set(is_latest),
-            is_delete_marker: Set(false),
-            size: Set(1),
-            last_modified: Set(last_modified),
-            content_type: Set(None),
-            etag: Set(Some(format!("etag-{version_id}"))),
-            user_metadata: Set(serde_json::json!({})),
-            tags: Set(serde_json::json!([])),
-            checksums: Set(serde_json::json!({})),
-            content: Set(serde_json::json!({"item": []})),
-        };
-        entity::object::Entity::insert(active)
-            .exec(&repo.db)
-            .await
-            .expect("seed version");
-    }
-
-    async fn versioned_bucket(repo: &Repository) {
-        repo.create_bucket("b".into(), None)
-            .await
-            .expect("create bucket");
-        repo.put_bucket_versioning("b", Some("Enabled".into()))
-            .await
-            .expect("enable versioning");
-    }
-
-    async fn rows_for_key(repo: &Repository) -> Vec<entity::object::Model> {
-        entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq("b"))
-            .filter(entity::object::Column::Id.eq("k"))
-            .all(&repo.db)
-            .await
-            .expect("load rows")
     }
 
     #[tokio::test]
     async fn deleting_latest_version_promotes_newest_predecessor() {
         let repo = repo().await;
         versioned_bucket(&repo).await;
-        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", false).await;
-        seed_version(&repo, "v2", "2024-01-02T00:00:00Z", false).await;
-        seed_version(&repo, "v3", "2024-01-03T00:00:00Z", true).await;
+        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", false);
+        seed_version(&repo, "v2", "2024-01-02T00:00:00Z", false);
+        seed_version(&repo, "v3", "2024-01-03T00:00:00Z", true);
 
         let (deleted, marker) = repo
             .delete_object_versioned("b", "k", Some("v3"))
@@ -1645,7 +1271,7 @@ mod tests {
         );
         assert!(!marker, "permanent delete creates no delete marker");
 
-        let rows = rows_for_key(&repo).await;
+        let rows = rows_for_key(&repo);
         let latest: Vec<_> = rows.iter().filter(|m| m.is_latest).collect();
         assert_eq!(
             latest
@@ -1656,7 +1282,6 @@ mod tests {
             "the newest remaining version must be promoted"
         );
 
-        // The promoted row is the one every later read resolves to.
         let got = repo
             .get_object("b", "k")
             .await
@@ -1669,17 +1294,15 @@ mod tests {
     async fn deleting_the_last_remaining_version_leaves_no_latest() {
         let repo = repo().await;
         versioned_bucket(&repo).await;
-        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", true).await;
+        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", true);
 
         repo.delete_object_versioned("b", "k", Some("v1"))
             .await
             .expect("delete only version");
 
-        let rows = rows_for_key(&repo).await;
-        assert!(rows.is_empty(), "the only version row is gone");
         assert!(
-            rows.iter().all(|m| !m.is_latest),
-            "no orphan latest row may remain"
+            rows_for_key(&repo).is_empty(),
+            "the only version row is gone"
         );
     }
 
@@ -1687,11 +1310,9 @@ mod tests {
     async fn deleting_the_newest_version_leaves_object_readable() {
         let repo = repo().await;
         versioned_bucket(&repo).await;
-        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", false).await;
-        seed_version(&repo, "v2", "2024-01-02T00:00:00Z", true).await;
+        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", false);
+        seed_version(&repo, "v2", "2024-01-02T00:00:00Z", true);
 
-        // A plain DELETE plants a delete marker; the key becomes unreadable
-        // but keeps exactly one latest row (the marker).
         let (marker_model, is_marker) = repo
             .delete_object_versioned("b", "k", None)
             .await
@@ -1701,13 +1322,11 @@ mod tests {
         assert!(marker_model.is_delete_marker && marker_model.is_latest);
 
         let latest = rows_for_key(&repo)
-            .await
             .into_iter()
             .filter(|m| m.is_latest)
             .count();
         assert_eq!(latest, 1, "the delete marker is the single latest row");
 
-        // Removing the marker (the newest version) exposes v2 again.
         repo.delete_object_versioned("b", "k", Some(&marker_model.version_id))
             .await
             .expect("delete the marker");
@@ -1715,11 +1334,7 @@ mod tests {
         let got = repo.get_object("b", "k").await.expect("object is readable");
         assert_eq!(got.version_id, "v2");
         assert_eq!(
-            rows_for_key(&repo)
-                .await
-                .iter()
-                .filter(|m| m.is_latest)
-                .count(),
+            rows_for_key(&repo).iter().filter(|m| m.is_latest).count(),
             1,
             "promotion after marker removal leaves exactly one latest"
         );
@@ -1729,7 +1344,7 @@ mod tests {
     async fn unknown_version_delete_is_a_no_op_inside_the_transaction() {
         let repo = repo().await;
         versioned_bucket(&repo).await;
-        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", true).await;
+        seed_version(&repo, "v1", "2024-01-01T00:00:00Z", true);
 
         let err = repo
             .delete_object_versioned("b", "k", Some("nope"))
@@ -1740,111 +1355,9 @@ mod tests {
             "expected NoSuchKey, got {err:?}"
         );
 
-        // The rolled-back transaction must not have touched anything.
-        let rows = rows_for_key(&repo).await;
+        let rows = rows_for_key(&repo);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_latest, "v1 stays latest after a failed delete");
-    }
-
-    #[tokio::test]
-    async fn concurrent_mixed_put_and_delete_converge_to_one_latest() {
-        use futures::future::join_all;
-
-        let repo = std::sync::Arc::new(repo().await);
-        versioned_bucket(&repo).await;
-
-        // Same shape as the concurrent-put harness in `super::tests`, but with
-        // transacted puts interleaved against transacted versioned deletes.
-        // Both paths must move `is_latest` atomically, or the key ends up with
-        // zero (unreadable) or two (arbitrary) latest rows.
-        let futs = (0..10).map(|i| {
-            let repo = repo.clone();
-            async move {
-                if i % 2 == 0 {
-                    repo.cas_put_object(
-                        "b".into(),
-                        "k".into(),
-                        ObjectWrite {
-                            size: 1,
-                            content_type: None,
-                            etag: Some(format!("e{i}")),
-                            content: serde_json::json!({"item": []}),
-                            user_metadata: serde_json::json!({}),
-                            checksums: serde_json::json!({}),
-                            tags: serde_json::json!([]),
-                        },
-                        PutCondition::None,
-                    )
-                    .await
-                    .map(|_| ())
-                } else {
-                    // Permanent delete of a version id that may not exist yet,
-                    // or a delete-marker create; both must keep the key
-                    // resolvable to exactly one latest row.
-                    if i % 4 == 1 {
-                        repo.delete_object_versioned("b", "k", None)
-                            .await
-                            .map(|_| ())
-                    } else {
-                        match repo
-                            .delete_object_versioned("b", "k", Some("missing"))
-                            .await
-                        {
-                            // An unknown version id is NoSuchKey by contract;
-                            // the transaction rolls back and changes nothing.
-                            Err(_) => Ok(()),
-                            Ok(_) => panic!("deleting a missing version must fail"),
-                        }
-                    }
-                }
-            }
-        });
-        let results = join_all(futs).await;
-        assert!(
-            results.iter().all(|r| r.is_ok()),
-            "all concurrent operations should succeed: {results:?}"
-        );
-
-        let rows = rows_for_key(&repo).await;
-        assert_eq!(
-            rows.iter().filter(|m| m.is_latest).count(),
-            1,
-            "exactly one latest row must survive mixed put/delete: {rows:?}"
-        );
-
-        // Whatever row won must be the one every read resolves to.
-        let latest = rows.iter().find(|m| m.is_latest).expect("a latest row");
-        match repo.get_latest_raw("b", "k").await {
-            Ok(m) => {
-                assert_eq!(m.map(|m| m.version_id), Some(latest.version_id.clone()));
-            }
-            Err(e) => panic!("latest read failed: {e:?}"),
-        }
-    }
-
-    // ---- Atomicity of the blob + object publish ----
-
-    fn write_with_content(content: serde_json::Value, etag: &str) -> ObjectWrite {
-        ObjectWrite {
-            size: 1,
-            content_type: None,
-            etag: Some(etag.into()),
-            content,
-            user_metadata: serde_json::json!({}),
-            checksums: serde_json::json!({}),
-            tags: serde_json::json!([]),
-        }
-    }
-
-    fn content_for(blob_id: &str) -> serde_json::Value {
-        serde_json::json!({"item": [{"id": blob_id, "offset": 0, "size": 1}]})
-    }
-
-    async fn blob_rows(repo: &Repository) -> Vec<entity::blob::Model> {
-        entity::blob::Entity::find()
-            .all(&repo.db)
-            .await
-            .expect("load blob rows")
     }
 
     #[tokio::test]
@@ -1860,14 +1373,14 @@ mod tests {
                 None,
                 "b".into(),
                 "k".into(),
-                write_with_content(content_for("blob-1"), "e1"),
+                write(content_for("blob-1"), "e1"),
                 PutCondition::None,
             )
             .await
             .expect("publish");
 
         assert_eq!(version_id, "null");
-        let blobs = blob_rows(&repo).await;
+        let blobs = blob_rows(&repo);
         assert_eq!(blobs.len(), 1, "the blob row must exist");
         assert_eq!(blobs[0].id, "blob-1");
         assert_eq!(blobs[0].refs, 1);
@@ -1891,16 +1404,16 @@ mod tests {
             Some("pid"),
             "b".into(),
             "k".into(),
-            write_with_content(content_for("blob-1"), "e1"),
+            write(content_for("blob-1"), "e1"),
             PutCondition::None,
         )
         .await
         .expect("publish");
 
-        let intent = entity::publish_intent::Entity::find_by_id("pid".to_string())
-            .one(&repo.db)
-            .await
-            .expect("load intent")
+        let intents = repo.store.all_publish_intents();
+        let intent = intents
+            .iter()
+            .find(|row| row.publish_id == "pid")
             .expect("intent row");
         assert!(
             intent.resolved_at.is_some(),
@@ -1916,16 +1429,13 @@ mod tests {
             .await
             .expect("create bucket");
 
-        // The publish must not commit an object whose intent it could not
-        // resolve. Such an object has no pending row, so the reclaim pass
-        // cannot find it, and no live row would record its key.
         let err = repo
             .publish_object_with_new_blob(
                 "blob-1".into(),
                 Some("missing"),
                 "b".into(),
                 "k".into(),
-                write_with_content(content_for("blob-1"), "e1"),
+                write(content_for("blob-1"), "e1"),
                 PutCondition::None,
             )
             .await
@@ -1933,7 +1443,7 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::InternalError);
 
         assert!(
-            blob_rows(&repo).await.is_empty(),
+            blob_rows(&repo).is_empty(),
             "the rolled-back publish must not leave a blob row behind"
         );
         assert!(
@@ -1951,22 +1461,19 @@ mod tests {
         repo.cas_put_object(
             "b".into(),
             "k".into(),
-            write_with_content(serde_json::json!({"item": []}), "e1"),
+            write(serde_json::json!({"item": []}), "e1"),
             PutCondition::None,
         )
         .await
         .expect("seed object");
 
-        // Second step of the publish fails on the condition check; the blob
-        // row inserted moments earlier in the same transaction must go with
-        // it instead of surviving as a `refs = 1` row nothing references.
         let err = repo
             .publish_object_with_new_blob(
                 "blob-orphan".into(),
                 None,
                 "b".into(),
                 "k".into(),
-                write_with_content(content_for("blob-orphan"), "e2"),
+                write(content_for("blob-orphan"), "e2"),
                 PutCondition::IfNoneMatchAny,
             )
             .await
@@ -1977,7 +1484,7 @@ mod tests {
         );
 
         assert!(
-            blob_rows(&repo).await.is_empty(),
+            blob_rows(&repo).is_empty(),
             "a failed publish must not leave a blob row behind"
         );
         let object = repo.get_object("b", "k").await.expect("object unchanged");
@@ -1994,7 +1501,7 @@ mod tests {
                 None,
                 "no-such-bucket".into(),
                 "k".into(),
-                write_with_content(content_for("blob-orphan"), "e1"),
+                write(content_for("blob-orphan"), "e1"),
                 PutCondition::None,
             )
             .await
@@ -2005,7 +1512,7 @@ mod tests {
         );
 
         assert!(
-            blob_rows(&repo).await.is_empty(),
+            blob_rows(&repo).is_empty(),
             "the rolled-back publish must not leave a blob row behind"
         );
     }
@@ -2016,10 +1523,6 @@ mod tests {
         repo.create_bucket("b".into(), None)
             .await
             .expect("create bucket");
-
-        // An id that is already registered cannot be re-registered: the
-        // publish transaction must fail as a whole rather than overwrite the
-        // existing row's ownership.
         repo.register_new_blob("blob-1".into(), 1)
             .await
             .expect("register");
@@ -2029,18 +1532,45 @@ mod tests {
             None,
             "b".into(),
             "k".into(),
-            write_with_content(content_for("blob-1"), "e1"),
+            write(content_for("blob-1"), "e1"),
             PutCondition::None,
         )
         .await
         .expect_err("duplicate blob id must fail");
 
-        let blobs = blob_rows(&repo).await;
+        let blobs = blob_rows(&repo);
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0].refs, 1, "the existing row is untouched");
         assert!(
             !repo.object_exists("b", "k").await.expect("exists"),
             "no object row may survive a failed publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_publish_intents_are_bounded_and_ordered_by_age() {
+        let repo = repo().await;
+        let now = chrono::Local::now().to_utc();
+        for (index, age) in [2_i64, 4, 3].into_iter().enumerate() {
+            repo.store.seed_publish_intent(&PublishIntentRow {
+                publish_id: format!("id-{index}"),
+                bucket_id: "b".into(),
+                object_id: "k".into(),
+                size: 1,
+                blob_id: None,
+                created_at: now - chrono::Duration::hours(age),
+                resolved_at: None,
+            });
+        }
+
+        let rows = repo.pending_publish_intents(now, 2).await.expect("pending");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.publish_id.as_str())
+                .collect::<Vec<_>>(),
+            ["id-1", "id-2"],
+            "the oldest pending intents come first"
         );
     }
 }

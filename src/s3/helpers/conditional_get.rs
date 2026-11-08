@@ -14,10 +14,10 @@ use s3s::{
     dto::{ETag, ETagCondition, Timestamp},
 };
 
-use super::super::repo::entity::object;
+use crate::storage::ObjectRow;
 
 pub(crate) fn check_conditional_get(
-    model: &object::Model,
+    model: &ObjectRow,
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,
     if_modified_since: Option<&Timestamp>,

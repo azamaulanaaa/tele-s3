@@ -211,10 +211,8 @@ mod tests {
     }
 
     async fn test_service() -> TeleS3<Memory<1, 1>> {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        TeleS3::init(Memory::default(), db).await.expect("init")
+        let store = crate::storage::Store::in_memory().expect("store");
+        TeleS3::init(Memory::default(), store).await.expect("init")
     }
 
     #[tokio::test]

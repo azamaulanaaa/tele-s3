@@ -26,7 +26,6 @@ use super::helpers::{
     chrono_to_timestamp, delete_marker_error, full_control_grant, json_to_metadata,
     json_to_tag_set, metadata_to_json, tagging_header_to_json, tags_to_json, verify_checksums,
 };
-use super::repo::entity::object;
 use super::repo::{ObjectWrite, Repository};
 use super::types::{Metadata, MetadataItem};
 use crate::backend::{
@@ -351,7 +350,7 @@ impl<B: Backend> TeleS3<B> {
 
             // The blob row, the object row and the resolved intent are
             // published in ONE transaction: a failure rolls all of them back,
-            // so no orphaned `s3_blob` row and no pending intent for a live
+            // so no orphaned blob row and no pending intent for a live
             // object can survive the write. The caller then drops the backend
             // bytes the rolled-back row would have owned.
             let result = match (publish_id.as_deref(), id.clone()) {
@@ -419,7 +418,7 @@ impl<B: Backend> TeleS3<B> {
         &self,
         bucket: &str,
         key: &str,
-    ) -> S3Result<Option<object::Model>> {
+    ) -> S3Result<Option<crate::storage::ObjectRow>> {
         match self.repo.get_object(bucket, key).await {
             Ok(model) => Ok(Some(model)),
             Err(err) if *err.code() == S3ErrorCode::NoSuchKey => Ok(None),
@@ -581,7 +580,7 @@ impl<B: Backend> TeleS3<B> {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
-    ) -> S3Result<object::Model> {
+    ) -> S3Result<crate::storage::ObjectRow> {
         if let Some(vid) = version_id {
             let model = self.repo.get_object_version(bucket, key, vid).await?;
             if model.is_delete_marker {
@@ -1339,13 +1338,11 @@ mod tests {
     use super::*;
     use crate::backend::{BackendError, Memory};
     use crate::s3::TeleS3;
-    use sea_orm::{ConnectionTrait, EntityTrait};
+    use crate::storage::{Fault, PublishIntentRow, Store};
 
     async fn test_service() -> TeleS3<Memory<1, 1>> {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        TeleS3::init(Memory::default(), db).await.expect("init")
+        let store = Store::in_memory().expect("store");
+        TeleS3::init(Memory::default(), store).await.expect("init")
     }
 
     /// A backend whose writes can fail on demand. The test observes what the publish intent survives.
@@ -1407,28 +1404,21 @@ mod tests {
     }
 
     async fn flaky_write_service() -> TeleS3<FlakyWrite> {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
+        let store = Store::in_memory().expect("store");
         TeleS3::init(
             FlakyWrite {
                 inner: Memory::default(),
                 fail_write: std::sync::atomic::AtomicBool::new(false),
                 fail_delete: std::sync::atomic::AtomicBool::new(false),
             },
-            db,
+            store,
         )
         .await
         .expect("init")
     }
 
-    async fn intents(
-        svc: &TeleS3<impl Backend>,
-    ) -> Vec<crate::s3::repo::entity::publish_intent::Model> {
-        crate::s3::repo::entity::publish_intent::Entity::find()
-            .all(&svc.repo.db)
-            .await
-            .expect("load publish intents")
+    async fn intents(svc: &TeleS3<impl Backend>) -> Vec<PublishIntentRow> {
+        svc.repo.store.all_publish_intents()
     }
 
     #[test]
@@ -1844,17 +1834,9 @@ mod tests {
         }
     }
 
-    /// Make every `get_bucket_versioning` query fail while leaving the rest of the schema readable.
-    ///
-    /// `get_bucket_versioning` reads `s3_bucket`. Renaming that table away turns the versioning lookup into a hard SQL error. Object reads touch `s3_object` and keep succeeding. That isolates the exact condition under test. The query itself fails. A handler that reports the bucket as unversioned is provably swallowing an error rather than observing `Ok(None)`.
-    ///
-    /// The test renames the table rather than dropping it. `s3_object` holds a foreign key into it. SQLite refuses to drop a referenced parent.
+    /// Make every bucket lookup fail while leaving object reads working.
     async fn break_versioning_lookup(svc: &TeleS3<Memory<1, 1>>) {
-        svc.repo
-            .db
-            .execute_unprepared("ALTER TABLE s3_bucket RENAME TO s3_bucket_hidden")
-            .await
-            .expect("rename s3_bucket away");
+        svc.repo.store.set_fault(Fault::BucketRead, true);
     }
 
     /// A versioning lookup that fails must surface, not read as "unversioned".
@@ -2164,17 +2146,9 @@ mod tests {
         req
     }
 
-    /// Make every update of a publish intent fail. A resolve failure becomes observable without a broken database connection.
+    /// Make every update of a publish intent fail.
     async fn refuse_publish_intent_updates(svc: &TeleS3<impl Backend>) {
-        svc.repo
-            .db
-            .execute_unprepared(
-                "CREATE TRIGGER refuse_publish_intent_update \
-                 BEFORE UPDATE ON s3_publish_intent \
-                 BEGIN SELECT RAISE(ABORT, 'intent update refused'); END",
-            )
-            .await
-            .expect("create trigger");
+        svc.repo.store.set_fault(Fault::PublishIntentUpdate, true);
     }
 
     #[tokio::test]
@@ -2640,17 +2614,13 @@ mod tests {
     ///
     /// Before the fix this lookup read `else if let Ok(old) = ...get_object()`. A repository failure was indistinguishable from "there is nothing to replace". The old object's blob references were never released.
     ///
-    /// The test asserts on `replaced_object` rather than on the whole request. A table-level fault cannot be isolated to this lookup. The copy's source read hits `s3_object` too. A broken table fails the request earlier no matter how this site is written. The helper is the exact expression both write paths evaluate. The end-to-end absence test below pins the branch that follows it.
+    /// The test asserts on `replaced_object` rather than on the whole request. An object-read fault cannot be isolated to this lookup. The copy's source read hits the object rows too. A failed read fails the request earlier no matter how this site is written. The helper is the exact expression both write paths evaluate. The end-to-end absence test below pins the branch that follows it.
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn replaced_object_propagates_a_repository_read_failure() {
         let svc = test_service().await;
         seed_unversioned_object(&svc, "b", "old").await;
-        svc.repo
-            .db
-            .execute_unprepared("ALTER TABLE s3_object RENAME TO s3_object_hidden")
-            .await
-            .expect("rename s3_object away");
+        svc.repo.store.set_fault(Fault::ObjectRead, true);
 
         let err = svc
             .replaced_object("b", "old")

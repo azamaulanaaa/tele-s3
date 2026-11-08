@@ -1,10 +1,9 @@
+use redb::{ReadableDatabase, ReadableTable};
 use s3s::{S3Error, S3ErrorCode, S3Result};
-use sea_orm::prelude::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, SqlErr};
 use tracing::instrument;
 
-use super::Repository;
-use super::entity;
+use super::{Repository, StoreResultExt};
+use crate::storage::{BUCKETS, BucketRow, OBJECTS, decode, encode};
 
 impl Repository {
     pub(crate) async fn get_bucket_versioning(&self, bucket: &str) -> S3Result<Option<String>> {
@@ -17,106 +16,151 @@ impl Repository {
         bucket: &str,
         status: Option<String>,
     ) -> S3Result<()> {
-        // Ensure bucket exists
-        self.get_bucket(bucket).await?;
+        let bucket = bucket.to_owned();
 
-        // status is Option: Some("Enabled") / Some("Suspended") / None (reset to disabled? but API only sends Enabled/Suspended)
-        // We treat None as disabled (should not happen via Put, but allow)
-        let res = entity::bucket::Entity::update_many()
-            .col_expr(
-                entity::bucket::Column::VersioningStatus,
-                Expr::value(status.clone()),
-            )
-            .filter(entity::bucket::Column::Id.eq(bucket))
-            .exec(&self.db)
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                {
+                    let mut table = txn.open_table(BUCKETS).store()?;
+                    let Some(mut row) = table
+                        .get(bucket.as_str())
+                        .store()?
+                        .map(|value| decode::<BucketRow>(value.value()))
+                        .transpose()
+                        .store()?
+                    else {
+                        return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
+                    };
+                    row.versioning_status = status;
+                    let bytes = encode(&row).store()?;
+                    table.insert(bucket.as_str(), bytes.as_slice()).store()?;
+                }
+                txn.commit().store()?;
+
+                Ok(())
+            })
             .await
-            .map_err(S3Error::internal_error)?;
-
-        if res.rows_affected == 0 {
-            return Err(S3Error::new(S3ErrorCode::NoSuchBucket));
-        }
-        Ok(())
     }
 
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn create_bucket(&self, name: String, region: Option<String>) -> S3Result<()> {
-        let active_model = entity::bucket::ActiveModel {
-            id: Set(name),
-            region: Set(region),
-            created_at: Set(chrono::Local::now().to_utc()),
-            versioning_status: Set(None),
-        };
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                {
+                    let mut table = txn.open_table(BUCKETS).store()?;
+                    let exists = table.get(name.as_str()).store()?.is_some();
+                    if exists {
+                        return Err(S3Error::new(S3ErrorCode::BucketAlreadyExists));
+                    }
 
-        entity::bucket::Entity::insert(active_model)
-            .exec(&self.db)
-            .await
-            .map_err(|e| {
-                // `DbErr::sql_err` sees through both `Exec` and `Query`, so the
-                // unique-constraint failure reaches us as
-                // `UniqueConstraintViolation` whichever driver path raised it.
-                let conflict = matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
-
-                if conflict {
-                    S3Error::new(S3ErrorCode::BucketAlreadyExists)
-                } else {
-                    S3Error::internal_error(e)
+                    let row = BucketRow {
+                        id: name.clone(),
+                        region,
+                        created_at: chrono::Local::now().to_utc(),
+                        versioning_status: None,
+                    };
+                    let bytes = encode(&row).store()?;
+                    table.insert(name.as_str(), bytes.as_slice()).store()?;
                 }
-            })?;
+                txn.commit().store()?;
 
-        Ok(())
+                Ok(())
+            })
+            .await
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub(crate) async fn list_buckets(&self) -> S3Result<Vec<entity::bucket::Model>> {
-        let buckets = entity::bucket::Entity::find()
-            .all(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?;
+    pub(crate) async fn list_buckets(&self) -> S3Result<Vec<BucketRow>> {
+        self.store
+            .run(|db| {
+                let txn = db.begin_read().store()?;
+                let table = txn.open_table(BUCKETS).store()?;
 
-        Ok(buckets)
+                table
+                    .iter()
+                    .store()?
+                    .map(|entry| {
+                        let (_, value) = entry.store()?;
+                        decode(value.value()).store()
+                    })
+                    .collect()
+            })
+            .await
     }
 
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn delete_bucket(&self, name: &str) -> S3Result<()> {
-        entity::bucket::Entity::delete_by_id(name)
-            .exec(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?;
+        let name = name.to_owned();
 
-        Ok(())
+        self.store
+            .run(move |db| {
+                let txn = db.begin_write().store()?;
+                {
+                    let mut table = txn.open_table(BUCKETS).store()?;
+                    table.remove(name.as_str()).store()?;
+                }
+                txn.commit().store()?;
+
+                Ok(())
+            })
+            .await
     }
 
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn get_bucket_object_count(&self, name: &str) -> S3Result<u64> {
-        // Count all versions including delete markers; bucket is non-empty if any version exists.
-        let object_count = entity::object::Entity::find()
-            .filter(entity::object::Column::BucketId.eq(name))
-            .count(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?;
+        let name = name.to_owned();
 
-        Ok(object_count)
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let table = txn.open_table(OBJECTS).store()?;
+                let mut count = 0_u64;
+
+                for entry in table.range((name.as_str(), "", "")..).store()? {
+                    let (key, _) = entry.store()?;
+                    if key.value().0 != name {
+                        break;
+                    }
+                    count += 1;
+                }
+
+                Ok(count)
+            })
+            .await
     }
 
     #[instrument(skip(self), level = "debug", err)]
     pub(crate) async fn bucket_exists(&self, name: &str) -> S3Result<bool> {
-        let bucket_exists = entity::bucket::Entity::find_by_id(name)
-            .one(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?
-            .is_some();
+        let name = name.to_owned();
 
-        Ok(bucket_exists)
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let table = txn.open_table(BUCKETS).store()?;
+
+                Ok(table.get(name.as_str()).store()?.is_some())
+            })
+            .await
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    pub(crate) async fn get_bucket(&self, name: &str) -> S3Result<entity::bucket::Model> {
-        let bucket = entity::bucket::Entity::find_by_id(name)
-            .one(&self.db)
-            .await
-            .map_err(S3Error::internal_error)?
-            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?;
+    pub(crate) async fn get_bucket(&self, name: &str) -> S3Result<BucketRow> {
+        self.inject(crate::storage::Fault::BucketRead)?;
+        let name = name.to_owned();
 
-        Ok(bucket)
+        self.store
+            .run(move |db| {
+                let txn = db.begin_read().store()?;
+                let table = txn.open_table(BUCKETS).store()?;
+                let value = table
+                    .get(name.as_str())
+                    .store()?
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchBucket))?;
+
+                decode(value.value()).store()
+            })
+            .await
     }
 }

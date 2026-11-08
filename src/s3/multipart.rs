@@ -798,13 +798,11 @@ mod tests {
     use super::*;
     use crate::backend::{Memory, ReadOutcome};
     use crate::s3::TeleS3;
-    use sea_orm::{ConnectionTrait, EntityTrait};
+    use crate::storage::{BlobRow, Fault, PublishIntentRow, Store};
 
     async fn test_service_with_upload() -> (TeleS3<Memory<2, 1>>, String) {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        let svc = TeleS3::init(Memory::default(), db).await.expect("init");
+        let store = Store::in_memory().expect("store");
+        let svc = TeleS3::init(Memory::default(), store).await.expect("init");
         svc.repo
             .create_bucket("b".into(), None)
             .await
@@ -825,34 +823,17 @@ mod tests {
         (svc, upload_id)
     }
 
-    async fn intents(
-        svc: &TeleS3<impl Backend>,
-    ) -> Vec<crate::s3::repo::entity::publish_intent::Model> {
-        crate::s3::repo::entity::publish_intent::Entity::find()
-            .all(&svc.repo.db)
-            .await
-            .expect("load publish intents")
+    async fn intents(svc: &TeleS3<impl Backend>) -> Vec<PublishIntentRow> {
+        svc.repo.store.all_publish_intents()
     }
 
-    async fn blob_rows(svc: &TeleS3<impl Backend>) -> Vec<crate::s3::repo::entity::blob::Model> {
-        crate::s3::repo::entity::blob::Entity::find()
-            .all(&svc.repo.db)
-            .await
-            .expect("load blob rows")
+    async fn blob_rows(svc: &TeleS3<impl Backend>) -> Vec<BlobRow> {
+        svc.repo.store.all_blobs()
     }
 
-    /// Make every update of a publish intent fail. A resolve failure becomes
-    /// observable without a broken database connection.
+    /// Make every update of a publish intent fail.
     async fn refuse_publish_intent_updates(svc: &TeleS3<impl Backend>) {
-        svc.repo
-            .db
-            .execute_unprepared(
-                "CREATE TRIGGER refuse_publish_intent_update \
-                 BEFORE UPDATE ON s3_publish_intent \
-                 BEGIN SELECT RAISE(ABORT, 'intent update refused'); END",
-            )
-            .await
-            .expect("create trigger");
+        svc.repo.store.set_fault(Fault::PublishIntentUpdate, true);
     }
 
     fn list_parts_req(upload_id: &str, max_parts: Option<i32>) -> S3Request<ListPartsInput> {
@@ -998,62 +979,26 @@ mod tests {
 
     /// Make every blob update fail, as a storage fault would.
     async fn fail_blob_updates<B: crate::backend::Backend>(svc: &TeleS3<B>) {
-        svc.repo
-            .db
-            .execute_unprepared(
-                "CREATE TRIGGER fail_blob_release BEFORE UPDATE ON s3_blob \
-                 BEGIN SELECT RAISE(ABORT, 'injected blob release failure'); END",
-            )
-            .await
-            .expect("create blob failure trigger");
+        svc.repo.store.set_fault(Fault::BlobRelease, true);
     }
 
     async fn allow_blob_updates<B: crate::backend::Backend>(svc: &TeleS3<B>) {
-        svc.repo
-            .db
-            .execute_unprepared("DROP TRIGGER fail_blob_release")
-            .await
-            .expect("drop blob failure trigger");
+        svc.repo.store.set_fault(Fault::BlobRelease, false);
     }
 
     /// Make the upload-state row reject deletion, as a storage fault would.
     async fn fail_state_delete<B: crate::backend::Backend>(svc: &TeleS3<B>) {
-        svc.repo
-            .db
-            .execute_unprepared(
-                "CREATE TRIGGER fail_upload_delete BEFORE DELETE ON s3_multipart_upload_state \
-                 BEGIN SELECT RAISE(ABORT, 'injected upload delete failure'); END",
-            )
-            .await
-            .expect("create upload delete trigger");
+        svc.repo.store.set_fault(Fault::StateDelete, true);
     }
 
     async fn allow_state_delete<B: crate::backend::Backend>(svc: &TeleS3<B>) {
-        svc.repo
-            .db
-            .execute_unprepared("DROP TRIGGER fail_upload_delete")
-            .await
-            .expect("drop upload delete trigger");
+        svc.repo.store.set_fault(Fault::StateDelete, false);
     }
 
-    /// Make `get_object` fail. Everything the completion path touches before it
-    /// keeps working. That includes the upload state and its parts.
-    ///
-    /// `get_object` reads `s3_object`. Renaming that table away turns the
-    /// lookup into a hard SQL error. `s3_multipart_upload_state` and
-    /// `s3_blob` stay untouched. The request reaches the replaced-object
-    /// lookup. The query itself fails there. That is the condition a handler
-    /// cannot distinguish from an absent key. The handler folds every error
-    /// into "nothing to release".
-    ///
-    /// The table is renamed, not dropped. `s3_object` holds a foreign key into
-    /// it. SQLite refuses to drop a referenced parent.
+    /// Make `get_object` fail. Everything the completion path touches before
+    /// it keeps working. That includes the upload state and its parts.
     async fn break_object_lookup<B: crate::backend::Backend>(svc: &TeleS3<B>) {
-        svc.repo
-            .db
-            .execute_unprepared("ALTER TABLE s3_object RENAME TO s3_object_hidden")
-            .await
-            .expect("rename s3_object away");
+        svc.repo.store.set_fault(Fault::ObjectRead, true);
     }
 
     /// A failed read of the object being replaced must abort the completion. It
@@ -1064,8 +1009,8 @@ mod tests {
     /// blob references were never released.
     ///
     /// This is the end-to-end contract check. It cannot isolate the lookup on
-    /// its own. `cas_put_object` writes the same `s3_object` table later in
-    /// the request. A fault injected at table level surfaces there too. See
+    /// its own. `cas_put_object` writes the same object rows later in
+    /// the request. A fault injected at store level surfaces there too. See
     /// `replaced_object_propagates_a_repository_read_failure` in `s3::objects`.
     /// It pins the swallow against the shared helper both write paths evaluate.
     #[tokio::test]

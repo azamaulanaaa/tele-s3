@@ -145,7 +145,7 @@ pub struct StartupReport {
 ///
 /// The field list is the redaction policy. It holds a port, three numbers,
 /// and two closed enums. No path allows `auth_access_key`,
-/// `auth_secret_key`, `api_hash`, `bot_token`, `database_uri`, or any
+/// `auth_secret_key`, `api_hash`, `bot_token`, `database_path`, or any
 /// other config value to reach a response. The value cannot reach it in
 /// whole, in part, or in an error string. Adding a field here is the only
 /// way to change the policy. The whitelist test makes that change
