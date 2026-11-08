@@ -2033,7 +2033,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::expect_used)]
-    async fn delimiter_rollup_is_unaffected_by_sql_page_limit() {
+    async fn delimiter_rollup_is_unaffected_by_page_bounding() {
         let svc = test_service().await;
         seed_versions(&svc, &["a/1", "a/2", "b/1"]).await;
 
@@ -2045,7 +2045,7 @@ mod tests {
 
         // Paged below the result set: same rollup, split across pages by the
         // handler's existing fold. The `CommonPrefix` entries per page are
-        // pinned to current (pre-SQL-cap) behaviour.
+        // pinned to the current page-bounded behaviour.
         let paged = walk_versions(&svc, 1, Some("/")).await;
         assert_eq!(
             paged.len(),
@@ -2086,7 +2086,7 @@ mod tests {
         assert_eq!(
             flat.iter().flat_map(|p| p.keys.clone()).collect::<Vec<_>>(),
             ["a/1", "a/2", "a/3", "b/1", "b/2", "c/1"],
-            "SQL-limited pages must neither skip nor repeat a key"
+            "page-bounded listings must neither skip nor repeat a key"
         );
         assert_eq!(flat.last().expect("last page").is_truncated, Some(false));
     }
