@@ -856,4 +856,35 @@ mod tests {
             "the resolved row is the only record of the key it produced"
         );
     }
+
+    #[tokio::test]
+    async fn prefix_scan_includes_keys_after_the_largest_scalar() {
+        let repo = repo().await;
+        let tricky = "a/\u{10FFFF}x";
+        seed_uploads(&repo, &[tricky, "a/z"], 1).await;
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", Some("a/"), None, None, Some(10))
+            .await
+            .expect("list uploads");
+        assert_eq!(
+            ids(&models),
+            [("a/z".into(), "u0".into()), (tricky.into(), "u0".into())],
+            "a key with the largest scalar must stay inside the prefix range"
+        );
+        assert!(!is_truncated);
+    }
+
+    #[tokio::test]
+    async fn a_marker_past_the_prefix_returns_an_empty_page() {
+        let repo = repo().await;
+        seed_uploads(&repo, &["a/1", "a/2"], 1).await;
+
+        let (models, is_truncated) = repo
+            .list_multipart_uploads("b", Some("a/"), Some("z"), None, Some(10))
+            .await
+            .expect("list uploads");
+        assert!(models.is_empty(), "no key under `a/` is greater than `z`");
+        assert!(!is_truncated);
+    }
 }

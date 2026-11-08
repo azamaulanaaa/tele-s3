@@ -1570,4 +1570,59 @@ mod tests {
             "the oldest pending intents come first"
         );
     }
+
+    #[tokio::test]
+    async fn prefix_scan_includes_keys_after_the_largest_scalar() {
+        let repo = repo().await;
+        let tricky = "a/\u{10FFFF}x";
+        versioned_bucket_with_keys(&repo, &[tricky, "a/z"]).await;
+
+        let rows = repo
+            .list_objects("b", Some("a/".into()), None, None, 10)
+            .await
+            .expect("list objects");
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["a/z", tricky],
+            "a key with the largest scalar must stay inside the prefix range"
+        );
+
+        let (versions, markers) = repo
+            .list_object_versions("b", Some("a/".into()), None, None, None, Some(10))
+            .await
+            .expect("list versions");
+        assert!(markers.is_empty());
+        assert_eq!(
+            versions
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a/z", tricky]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_past_the_prefix_returns_an_empty_page() {
+        let repo = repo().await;
+        versioned_bucket_with_keys(&repo, &["a/1", "a/2"]).await;
+
+        let rows = repo
+            .list_objects("b", Some("a/".into()), None, Some("z".into()), 10)
+            .await
+            .expect("list objects");
+        assert!(rows.is_empty(), "no key under `a/` is greater than `z`");
+
+        let (versions, markers) = repo
+            .list_object_versions(
+                "b",
+                Some("a/".into()),
+                None,
+                Some("z".into()),
+                None,
+                Some(10),
+            )
+            .await
+            .expect("list versions");
+        assert!(versions.is_empty() && markers.is_empty());
+    }
 }
