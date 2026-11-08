@@ -6,3 +6,5 @@ pub mod admin;
 pub mod backend;
 /// S3 API implementation.
 pub mod s3;
+/// Shared redb metadata store.
+pub mod storage;
