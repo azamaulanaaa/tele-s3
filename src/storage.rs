@@ -1,8 +1,8 @@
 //! Shared redb metadata store.
 //!
-//! One [`Store`] owns one redb database file. The S3 repository and the
+//! One [`Store`](crate::storage::Store) owns one redb database file. The S3 repository and the
 //! Telegram session store both clone the same handle. A clone is cheap: it
-//! holds an [`Arc`] to the open database.
+//! holds an [`Arc`](std::sync::Arc) to the open database.
 //!
 //! redb is synchronous. The S3 repository wraps every operation in
 //! [`tokio::task::spawn_blocking`]. The code never holds a transaction across
