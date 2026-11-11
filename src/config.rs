@@ -53,10 +53,8 @@ struct SettingSpec {
     name: &'static str,
     /// The CLI flag without the leading dashes.
     cli_flag: &'static str,
-    /// The canonical environment variable.
+    /// The environment variable.
     env_var: &'static str,
-    /// Environment variable aliases, in fallback order.
-    aliases: &'static [&'static str],
     /// The setting has no built-in default.
     required: bool,
     /// The value must not appear in a log line.
@@ -67,7 +65,6 @@ static API_ID: SettingSpec = SettingSpec {
     name: "api_id",
     cli_flag: "api-id",
     env_var: "TELE_S3_API_ID",
-    aliases: &[],
     required: true,
     secret: false,
 };
@@ -75,7 +72,6 @@ static API_HASH: SettingSpec = SettingSpec {
     name: "api_hash",
     cli_flag: "api-hash",
     env_var: "TELE_S3_API_HASH",
-    aliases: &[],
     required: true,
     secret: true,
 };
@@ -83,7 +79,6 @@ static BOT_TOKEN: SettingSpec = SettingSpec {
     name: "bot_token",
     cli_flag: "bot-token",
     env_var: "TELE_S3_BOT_TOKEN",
-    aliases: &[],
     required: true,
     secret: true,
 };
@@ -91,7 +86,6 @@ static USERNAME: SettingSpec = SettingSpec {
     name: "username",
     cli_flag: "username",
     env_var: "TELE_S3_USERNAME",
-    aliases: &[],
     required: true,
     secret: false,
 };
@@ -99,7 +93,6 @@ static DATABASE_PATH: SettingSpec = SettingSpec {
     name: "database_path",
     cli_flag: "database-path",
     env_var: "TELE_S3_DATABASE_PATH",
-    aliases: &[],
     required: true,
     secret: false,
 };
@@ -107,7 +100,6 @@ static LISTEN_PORT: SettingSpec = SettingSpec {
     name: "listen_port",
     cli_flag: "listen-port",
     env_var: "TELE_S3_LISTEN_PORT",
-    aliases: &[],
     required: true,
     secret: false,
 };
@@ -115,7 +107,6 @@ static AUTH_ACCESS_KEY: SettingSpec = SettingSpec {
     name: "auth_access_key",
     cli_flag: "auth-access-key",
     env_var: "TELE_S3_AUTH_ACCESS_KEY",
-    aliases: &[],
     required: true,
     secret: true,
 };
@@ -123,7 +114,6 @@ static AUTH_SECRET_KEY: SettingSpec = SettingSpec {
     name: "auth_secret_key",
     cli_flag: "auth-secret-key",
     env_var: "TELE_S3_AUTH_SECRET_KEY",
-    aliases: &[],
     required: true,
     secret: true,
 };
@@ -131,31 +121,27 @@ static MAX_CONCURRENT_CONNECTIONS: SettingSpec = SettingSpec {
     name: "max_concurrent_connections",
     cli_flag: "max-concurrent-connections",
     env_var: "TELE_S3_MAX_CONCURRENT_CONNECTIONS",
-    aliases: &[],
     required: false,
     secret: false,
 };
 static TELEGRAM_MAX_CONCURRENT_REQUESTS: SettingSpec = SettingSpec {
     name: "telegram_max_concurrent_requests",
     cli_flag: "telegram-max-concurrent-requests",
-    env_var: "TELEGRAM_MAX_CONCURRENT_REQUESTS",
-    aliases: &["TELE_S3_MAX_CONCURRENT_REQUESTS"],
+    env_var: "TELE_S3_MAX_CONCURRENT_REQUESTS",
     required: false,
     secret: false,
 };
 static TELEGRAM_IO_TIMEOUT_SECS: SettingSpec = SettingSpec {
     name: "telegram_io_timeout_secs",
     cli_flag: "telegram-io-timeout-secs",
-    env_var: "TELEGRAM_IO_TIMEOUT_SECS",
-    aliases: &["TELE_S3_IO_TIMEOUT_SECS"],
+    env_var: "TELE_S3_IO_TIMEOUT_SECS",
     required: false,
     secret: false,
 };
 static TELEGRAM_MAX_ATTEMPTS: SettingSpec = SettingSpec {
     name: "telegram_max_attempts",
     cli_flag: "telegram-max-attempts",
-    env_var: "TELEGRAM_MAX_ATTEMPTS",
-    aliases: &["TELE_S3_MAX_ATTEMPTS"],
+    env_var: "TELE_S3_MAX_ATTEMPTS",
     required: false,
     secret: false,
 };
@@ -163,7 +149,6 @@ static LOG_FORMAT: SettingSpec = SettingSpec {
     name: "log_format",
     cli_flag: "log-format",
     env_var: "TELE_S3_LOG_FORMAT",
-    aliases: &[],
     required: false,
     secret: false,
 };
@@ -171,7 +156,6 @@ static LOG_FILTER: SettingSpec = SettingSpec {
     name: "log_filter",
     cli_flag: "log-filter",
     env_var: "RUST_LOG",
-    aliases: &[],
     required: false,
     secret: false,
 };
@@ -179,7 +163,6 @@ static OTLP_ENDPOINT: SettingSpec = SettingSpec {
     name: "otlp_endpoint",
     cli_flag: "otlp-endpoint",
     env_var: "TELE_S3_OTLP_ENDPOINT",
-    aliases: &["OTEL_EXPORTER_OTLP_ENDPOINT"],
     required: false,
     secret: false,
 };
@@ -187,7 +170,6 @@ static OTLP_SAMPLE_RATIO: SettingSpec = SettingSpec {
     name: "otlp_sample_ratio",
     cli_flag: "otlp-sample-ratio",
     env_var: "TELE_S3_OTLP_SAMPLE_RATIO",
-    aliases: &[],
     required: false,
     secret: false,
 };
@@ -643,14 +625,11 @@ fn non_blank(raw: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Pick the first non-blank environment value.
+/// Read the environment variable for one setting.
 ///
-/// The canonical variable comes before the aliases. A blank value counts as
-/// unset.
+/// A blank value counts as unset.
 fn env_value(spec: &'static SettingSpec, env: EnvLookup<'_>) -> Option<(&'static str, String)> {
-    std::iter::once(spec.env_var)
-        .chain(spec.aliases.iter().copied())
-        .find_map(|name| non_blank(env(name).as_deref()).map(|raw| (name, raw)))
+    non_blank(env(spec.env_var).as_deref()).map(|raw| (spec.env_var, raw))
 }
 
 /// The values one setting has in the strict sources and the default.
@@ -1136,57 +1115,53 @@ mod tests {
     }
 
     #[test]
-    fn legacy_telegram_environment_names_work() {
-        for (legacy, canonical, expected) in [
-            (
-                "TELE_S3_MAX_CONCURRENT_REQUESTS",
-                "TELEGRAM_MAX_CONCURRENT_REQUESTS",
-                "5",
-            ),
-            ("TELE_S3_IO_TIMEOUT_SECS", "TELEGRAM_IO_TIMEOUT_SECS", "42"),
-            ("TELE_S3_MAX_ATTEMPTS", "TELEGRAM_MAX_ATTEMPTS", "3"),
+    fn the_tele_s3_telegram_names_resolve() {
+        for (name, expected) in [
+            ("TELE_S3_MAX_CONCURRENT_REQUESTS", "5"),
+            ("TELE_S3_IO_TIMEOUT_SECS", "42"),
+            ("TELE_S3_MAX_ATTEMPTS", "3"),
         ] {
-            let env = env_map(&[(legacy, expected)]);
+            let env = env_map(&[(name, expected)]);
             let resolved =
                 resolve_with(empty_args(), &env, required_file()).expect("the config resolves");
 
-            let actual = match canonical {
-                "TELEGRAM_MAX_CONCURRENT_REQUESTS" => {
+            let actual = match name {
+                "TELE_S3_MAX_CONCURRENT_REQUESTS" => {
                     resolved.config.telegram_max_concurrent_requests.to_string()
                 }
-                "TELEGRAM_IO_TIMEOUT_SECS" => resolved.config.telegram_io_timeout_secs.to_string(),
+                "TELE_S3_IO_TIMEOUT_SECS" => resolved.config.telegram_io_timeout_secs.to_string(),
                 _ => resolved.config.telegram_max_attempts.to_string(),
             };
-            assert_eq!(actual, expected, "{legacy}");
+            assert_eq!(actual, expected, "{name}");
         }
     }
 
     #[test]
-    fn canonical_telegram_environment_names_win() {
+    fn the_old_telegram_names_are_ignored() {
         let env = env_map(&[
-            ("TELEGRAM_MAX_CONCURRENT_REQUESTS", "6"),
-            ("TELE_S3_MAX_CONCURRENT_REQUESTS", "5"),
+            ("TELEGRAM_MAX_CONCURRENT_REQUESTS", "5"),
+            ("TELEGRAM_IO_TIMEOUT_SECS", "42"),
+            ("TELEGRAM_MAX_ATTEMPTS", "3"),
         ]);
 
         let resolved =
             resolve_with(empty_args(), &env, required_file()).expect("the config resolves");
-        assert_eq!(resolved.config.telegram_max_concurrent_requests, 6);
+        assert_eq!(resolved.config.telegram_max_concurrent_requests, 8);
+        assert_eq!(resolved.config.telegram_io_timeout_secs, 120);
+        assert_eq!(resolved.config.telegram_max_attempts, 8);
     }
 
     #[test]
-    fn the_standard_otel_endpoint_is_a_fallback() {
+    fn only_the_tele_s3_otlp_endpoint_is_read() {
         let standard = "http://otel-collector:4318/v1/traces";
         let own = "http://collector.internal:4318/v1/traces";
 
         let env = env_map(&[("OTEL_EXPORTER_OTLP_ENDPOINT", standard)]);
         let resolved =
             resolve_with(empty_args(), &env, required_file()).expect("the config resolves");
-        assert_eq!(resolved.config.otlp_endpoint.as_deref(), Some(standard));
+        assert_eq!(resolved.config.otlp_endpoint, None);
 
-        let env = env_map(&[
-            ("TELE_S3_OTLP_ENDPOINT", own),
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", standard),
-        ]);
+        let env = env_map(&[("TELE_S3_OTLP_ENDPOINT", own)]);
         let resolved =
             resolve_with(empty_args(), &env, required_file()).expect("the config resolves");
         assert_eq!(resolved.config.otlp_endpoint.as_deref(), Some(own));

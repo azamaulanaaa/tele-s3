@@ -2407,8 +2407,8 @@ mod body_contract {
 /// recorded under.
 ///
 /// The flood guard is process-wide. So an operator tuning
-/// `TELEGRAM_MAX_CONCURRENT_REQUESTS`, `TELEGRAM_IO_TIMEOUT_SECS` and
-/// `TELEGRAM_MAX_ATTEMPTS` needs to know which request drew a 420, what
+/// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS` and
+/// `TELE_S3_MAX_ATTEMPTS` needs to know which request drew a 420, what
 /// Telegram called it, and which chat it came from. Before this module those
 /// three facts were either absent or folded into `operation`. A rate limit
 /// that named no wait produced no event at all.

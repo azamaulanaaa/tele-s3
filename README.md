@@ -187,9 +187,9 @@ A required setting must come from a source. Start-up fails when no source gives 
 | S3 access key | `auth_access_key` | `--auth-access-key` | `TELE_S3_AUTH_ACCESS_KEY` | required |
 | S3 secret key | `auth_secret_key` | `--auth-secret-key` | `TELE_S3_AUTH_SECRET_KEY` | required |
 | Max inbound connections | `max_concurrent_connections` | `--max-concurrent-connections` | `TELE_S3_MAX_CONCURRENT_CONNECTIONS` | `128` |
-| Telegram max in-flight requests | `telegram_max_concurrent_requests` | `--telegram-max-concurrent-requests` | `TELEGRAM_MAX_CONCURRENT_REQUESTS` | `8` |
-| Telegram I/O timeout seconds | `telegram_io_timeout_secs` | `--telegram-io-timeout-secs` | `TELEGRAM_IO_TIMEOUT_SECS` | `120` |
-| Telegram max attempts | `telegram_max_attempts` | `--telegram-max-attempts` | `TELEGRAM_MAX_ATTEMPTS` | `8` |
+| Telegram max in-flight requests | `telegram_max_concurrent_requests` | `--telegram-max-concurrent-requests` | `TELE_S3_MAX_CONCURRENT_REQUESTS` | `8` |
+| Telegram I/O timeout seconds | `telegram_io_timeout_secs` | `--telegram-io-timeout-secs` | `TELE_S3_IO_TIMEOUT_SECS` | `120` |
+| Telegram max attempts | `telegram_max_attempts` | `--telegram-max-attempts` | `TELE_S3_MAX_ATTEMPTS` | `8` |
 | Log format | `log_format` | `--log-format` | `TELE_S3_LOG_FORMAT` | `text` |
 | Log filter | `log_filter` | `--log-filter` | `RUST_LOG` | `tele_s3=info` |
 | OTLP endpoint | `otlp_endpoint` | `--otlp-endpoint` | `TELE_S3_OTLP_ENDPOINT` | unset, export off |
@@ -202,17 +202,6 @@ A bad environment value is not fatal. The code logs a warning. The warning names
 The code clamps `max_concurrent_connections` to `1..=Semaphore::MAX_PERMITS`. The code clamps the Telegram limits with `GrammersLimits::sanitized()`. The introspection endpoint publishes the effective values.
 
 `otlp_sample_ratio` must be finite and in `0.0..=1.0`. A blank `otlp_endpoint` means unset at every source.
-
-### Environment aliases
-
-The canonical names win when both names are set.
-
-| Setting | Canonical variable | Alias |
-|---|---|---|
-| Telegram max in-flight requests | `TELEGRAM_MAX_CONCURRENT_REQUESTS` | `TELE_S3_MAX_CONCURRENT_REQUESTS` |
-| Telegram I/O timeout seconds | `TELEGRAM_IO_TIMEOUT_SECS` | `TELE_S3_IO_TIMEOUT_SECS` |
-| Telegram max attempts | `TELEGRAM_MAX_ATTEMPTS` | `TELE_S3_MAX_ATTEMPTS` |
-| OTLP endpoint | `TELE_S3_OTLP_ENDPOINT` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
 ### Source examples
 
