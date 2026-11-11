@@ -29,7 +29,7 @@ use tele_s3::{
     },
     backend::{Grammers, GrammersConfig},
     s3::TeleS3,
-    storage::{Store, ignored_legacy_sqlite_path},
+    storage::Store,
 };
 
 mod config;
@@ -56,9 +56,6 @@ const TELEMETRY_CONFIG_ERROR_TYPE: &str = "unparsable_telemetry_config";
 
 /// `error.type` for spans that could not be flushed to the collector.
 const TELEMETRY_EXPORT_ERROR_TYPE: &str = "telemetry_export";
-
-/// `error.type` for a legacy SQLite database that the service does not import.
-const LEGACY_SQLITE_IGNORED_ERROR_TYPE: &str = "legacy_sqlite_ignored";
 
 /// Where and how much to export.
 ///
@@ -496,18 +493,6 @@ async fn main() -> anyhow::Result<()> {
     let telemetry = init_tracing(&config);
     for warning in &resolved.warnings {
         warning.emit();
-    }
-
-    // The migration from SQLite is a clean cut. An operator who still has the
-    // old file must learn why its data is absent. Check before `Store::open`
-    // creates the redb file.
-    if let Some(legacy_path) = ignored_legacy_sqlite_path(&config.database_path) {
-        tracing::warn!(
-            database_path = %config.database_path,
-            legacy_database_path = %legacy_path.display(),
-            error.type = LEGACY_SQLITE_IGNORED_ERROR_TYPE,
-            "Legacy SQLite database is ignored. The service does not import it."
-        );
     }
 
     let store = Store::open(&config.database_path)?;
