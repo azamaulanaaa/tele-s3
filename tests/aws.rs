@@ -1072,7 +1072,9 @@ async fn test_list_objects_v2_with_start_after() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_create_multipart_upload() -> anyhow::Result<()> {
-    let config = config::<6, { 1024 * 1024 }>().await?;
+    // 96 chunks of 64 KiB give 6 MiB of capacity. The 5 MiB part uses 80 chunks.
+    // The last part uses one more chunk.
+    let config = config::<96, { 64 * 1024 }>().await?;
     let client = Client::new(&config);
 
     let bucket_name = "multipart-upload";
