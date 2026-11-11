@@ -10,12 +10,14 @@
 [tools]
 rust = { version = "stable", components = "rust-analyzer" }
 # Coverage: llvm-cov instruments the test binary rather than sampling, so the
-# numbers are exact and reproducible.
-"cargo:cargo-llvm-cov" = "latest"
+# numbers are exact and reproducible. Pinned to the version CI installs.
+"cargo:cargo-llvm-cov" = "0.9.1"
 # Advisories, licences and duplicate-version checks over the resolved graph.
-"cargo:cargo-deny" = "latest"
+# Pinned to the version CI installs.
+"cargo:cargo-deny" = "0.20.2"
 # Release artifacts: builds the platform archives and drives the release CI.
-"cargo:cargo-dist" = "latest"
+# Pinned to the version CI installs.
+"cargo:cargo-dist" = "0.32.0"
 
 [tasks.build]
 run = "cargo build --all-targets --all-features"
@@ -27,7 +29,7 @@ run = [
 ]
 
 [tasks.cov]
-run = "cargo llvm-cov --all-features --summary-only"
+run = "cargo llvm-cov --all-features --summary-only --locked"
 description = "Print a coverage summary for the test suite"
 
 [tasks.fmt]

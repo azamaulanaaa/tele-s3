@@ -1,28 +1,46 @@
 name: Release Container Image
 
-# Run when the "Release" workflow finishes
+# Publish the multi-arch container image for a GitHub release.
+#
+# Trigger on `release: published`, not on the completion of the `Release`
+# workflow. `release.yml` also runs on pull requests, so a `workflow_run`
+# trigger could start this privileged workflow from a successful pull request
+# run. The release event names the tag directly, so the tag no longer comes
+# from `gh release list`.
 on:
-  workflow_run:
-    workflows:
-      - Release
+  release:
     types:
-      - completed
+      - published
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example 0.7.1
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   BINARY_NAME: tele-s3
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+permissions:
+  contents: read
+
+# One run per tag, and never cancel a run that already started. A second
+# publish for the same tag must not remove images the first run already pushed.
+concurrency:
+  group: release-container-image-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
   build-arch-images:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     outputs:
-      tag: ${{ steps.get_tag.outputs.tag }}
+      tag: ${{ env.TAG }}
     strategy:
       matrix:
         include:
@@ -35,21 +53,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Get latest release tag
-        id: get_tag
-        run: |
-          TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -58,41 +71,47 @@ jobs:
       - name: Download Release Asset
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.get_tag.outputs.tag }}
           TARGET: ${{ matrix.target }}
         run: |
-          echo "Attempting to download artifact for $TARGET (tag: $TAG)..."
-          if gh release download "$TAG" --pattern "*$TARGET.tar.xz" --dir download; then
-            echo "Download successful!"
-          fi
-
-      - name: Extract Binary
-        run: |
-          cd download
-          # Extract the tarball
-          tar -xvf *${{ matrix.target }}.tar.xz
-          
-          # Locate the binary inside the extracted folder and move to root
-          FOUND_BIN=$(find . -name "${{ env.BINARY_NAME }}" -type f | head -n 1)
-          
-          if [ -z "$FOUND_BIN" ]; then
-            echo "Could not find binary named ${{ env.BINARY_NAME }} in extracted files"
+          set -euo pipefail
+          echo "Downloading the release archive for $TARGET (tag: $TAG)"
+          mkdir -p download
+          gh release download "$TAG" --pattern "*$TARGET.tar.xz" --dir download
+          archive=$(find download -maxdepth 1 -name "*$TARGET.tar.xz" -type f -print -quit)
+          if [ -z "$archive" ]; then
+            echo "::error::No release archive for $TARGET in release $TAG"
             exit 1
           fi
-          
-          mv "$FOUND_BIN" ../${{ env.BINARY_NAME }}
-          chmod +x ../${{ env.BINARY_NAME }}
-          
-          echo "Binary moved to project root successfully."
+          echo "Downloaded $archive"
+
+      - name: Extract Binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive=$(find download -maxdepth 1 -name "*$TARGET.tar.xz" -type f -print -quit)
+          if [ -z "$archive" ]; then
+            echo "::error::No release archive for $TARGET in the download directory"
+            exit 1
+          fi
+          tar -xvf "$archive" -C download
+          found_bin=$(find download -name "$BINARY_NAME" -type f -print -quit)
+          if [ -z "$found_bin" ]; then
+            echo "::error::The release archive for $TARGET does not contain $BINARY_NAME"
+            exit 1
+          fi
+          mv "$found_bin" "./$BINARY_NAME"
+          chmod +x "./$BINARY_NAME"
+          echo "Moved $BINARY_NAME to the project root"
 
       - name: Build and push intermediate image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           file: .github/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tag.outputs.tag }}-${{ matrix.arch }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}-${{ matrix.arch }}
           build-args: |
             BINARY_NAME=${{ env.BINARY_NAME }}
 
@@ -100,29 +119,37 @@ jobs:
     needs: build-arch-images
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       packages: write
     steps:
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and Push Manifest
+        env:
+          TAG: ${{ needs.build-arch-images.outputs.tag }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
-          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAG="${{ needs.build-arch-images.outputs.tag }}"
-          
-          # 1. Create the specific version tag (e.g. v1.0.0)
-          # combining amd64 and arm64
-          docker buildx imagetools create -t ${BASE}:${TAG} \
-            ${BASE}:${TAG}-amd64 \
-            ${BASE}:${TAG}-arm64
-            
-          # 2. Update the 'latest' tag
-          docker buildx imagetools create -t ${BASE}:latest \
-            ${BASE}:${TAG}-amd64 \
-            ${BASE}:${TAG}-arm64
-            
-          echo "Successfully pushed ${BASE}:${TAG} and ${BASE}:latest"
+          set -euo pipefail
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+
+          # Keep the version tag for every release.
+          docker buildx imagetools create -t "${BASE}:${TAG}" \
+            "${BASE}:${TAG}-amd64" \
+            "${BASE}:${TAG}-arm64"
+          echo "Pushed ${BASE}:${TAG}"
+
+          # Update `latest` only for a stable release. A manual dispatch has no
+          # release event, so it counts as stable.
+          if [ "${PRERELEASE:-false}" != "true" ]; then
+            docker buildx imagetools create -t "${BASE}:latest" \
+              "${BASE}:${TAG}-amd64" \
+              "${BASE}:${TAG}-arm64"
+            echo "Pushed ${BASE}:latest"
+          else
+            echo "Release $TAG is a prerelease. The latest tag is unchanged."
+          fi

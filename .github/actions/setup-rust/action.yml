@@ -103,11 +103,17 @@ runs:
         # The image has rustfmt but not clippy or llvm-tools, and this is a
         # download of a component from static.rust-lang.org rather than an
         # action fetching a toolchain.
-        IFS=',' read -ra wanted <<< "$COMPONENTS"
-        for component in "${wanted[@]}"; do
-          [ -n "$component" ] || continue
-          rustup component add "$component"
-        done
+        #
+        # An empty list does nothing. On macOS, bash 3.2 leaves `wanted`
+        # undefined when `read -ra` gets an empty string. `set -u` then rejects
+        # `"${wanted[@]}"`. Guard the array before the loop.
+        if [ -n "$COMPONENTS" ]; then
+          IFS=',' read -ra wanted <<< "$COMPONENTS"
+          for component in "${wanted[@]}"; do
+            [ -n "$component" ] || continue
+            rustup component add "$component"
+          done
+        fi
         rustc --version
         cargo --version
 

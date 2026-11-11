@@ -16,6 +16,10 @@ on:
   pull_request:
   # So the release workflow can gate publishing on this having passed.
   workflow_call:
+  # Weekly run on the default branch, so the suite runs even with no open pull
+  # request.
+  schedule:
+    - cron: '0 4 * * 1'
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,6 +83,31 @@ jobs:
       # collected as doctests of a `#[cfg(doctest)]` item in `lib.rs`. Without
       # this the only compiled prose in the repository goes unchecked.
       - run: cargo test --doc --locked
+
+  # Advisory only. The benchmark is a useful signal, but a noisy shared runner
+  # must not block a pull request, so this job cannot fail the run.
+  bench-fast:
+    name: Bench (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      - name: Run the memory backend benchmark
+        run: cargo bench --locked --bench memory_backend -- --test
+      - name: Write the advisory note
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Benchmark result is advisory'
+            echo
+            echo 'This run does not block the pull request.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   coverage:
     name: Coverage
