@@ -173,8 +173,8 @@ impl AdminState {
     ///
     /// `metrics_export` answers the same question for the rate-limit and RPC
     /// metrics. An operator tunes
-    /// `TELE_S3_MAX_CONCURRENT_REQUESTS`, `TELE_S3_IO_TIMEOUT_SECS`, and
-    /// `TELE_S3_MAX_ATTEMPTS`. Without these metrics, the operator tunes
+    /// `TELEGRAM_MAX_CONCURRENT_REQUESTS`, `TELEGRAM_IO_TIMEOUT_SECS`, and
+    /// `TELEGRAM_MAX_ATTEMPTS`. Without these metrics, the operator tunes
     /// blind. `metrics_export` tracks `trace_export` today. One endpoint turns
     /// both on. The code publishes `metrics_export` separately. A probe can
     /// then tell which half of the pipeline a future change made dark.

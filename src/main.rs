@@ -1,5 +1,5 @@
 //! Binary entry point for tele-s3.
-use std::{env, path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
@@ -27,136 +27,15 @@ use tele_s3::{
         AdminRoute, AdminState, ORPHAN_BLOB_RECONCILER_ERROR_TYPE,
         PUBLISH_INTENT_RECONCILER_ERROR_TYPE, ReconcilerOutcome, StartupReport,
     },
-    backend::{Grammers, GrammersConfig, GrammersLimits},
+    backend::{Grammers, GrammersConfig},
     s3::TeleS3,
     storage::Store,
 };
 
 mod config;
 
-#[derive(Debug, Clone, Parser)]
-#[command(version, about)]
-struct Args {
-    #[arg(short, long)]
-    config: String,
-}
-
-/// Outbound Telegram bounds. An operator can override them from the
-/// environment without a rebuild. Unset or unparsable values keep the
-/// built-in default.
-///
-/// `TELEGRAM_MAX_CONCURRENT_REQUESTS`, `TELEGRAM_IO_TIMEOUT_SECS`, and
-/// `TELEGRAM_MAX_ATTEMPTS` come from the environment, not the config file.
-/// An operator can set them on a container without touching `config.toml`.
-/// The code reads them once, here, before it builds the backend. The README's
-/// configuration reference documents what they bound and their defaults. The
-/// defaults live in [`GrammersLimits::default`].
-///
-/// The code does not reject out-of-range values here. [`GrammersLimits::sanitized`]
-/// clamps them later. An absurd setting degrades instead of wedging the
-/// backend at start-up.
-fn telegram_limits() -> GrammersLimits {
-    let defaults = GrammersLimits::default();
-
-    fn env_or<T: std::str::FromStr>(name: &str, fallback: T) -> T {
-        match env::var(name) {
-            Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
-                tracing::warn!(
-                    env_var = name,
-                    value = %raw,
-                    error.type = "unparsable_env_override",
-                    "ignoring unparsable environment override"
-                );
-                fallback
-            }),
-            Err(_) => fallback,
-        }
-    }
-
-    let max_concurrent_requests = env_or(
-        "TELEGRAM_MAX_CONCURRENT_REQUESTS",
-        defaults.max_concurrent_requests,
-    );
-    let io_timeout = Duration::from_secs(env_or(
-        "TELEGRAM_IO_TIMEOUT_SECS",
-        defaults.io_timeout.as_secs(),
-    ));
-    let max_attempts = env_or("TELEGRAM_MAX_ATTEMPTS", defaults.max_attempts);
-
-    GrammersLimits {
-        max_concurrent_requests,
-        io_timeout,
-        max_attempts,
-    }
-}
-
-/// Line-oriented output format for the process log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogFormat {
-    /// `tracing-subscriber`'s human-readable renderer. The default. The
-    /// only format that has always been available.
-    Text,
-    /// One self-describing JSON object per event, for ingestion.
-    Json,
-}
-
-impl LogFormat {
-    /// Parse a format name, case- and whitespace-insensitively. `None` for a
-    /// name this build does not have.
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "json" => Some(Self::Json),
-            _ => None,
-        }
-    }
-
-    /// Read [`LOG_FORMAT_ENV`]. An unset variable keeps [`LogFormat::Text`].
-    /// A variable that names a format this build lacks also keeps
-    /// [`LogFormat::Text`]. A typo degrades to the default rather than to a
-    /// process that logs nothing.
-    fn from_env() -> Self {
-        let Ok(raw) = env::var(LOG_FORMAT_ENV) else {
-            return Self::Text;
-        };
-
-        if let Some(parsed) = Self::parse(&raw) {
-            parsed
-        } else {
-            tracing::warn!(
-                env_var = LOG_FORMAT_ENV,
-                value = %raw,
-                error.type = "unparsable_env_override",
-                "unknown log format requested; using the default text format"
-            );
-            Self::Text
-        }
-    }
-}
-
-/// Selects the process-wide log format. See [`LOG_FORMAT_ENV`].
-const LOG_FORMAT_ENV: &str = "TELE_S3_LOG_FORMAT";
-
 /// Name this process reports to the collector, as `service.name`.
 const SERVICE_NAME: &str = "tele-s3";
-
-/// OTLP endpoint that receives exported traces. Unset means trace export is
-/// off.
-///
-/// This follows the same environment-variable convention as the log format and
-/// the Telegram limits. The code reads it once, here, before it builds
-/// anything. An operator can set it on a container without touching
-/// `config.toml`.
-const OTLP_ENDPOINT_ENV: &str = "TELE_S3_OTLP_ENDPOINT";
-
-/// The standard OpenTelemetry endpoint variable, honoured as a fallback.
-///
-/// An operator who already points other services at a collector does not have
-/// to learn this crate's spelling. [`OTLP_ENDPOINT_ENV`] takes precedence.
-/// The crate's own variable works standalone.
-const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
-
-/// Fraction of traces to export, `0.0` to `1.0`. Unset means every trace.
-const OTLP_SAMPLE_RATIO_ENV: &str = "TELE_S3_OTLP_SAMPLE_RATIO";
 
 /// The only transport built into this binary.
 ///
@@ -164,9 +43,6 @@ const OTLP_SAMPLE_RATIO_ENV: &str = "TELE_S3_OTLP_SAMPLE_RATIO";
 /// path can speak gRPC, even if a collector asks for it. The code publishes
 /// the name at start-up. An operator can see which transport they got.
 const TRACE_TRANSPORT: &str = "otlp_http_protobuf";
-
-/// The crate exports every trace unless the operator says otherwise.
-const DEFAULT_SAMPLE_RATIO: f64 = 1.0;
 
 /// How often the meter provider pushes a collection to the collector.
 ///
@@ -181,7 +57,7 @@ const TELEMETRY_CONFIG_ERROR_TYPE: &str = "unparsable_telemetry_config";
 /// `error.type` for spans that could not be flushed to the collector.
 const TELEMETRY_EXPORT_ERROR_TYPE: &str = "telemetry_export";
 
-/// Where and how much to export. Read once from the environment.
+/// Where and how much to export.
 ///
 /// `None` means no endpoint is configured. This is the default and the common
 /// case. It is genuinely inert, not merely quiet. With no endpoint, nothing
@@ -198,62 +74,20 @@ struct TraceExport {
 }
 
 impl TraceExport {
-    /// Read the settings, or `None` when no endpoint is configured.
-    fn from_env() -> Option<Self> {
-        let endpoint = Self::endpoint_from(
-            env::var(OTLP_ENDPOINT_ENV).ok().as_deref(),
-            env::var(OTEL_ENDPOINT_ENV).ok().as_deref(),
-        )?;
+    /// Read the settings from the resolved config.
+    ///
+    /// `None` means that no endpoint is configured.
+    fn from_config(config: &config::Config) -> Option<Self> {
+        let endpoint = config
+            .otlp_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
 
         Some(Self {
             endpoint,
-            sample_ratio: Self::sample_ratio_from_env(),
-        })
-    }
-
-    /// The first usable endpoint among the crate's own variable, then the
-    /// standard one. An unset or blank value is not a configuration. It is
-    /// skipped rather than producing an endpoint of `""`.
-    ///
-    /// Pure. The precedence rule can be tested without mutating the process
-    /// environment. Every test in a binary shares that environment.
-    fn endpoint_from(own: Option<&str>, standard: Option<&str>) -> Option<String> {
-        [own, standard]
-            .into_iter()
-            .flatten()
-            .map(str::trim)
-            .find(|raw| !raw.is_empty())
-            .map(str::to_string)
-    }
-
-    /// A usable sample ratio, or `None` if `raw` is not one.
-    ///
-    /// The code rejects out-of-range and non-finite values here. They do not go
-    /// to the sampler's own clamping. An absurd setting degrades to a logged
-    /// default. It does not quietly mean "export nothing".
-    fn sample_ratio(raw: &str) -> Option<f64> {
-        let parsed = raw.trim().parse::<f64>().ok()?;
-
-        parsed
-            .is_finite()
-            .then_some(parsed)
-            .filter(|ratio| (0.0..=1.0).contains(ratio))
-    }
-
-    /// The configured ratio, or [`DEFAULT_SAMPLE_RATIO`] with a reason logged.
-    fn sample_ratio_from_env() -> f64 {
-        let Ok(raw) = env::var(OTLP_SAMPLE_RATIO_ENV) else {
-            return DEFAULT_SAMPLE_RATIO;
-        };
-
-        Self::sample_ratio(&raw).unwrap_or_else(|| {
-            tracing::warn!(
-                env_var = OTLP_SAMPLE_RATIO_ENV,
-                value = %raw,
-                error.type = TELEMETRY_CONFIG_ERROR_TYPE,
-                "unparsable trace sample ratio; exporting every trace"
-            );
-            DEFAULT_SAMPLE_RATIO
+            sample_ratio: config.otlp_sample_ratio,
         })
     }
 
@@ -454,11 +288,12 @@ impl TraceExport {
 /// tracer provider. Everything the crate records goes through the
 /// process-wide meter. A later scope adds instruments without a second
 /// configuration surface.
-fn init_tracing() -> Telemetry {
-    let format = LogFormat::from_env();
+fn init_tracing(config: &config::Config) -> Telemetry {
+    let format = config.log_format;
+    let log_filter = &config.log_filter;
 
-    let Some(settings) = TraceExport::from_env() else {
-        init_log_subscriber(format);
+    let Some(settings) = TraceExport::from_config(config) else {
+        init_log_subscriber(format, log_filter);
         return Telemetry::default();
     };
 
@@ -468,7 +303,7 @@ fn init_tracing() -> Telemetry {
     let metrics = settings.build_meter_pipeline();
 
     let Some(provider) = settings.build_pipeline() else {
-        init_log_subscriber(format);
+        init_log_subscriber(format, log_filter);
         return Telemetry {
             metrics,
             ..Default::default()
@@ -481,7 +316,7 @@ fn init_tracing() -> Telemetry {
         "exporting traces and metrics over OTLP"
     );
 
-    init_otel_subscriber(format, provider.tracer(SERVICE_NAME));
+    init_otel_subscriber(format, log_filter, provider.tracer(SERVICE_NAME));
 
     // Set globally rather than threaded through every constructor: the
     // backend resolves its instruments once at start-up, and the S3 and
@@ -546,28 +381,27 @@ impl Telemetry {
     }
 }
 
-/// `RUST_LOG`, or the crate's own default when it is unset or unreadable.
+/// Build one filter from the resolved `log_filter` setting.
 ///
 /// Built per layer, not once and shared. [`EnvFilter`] is not `Clone`. Each
 /// layer needs its own copy.
-fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tele_s3=info"))
+fn env_filter(log_filter: &str) -> EnvFilter {
+    EnvFilter::new(log_filter)
 }
 
 /// Install the log layer on its own.
 ///
 /// This is the whole subscriber for a process with no trace export. It uses
-/// the same `fmt` renderer. It uses the same environment filter. It uses the
-/// same default of pretty text.
-fn init_log_subscriber(format: LogFormat) {
+/// the same `fmt` renderer. It uses the resolved filter.
+fn init_log_subscriber(format: config::LogFormat, log_filter: &str) {
     match format {
-        LogFormat::Text => FmtSubscriber::builder()
+        config::LogFormat::Text => FmtSubscriber::builder()
             .pretty()
-            .with_env_filter(env_filter())
+            .with_env_filter(env_filter(log_filter))
             .init(),
-        LogFormat::Json => FmtSubscriber::builder()
+        config::LogFormat::Json => FmtSubscriber::builder()
             .json()
-            .with_env_filter(env_filter())
+            .with_env_filter(env_filter(log_filter))
             .init(),
     }
 }
@@ -580,19 +414,20 @@ fn init_log_subscriber(format: LogFormat) {
 /// log formats keep working as before. The trace layer writes nothing to
 /// stdout. It observes spans on their way to the collector.
 ///
-/// Both layers use the same `RUST_LOG`. Filtering only the log layer would let
-/// a `tele_s3=info` operator export debug spans they asked not to see.
-fn init_otel_subscriber(format: LogFormat, tracer: SdkTracer) {
+/// Both layers use the same resolved `log_filter`. Filtering only the log
+/// layer would let a `tele_s3=info` operator export debug spans they asked
+/// not to see.
+fn init_otel_subscriber(format: config::LogFormat, log_filter: &str, tracer: SdkTracer) {
     let logs: Box<dyn Layer<Registry> + Send + Sync> = match format {
-        LogFormat::Text => Box::new(
+        config::LogFormat::Text => Box::new(
             tracing_subscriber::fmt::layer()
                 .pretty()
-                .with_filter(env_filter()),
+                .with_filter(env_filter(log_filter)),
         ),
-        LogFormat::Json => Box::new(
+        config::LogFormat::Json => Box::new(
             tracing_subscriber::fmt::layer()
                 .json()
-                .with_filter(env_filter()),
+                .with_filter(env_filter(log_filter)),
         ),
     };
 
@@ -601,7 +436,7 @@ fn init_otel_subscriber(format: LogFormat, tracer: SdkTracer) {
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
-                .with_filter(env_filter()),
+                .with_filter(env_filter(log_filter)),
         )
         .init();
 }
@@ -647,63 +482,28 @@ impl ConnectionLimiter {
     }
 }
 
-/// Environment variable that overrides `max_concurrent_connections`.
-const CONNECTION_LIMIT_ENV: &str = "TELE_S3_MAX_CONCURRENT_CONNECTIONS";
-
-/// Resolve the inbound connection limit.
-///
-/// Read [`CONNECTION_LIMIT_ENV`] when it is set. An unset or unparsable value
-/// uses `config_value`. A warning names the bad value. The code clamps the
-/// result to `1..=Semaphore::MAX_PERMITS`.
-fn inbound_connection_limit(config_value: usize) -> usize {
-    connection_limit_from(env::var(CONNECTION_LIMIT_ENV).ok().as_deref(), config_value)
-}
-
-/// Resolve a connection limit from a raw environment value.
-///
-/// Pure. The parsing rule can be tested without changing the process
-/// environment. Every test in the binary shares that environment.
-fn connection_limit_from(raw: Option<&str>, config_value: usize) -> usize {
-    let fallback = config_value.clamp(1, Semaphore::MAX_PERMITS);
-    let Some(raw) = raw else {
-        return fallback;
-    };
-
-    match raw.trim().parse::<usize>() {
-        Ok(parsed) => parsed.clamp(1, Semaphore::MAX_PERMITS),
-        Err(_) => {
-            tracing::warn!(
-                env_var = CONNECTION_LIMIT_ENV,
-                value = %raw,
-                error.type = "unparsable_env_override",
-                "ignoring unparsable environment override"
-            );
-            fallback
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let telemetry = init_tracing();
+    let args = config::Args::parse();
+    let resolved = config::Config::resolve(args, &config::process_env)?;
+    let config = resolved.config;
 
-    let args = Args::parse();
-
-    let config = {
-        let config_path = Path::new(&args.config);
-
-        config::Config::try_from(config_path)?
-    };
+    // Install tracing before any warning. The resolved settings select the
+    // subscriber.
+    let telemetry = init_tracing(&config);
+    for warning in &resolved.warnings {
+        warning.emit();
+    }
 
     let store = Store::open(&config.database_path)?;
 
-    // Resolved once, here, so the admin endpoints publish the limits actually
-    // in force rather than a second reading of the environment.
-    let limits = telegram_limits();
+    // Sanitized once, here, so the backend and the admin endpoints share the
+    // limits actually in force.
+    let limits = config.telegram_limits();
 
     // Inbound S3 connections are bounded separately from Telegram I/O, so a
-    // slow client cannot exhaust the listener.
-    let max_concurrent_connections = inbound_connection_limit(config.max_concurrent_connections);
+    // slow client cannot exhaust the listener. The resolver clamps the value.
+    let max_concurrent_connections = config.max_concurrent_connections;
 
     let grammers = {
         let config = GrammersConfig {
@@ -865,6 +665,28 @@ mod tests {
     use super::*;
 
     use tele_s3::admin::ReconcilerOutcome;
+    use tele_s3::backend::GrammersLimits;
+
+    fn sample_config() -> config::Config {
+        config::Config {
+            api_id: 12345,
+            api_hash: "api-hash".to_string(),
+            bot_token: "12345:bot-token".to_string(),
+            username: "tele_s3_channel".to_string(),
+            database_path: "storage.redb".to_string(),
+            listen_port: 8000,
+            auth_access_key: "access-key".to_string(),
+            auth_secret_key: "secret-key".to_string(),
+            max_concurrent_connections: 128,
+            telegram_max_concurrent_requests: 8,
+            telegram_io_timeout_secs: 120,
+            telegram_max_attempts: 8,
+            log_format: config::LogFormat::Text,
+            log_filter: "tele_s3=info".to_string(),
+            otlp_endpoint: None,
+            otlp_sample_ratio: 1.0,
+        }
+    }
 
     /// The code builds the introspection document from the port, the Telegram limits,
     /// and two closed enums. No argument of [`AdminState::new`] can carry a
@@ -881,17 +703,12 @@ mod tests {
             "postgres://tele_s3:hunter2@db.internal/tele_s3",
         ];
 
-        let config = config::Config {
-            api_id: 12345,
-            api_hash: SENTINELS[2].to_string(),
-            bot_token: SENTINELS[3].to_string(),
-            username: "tele_s3_channel".to_string(),
-            database_path: SENTINELS[4].to_string(),
-            listen_port: 8000,
-            auth_access_key: SENTINELS[0].to_string(),
-            auth_secret_key: SENTINELS[1].to_string(),
-            max_concurrent_connections: 128,
-        };
+        let mut config = sample_config();
+        config.api_hash = SENTINELS[2].to_string();
+        config.bot_token = SENTINELS[3].to_string();
+        config.database_path = SENTINELS[4].to_string();
+        config.auth_access_key = SENTINELS[0].to_string();
+        config.auth_secret_key = SENTINELS[1].to_string();
 
         // The worst case for the operator: start-up reconciliation failed, so
         // the outcome is being published for a server that has something to
@@ -950,20 +767,6 @@ mod tests {
         }
     }
 
-    /// A valid override wins over the config value. An unset or unparsable
-    /// value falls back to the config value. The code clamps both ends to at
-    /// least one.
-    #[test]
-    fn the_connection_limit_override_falls_back_and_clamps() {
-        assert_eq!(connection_limit_from(None, 128), 128);
-        assert_eq!(connection_limit_from(Some("16"), 128), 16);
-        assert_eq!(connection_limit_from(Some(" 16 \n"), 128), 16);
-        assert_eq!(connection_limit_from(Some("many"), 128), 128);
-        assert_eq!(connection_limit_from(Some(""), 128), 128);
-        assert_eq!(connection_limit_from(Some("0"), 128), 1);
-        assert_eq!(connection_limit_from(None, 0), 1);
-    }
-
     /// The rejection is a complete HTTP/1.1 response with no body.
     ///
     /// A client must be able to parse it without a second read.
@@ -978,86 +781,27 @@ mod tests {
         );
     }
 
-    /// The default stays the human-readable renderer. Nothing about an
-    /// operator's existing output changes unless they ask for it.
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn the_log_format_defaults_to_text() {
-        assert_eq!(LogFormat::from_env(), LogFormat::Text);
-    }
-
-    /// `json` is the opt-in. It is the spelling an operator will guess. Case
-    /// and surrounding whitespace do not matter.
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn json_output_is_opt_in() {
-        for raw in ["json", "JSON", " JSON \n"] {
-            assert_eq!(LogFormat::parse(raw), Some(LogFormat::Json), "{raw}");
-        }
-    }
-
-    /// An unrecognised value degrades to the default. It does not degrade to a
-    /// process that logs nothing.
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn an_unknown_log_format_falls_back_to_text() {
-        for raw in ["yaml", "1", ""] {
-            assert_eq!(LogFormat::parse(raw), None, "{raw}");
-        }
-    }
-
-    /// The default stays free. No endpoint means export is off. The code never
-    /// builds an exporter, a batching thread, or a trace layer.
+    /// No endpoint means export is off. The code never builds an exporter, a
+    /// batching thread, or a trace layer.
     ///
-    /// This is the whole zero-cost argument. It is asserted on the decision
-    /// itself, not on any side effect. [`TraceExport::from_env`] is the only
-    /// thing that reads the environment. It returns nothing.
+    /// The graceful-exit path is reached with no provider at all. It is a
+    /// no-op rather than a panic.
     #[test]
     #[allow(clippy::expect_used)]
     fn trace_export_stays_off_without_a_configured_endpoint() {
-        assert_eq!(TraceExport::endpoint_from(None, None), None);
-        // A variable that is set to nothing is not a configuration either, and
-        // must not become an endpoint the exporter then chokes on.
-        assert_eq!(TraceExport::endpoint_from(Some(""), None), None);
-        assert_eq!(TraceExport::endpoint_from(Some("   \n"), None), None);
-        assert_eq!(TraceExport::endpoint_from(None, Some("")), None);
+        let mut config = sample_config();
+        config.otlp_endpoint = None;
+        assert_eq!(TraceExport::from_config(&config), None);
 
-        // The graceful-exit path is reached with no provider at all, and is a
-        // no-op rather than a panic. Neither half was ever built: the
-        // decision to build them lives in the `from_env` above.
+        // A blank value is not a configuration either, and must not become an
+        // endpoint the exporter then chokes on.
+        config.otlp_endpoint = Some("   \n".to_string());
+        assert_eq!(TraceExport::from_config(&config), None);
+
         let telemetry = Telemetry::default();
         assert!(!telemetry.trace_export());
         assert!(!telemetry.metrics_export());
         telemetry.flush();
-    }
-
-    /// The crate's own variable works standalone. The code honours the standard
-    /// one when it is the only one set. When both are set, the crate's own
-    /// spelling wins. An operator can override a cluster-wide default.
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn the_crates_own_endpoint_variable_takes_precedence() {
-        let own = "http://collector.internal:4318/v1/traces";
-        let standard = "http://otel-collector:4318/v1/traces";
-
-        assert_eq!(
-            TraceExport::endpoint_from(Some(own), Some(standard)),
-            Some(own.to_string())
-        );
-        assert_eq!(
-            TraceExport::endpoint_from(None, Some(standard)),
-            Some(standard.to_string())
-        );
-        // A blank value falls through instead of shadowing the one below it.
-        assert_eq!(
-            TraceExport::endpoint_from(Some("  "), Some(standard)),
-            Some(standard.to_string())
-        );
-        // Surrounding whitespace is an operator's editor, not a hostname.
-        assert_eq!(
-            TraceExport::endpoint_from(Some(" http://a/v1/traces \n"), None),
-            Some("http://a/v1/traces".to_string())
-        );
     }
 
     /// A configured endpoint is enough to build the pipeline. The code exports
@@ -1070,7 +814,7 @@ mod tests {
     fn a_configured_endpoint_initialises_the_pipeline() {
         let settings = TraceExport {
             endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
-            sample_ratio: DEFAULT_SAMPLE_RATIO,
+            sample_ratio: 1.0,
         };
 
         let provider = settings
@@ -1106,7 +850,7 @@ mod tests {
             // Port 1 on loopback: nothing listens there, and the connection is
             // refused immediately rather than left to time out.
             endpoint: "http://127.0.0.1:1/v1/traces".to_string(),
-            sample_ratio: DEFAULT_SAMPLE_RATIO,
+            sample_ratio: 1.0,
         };
 
         let provider = settings.build_pipeline().expect(
@@ -1128,7 +872,7 @@ mod tests {
     fn the_resource_carries_the_service_name_and_crate_version() {
         let resource = TraceExport {
             endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
-            sample_ratio: DEFAULT_SAMPLE_RATIO,
+            sample_ratio: 1.0,
         }
         .resource();
 
@@ -1145,32 +889,5 @@ mod tests {
             attributes.get("service.version").map(String::as_str),
             Some(env!("CARGO_PKG_VERSION"))
         );
-    }
-
-    /// The crate exports every trace unless the operator says otherwise. Every
-    /// spelling of "otherwise" that a shell would produce is accepted.
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn the_sample_ratio_defaults_to_every_trace() {
-        assert_eq!(DEFAULT_SAMPLE_RATIO, 1.0);
-
-        for (raw, expected) in [
-            ("1", Some(1.0)),
-            ("0.25", Some(0.25)),
-            (" 0.5 \n", Some(0.5)),
-            ("0", Some(0.0)),
-        ] {
-            assert_eq!(TraceExport::sample_ratio(raw), expected, "{raw}");
-        }
-    }
-
-    /// A ratio that cannot be used falls back to the documented default. It
-    /// says so. It does not panic. It does not quietly mean "export nothing".
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn an_unusable_sample_ratio_falls_back_to_the_default() {
-        for raw in ["", "  ", "half", "1.5", "-0.1", "NaN", "inf"] {
-            assert_eq!(TraceExport::sample_ratio(raw), None, "{raw}");
-        }
     }
 }
