@@ -1,0 +1,14 @@
+# Keep the build context small. The Dockerfile copies only the release binary,
+# and the release workflow puts that binary at the repository root.
+target/
+.git/
+.opencode/
+.tmp/
+reports/
+tests/
+benches/
+download/
+
+# Runtime state and secrets. The image needs neither.
+*.redb
+config.toml
