@@ -22,7 +22,7 @@ Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](htt
 
 ### Prerequisites
 
-- Rust stable (see `mise.toml`; CI uses `cargo test --locked --all-targets`)
+- Rust stable (see `mise.toml`; CI uses `cargo test --all-targets --all-features --locked`)
 - Telegram `api_id`, `api_hash`, `bot_token` from https://my.telegram.org, plus a `username` destination (chat/channel) where objects will be stored
 
 ### Configure
@@ -294,7 +294,7 @@ Blob ref-counting keeps shared slices (e.g. `UploadPartCopy` ranges, `CopyObject
 ## Development
 
 ```bash
-cargo test --locked --all-targets # 199 lib + 14 main + 36 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yaml`)
+cargo test --all-targets --all-features --locked # 199 lib + 14 main + 36 aws + 2 conditional + 3 presigned (per CI in `.github/workflows/ci.yml`)
 cargo test --test presigned -- --nocapture # presigned generation only (no endpoint)
 ```
 
