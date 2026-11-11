@@ -18,6 +18,16 @@ Built with [`s3s`](https://github.com/Nugine/s3s) (S3 service), [`grammers`](htt
 - **Buckets** — DNS-compliant name validation (`InvalidBucketName`), idempotent recreate of an owned bucket (200, no duplicate row), `DeleteBucket` rejected with `BucketNotEmpty` while multipart uploads are in flight
 - **Other** — conditional reads (`If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` with `412`/`304`), conditional writes (`PutObject` `If-Match`/`If-None-Match` incl. `*`, `CompleteMultipartUpload` `If-Match`, transactional CAS so concurrent versioned puts leave a single latest), `Content-MD5` validation, checksums (`crc32`/`crc32c`/`sha1`/`sha256` verified, `BadDigest`/`InvalidRequest` on mismatch, echoed on `Put`/`Get`/`Head`/`Copy`/`UploadPart`), user metadata (`x-amz-meta-*`), tagging (`Get/Put/DeleteObjectTagging`, plus `x-amz-tagging` header preserved on `Put`/`Copy`/`CreateMultipartUpload`/`Complete` with `TaggingDirective COPY`/`REPLACE`), delete-marker headers (`x-amz-delete-marker: true` on `GET`/`HEAD` of a marker), backend error mapping (`EntityTooLarge` on over-capacity writes, `InvalidRange` on out-of-range reads), ACL stubs, blob ref-counting for shared slices
 
+## Limits
+
+- **Maximum object size** — 2,097,152,000 bytes. That is 4000 parts of 512 KiB. A larger write returns `EntityTooLarge`.
+- **Chunk size** — the Telegram backend splits each write into 512 KiB chunks before upload.
+- **Plain HTTP** — the server speaks plain HTTP. It has no in-process TLS. Terminate TLS at a reverse proxy.
+- **ACL stubs** — the ACL operations return canned values and enforce nothing. Authentication is a single access-key/secret-key pair.
+- **One process per database** — the metadata and the Telegram session live in one redb file. Run one process for each database file.
+- **Start-up reconciliation** — it looks back at most 500 messages (`src/backend/grammers/mod.rs:87`). A publish older than that window may leave bytes in the Telegram chat. An operator must delete those bytes by hand.
+- **Copy source** — a copy from an access point or an outpost returns `NotImplemented` (`src/s3/objects.rs:442`, `src/s3/multipart.rs:590`).
+
 ## Quick Start
 
 ### Prerequisites
