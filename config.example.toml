@@ -8,3 +8,16 @@ database_path = "storage.redb"
 listen_port = 8000
 auth_access_key = "YOUR_ACCESS_KEY"
 auth_secret_key = "YOUR_SECRET_KEY"
+
+# Optional settings. The built-in default is shown.
+# Remove a line to use the default.
+max_concurrent_connections = 128
+telegram_max_concurrent_requests = 8
+telegram_io_timeout_secs = 120
+telegram_max_attempts = 8
+log_format = "text"
+log_filter = "tele_s3=info"
+
+# Trace export stays off until you set an endpoint.
+# otlp_endpoint = "http://collector:4318/v1/traces"
+# otlp_sample_ratio = 1.0

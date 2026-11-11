@@ -143,38 +143,94 @@ aws --endpoint-url $AWS_ENDPOINT_URL s3api delete-object --bucket my-bucket --ke
 
 ## Configuration Reference
 
-| Key | Description |
-|-----|-------------|
-| `api_id` / `api_hash` / `bot_token` | Telegram bot credentials (MTProto login) |
-| `username` | Storage destination: chat/channel/peer username objects are sent to |
-| `database_path` | Path to the redb metadata file, e.g. `storage.redb`. The code creates the file when it does not exist. An existing SQLite file is not read. |
-| `listen_port` | HTTP listen port |
-| `auth_access_key` / `auth_secret_key` | S3 `SimpleAuth` credentials (used for both header and presigned URL verification) |
+Every setting comes from one of three sources. The resolver checks them in this order:
 
-### Environment variables
+1. CLI flag.
+2. Environment variable.
+3. TOML value.
+4. Built-in default.
 
-The bounds on outbound Telegram I/O are **environment variables, not TOML keys**, so they can be set per container without editing `config.toml`. All three are optional; an unset or unparsable value falls back to the default and logs a warning. They are read once at start-up, so changing one takes effect on the next restart.
+A required setting must come from a source. Start-up fails when no source gives it. The error names the setting, its CLI flag, its environment variable, and its TOML key.
 
-| Variable | Default | What it bounds |
-|----------|---------|----------------|
-| `TELEGRAM_MAX_CONCURRENT_REQUESTS` | `8` | Telegram operations in flight at once, process-wide. The S3 layer fans out one backend call per blob, so this is what keeps a `DeleteObjects` or a multi-part `GET` from opening a burst at a single chat and tripping Telegram's rate limit. |
-| `TELEGRAM_IO_TIMEOUT_SECS` | `120` | Deadline for a single Telegram request, counted from the moment it holds a concurrency permit — time spent queueing behind other callers is not charged to it. Generous enough for one 512 KiB part on a slow link. |
-| `TELEGRAM_MAX_ATTEMPTS` | `8` | Attempts per retry loop, the first try included. Only Telegram's timed rate limits (`FLOOD_WAIT` and friends) are retried, and only after sleeping the window the server asked for. |
+`-c` or `--config` gives the TOML path. `TELE_S3_CONFIG` is the fallback. If neither source gives a path, the code skips the TOML layer. The code does not search for `config.toml`.
 
-Out-of-range values are clamped rather than rejected, so a bad setting degrades instead of failing at start-up: `TELEGRAM_MAX_CONCURRENT_REQUESTS` and `TELEGRAM_MAX_ATTEMPTS` have a floor of `1`, and `TELEGRAM_IO_TIMEOUT_SECS` a floor of `1`. The effective values are logged at start-up as `Telegram backend limits`.
+| Setting | TOML key | CLI flag | Environment variable | Default |
+|---|---|---|---|---|
+| Telegram API id | `api_id` | `--api-id` | `TELE_S3_API_ID` | required |
+| Telegram API hash | `api_hash` | `--api-hash` | `TELE_S3_API_HASH` | required |
+| Bot token | `bot_token` | `--bot-token` | `TELE_S3_BOT_TOKEN` | required |
+| Storage chat username | `username` | `--username` | `TELE_S3_USERNAME` | required |
+| redb metadata path | `database_path` | `--database-path` | `TELE_S3_DATABASE_PATH` | required |
+| Listen port | `listen_port` | `--listen-port` | `TELE_S3_LISTEN_PORT` | required |
+| S3 access key | `auth_access_key` | `--auth-access-key` | `TELE_S3_AUTH_ACCESS_KEY` | required |
+| S3 secret key | `auth_secret_key` | `--auth-secret-key` | `TELE_S3_AUTH_SECRET_KEY` | required |
+| Max inbound connections | `max_concurrent_connections` | `--max-concurrent-connections` | `TELE_S3_MAX_CONCURRENT_CONNECTIONS` | `128` |
+| Telegram max in-flight requests | `telegram_max_concurrent_requests` | `--telegram-max-concurrent-requests` | `TELEGRAM_MAX_CONCURRENT_REQUESTS` | `8` |
+| Telegram I/O timeout seconds | `telegram_io_timeout_secs` | `--telegram-io-timeout-secs` | `TELEGRAM_IO_TIMEOUT_SECS` | `120` |
+| Telegram max attempts | `telegram_max_attempts` | `--telegram-max-attempts` | `TELEGRAM_MAX_ATTEMPTS` | `8` |
+| Log format | `log_format` | `--log-format` | `TELE_S3_LOG_FORMAT` | `text` |
+| Log filter | `log_filter` | `--log-filter` | `RUST_LOG` | `tele_s3=info` |
+| OTLP endpoint | `otlp_endpoint` | `--otlp-endpoint` | `TELE_S3_OTLP_ENDPOINT` | unset, export off |
+| OTLP sample ratio | `otlp_sample_ratio` | `--otlp-sample-ratio` | `TELE_S3_OTLP_SAMPLE_RATIO` | `1.0` |
+
+A bad environment value is not fatal. The code logs a warning. The warning names the variable and falls through to the next source. A bad CLI value is a usage error. A bad TOML value stops start-up. A blank environment value counts as unset.
+
+`log_format` accepts `text` and `json`. The parser ignores case and surrounding whitespace.
+
+The code clamps `max_concurrent_connections` to `1..=Semaphore::MAX_PERMITS`. The code clamps the Telegram limits with `GrammersLimits::sanitized()`. The introspection endpoint publishes the effective values.
+
+`otlp_sample_ratio` must be finite and in `0.0..=1.0`. A blank `otlp_endpoint` means unset at every source.
+
+### Environment aliases
+
+The canonical names win when both names are set.
+
+| Setting | Canonical variable | Alias |
+|---|---|---|
+| Telegram max in-flight requests | `TELEGRAM_MAX_CONCURRENT_REQUESTS` | `TELE_S3_MAX_CONCURRENT_REQUESTS` |
+| Telegram I/O timeout seconds | `TELEGRAM_IO_TIMEOUT_SECS` | `TELE_S3_IO_TIMEOUT_SECS` |
+| Telegram max attempts | `TELEGRAM_MAX_ATTEMPTS` | `TELE_S3_MAX_ATTEMPTS` |
+| OTLP endpoint | `TELE_S3_OTLP_ENDPOINT` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+
+### Source examples
+
+A TOML file with every optional setting is in `config.example.toml`.
+
+CLI only:
 
 ```bash
-TELEGRAM_MAX_CONCURRENT_REQUESTS=2 TELEGRAM_IO_TIMEOUT_SECS=300 cargo run -- --config config.toml
+cargo run -- \
+  --api-id 1234567 \
+  --api-hash 344583e45741c457fe1862106095a5eb \
+  --bot-token '1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0' \
+  --username your_username \
+  --database-path storage.redb \
+  --listen-port 8000 \
+  --auth-access-key YOUR_ACCESS_KEY \
+  --auth-secret-key YOUR_SECRET_KEY
+```
+
+Environment only:
+
+```bash
+export TELE_S3_API_ID=1234567
+export TELE_S3_API_HASH=344583e45741c457fe1862106095a5eb
+export TELE_S3_BOT_TOKEN='1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0'
+export TELE_S3_USERNAME=your_username
+export TELE_S3_DATABASE_PATH=storage.redb
+export TELE_S3_LISTEN_PORT=8000
+export TELE_S3_AUTH_ACCESS_KEY=YOUR_ACCESS_KEY
+export TELE_S3_AUTH_SECRET_KEY=YOUR_SECRET_KEY
+cargo run
 ```
 
 ### Logging
 
-| Variable | Default | What it does |
-|----------|---------|--------------|
-| `RUST_LOG` | `tele_s3=info` | The usual `tracing-subscriber` filter. `RUST_LOG=tele_s3=debug` turns up the high-frequency internals — every uploaded part, every backend read, every retry after a Telegram rate limit. Anything the dependencies emit needs their targets named explicitly, e.g. `RUST_LOG=tele_s3=debug,s3s=info`. |
-| `TELE_S3_LOG_FORMAT` | `text` | `json` emits one JSON object per event instead of the human-readable rendering, for ingestion into a log pipeline. Any other value keeps `text`, so a typo degrades to the default rather than to a process that logs nothing. |
+The `log_filter` setting uses the usual `tracing-subscriber` filter syntax. `log_filter=tele_s3=debug` turns up the high-frequency internals: every uploaded part, every backend read, and every retry after a Telegram rate limit. Anything the dependencies emit needs their targets named explicitly, for example `log_filter=tele_s3=debug,s3s=info`.
 
-Every event this service emits carries its data as named fields rather than prose, so the same event can be counted and grouped downstream: `bucket`, `key`, `blob_id`, `publish_id`, `message_id`, `part_index`, `bytes`, `attempts`, `duration_ms`, `timeout_ms`, `error.type`, `error.message` and so on. The full vocabulary — every field name and what it means — is documented on `init_tracing` in `src/main.rs`, and it is the contract a log or tracing exporter binds to.
+`log_format=json` emits one JSON object per event. Use it for a log pipeline. Any other value from a CLI or TOML source stops start-up. Any other value from `TELE_S3_LOG_FORMAT` warns and falls through to the default `text`.
+
+Every event this service emits carries its data as named fields rather than prose. The same event can be counted and grouped downstream: `bucket`, `key`, `blob_id`, `publish_id`, `message_id`, `part_index`, `bytes`, `attempts`, `duration_ms`, `timeout_ms`, `error.type`, `error.message` and so on. The full vocabulary is documented on `init_tracing` in `src/main.rs`. It is the contract a log or tracing exporter binds to.
 
 ```bash
 TELE_S3_LOG_FORMAT=json RUST_LOG=tele_s3=debug cargo run -- --config config.toml
@@ -182,24 +238,18 @@ TELE_S3_LOG_FORMAT=json RUST_LOG=tele_s3=debug cargo run -- --config config.toml
 
 ### Trace export (OTLP)
 
-The same `tracing` spans that produce log lines are also exported as OTLP traces, so a collector can show a request as a tree rather than as unrelated lines. Export is **opt-in and off by default**: with no endpoint configured no exporter is built, no background thread is started, and the process runs exactly as it did before — a self-hosted deployment that never configures telemetry pays nothing for it.
-
-| Variable | Default | What it does |
-|----------|---------|--------------|
-| `TELE_S3_OTLP_ENDPOINT` | unset | Full OTLP traces endpoint, e.g. `http://collector:4318/v1/traces`. Setting it turns trace export on. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | The standard OpenTelemetry variable, honoured as a fallback so an operator who already points other services at a collector need not learn this crate's spelling. `TELE_S3_OTLP_ENDPOINT` wins when both are set. |
-| `TELE_S3_OTLP_SAMPLE_RATIO` | `1.0` | Fraction of traces to export, `0.0` to `1.0`. Applied to whole traces, so a span never joins a trace its parent was excluded from. Any value that is not a number in range falls back to `1.0` and logs `error.type=unparsable_telemetry_config`. |
+The same `tracing` spans that produce log lines are also exported as OTLP traces. A collector can show a request as a tree rather than as unrelated lines. Export is opt-in and off by default. With no endpoint, no exporter is built, no background thread starts, and the process runs as it did before.
 
 | Setting | Value |
-|---------|-------|
-| Protocol | OTLP over HTTP with protobuf-encoded payloads. gRPC is not compiled in: it would drag a tonic/prost server stack in for no benefit at this scale. |
-| Export | Batching. A span costs a queue send, and the exporter's own worker thread does the network work off the request path. |
-| Resource attributes | `service.name=tele-s3` and `service.version`, taken from the crate version so it cannot drift from the binary. |
-| Filtering | `RUST_LOG` governs both the log layer and the trace layer, so a `tele_s3=info` operator does not export the debug spans they asked not to see. |
-| Shutdown | On `SIGINT`/`SIGTERM` the queue is drained and the exporter shut down before the process exits, so in-flight spans are not lost. A flush that fails is logged with `error.type=telemetry_export` and otherwise ignored. |
-| Failure | Telemetry never takes the server down. An unreachable or slow collector, or an endpoint the exporter cannot even be built from, is logged and ignored; no request fails and nothing panics. |
+|---|---|
+| Protocol | OTLP over HTTP with protobuf-encoded payloads. gRPC is not compiled in. |
+| Export | Batching. A span costs a queue send. The exporter worker thread does the network work off the request path. |
+| Resource attributes | `service.name=tele-s3` and `service.version` from the crate version. |
+| Filtering | `log_filter` governs both the log layer and the trace layer. A `tele_s3=info` operator does not export the debug spans they asked not to see. |
+| Shutdown | On `SIGINT` or `SIGTERM` the queue drains and the exporter shuts down before exit. A failed flush is logged with `error.type=telemetry_export` and ignored. |
+| Failure | Telemetry never takes the server down. An unreachable collector or a bad endpoint is logged and ignored. |
 
-Whether export is on is published at `/.tele-s3/introspect` as `telemetry.trace_export`, as a boolean — the endpoint itself is operator infrastructure and this document is unauthenticated.
+Whether export is on is published at `/.tele-s3/introspect` as `telemetry.trace_export`. The value is a boolean. The endpoint itself is operator infrastructure and this document is unauthenticated.
 
 ```bash
 TELE_S3_OTLP_ENDPOINT=http://collector:4318/v1/traces cargo run -- --config config.toml
@@ -213,7 +263,7 @@ Three JSON endpoints share the S3 listener and are answered before any request r
 |------|---------|
 | `/.tele-s3/healthz` | Liveness: the process is alive and serving HTTP. Always `200`, derived from nothing — not Telegram, not the database. A rate-limited upstream must never make a healthy server look dead to its supervisor. |
 | `/.tele-s3/readyz` | Readiness: start-up finished, so S3 traffic is being served. Always `200`, with the outcome of both start-up reconcilers in the body. |
-| `/.tele-s3/introspect` | Introspection: the effective runtime state — the three Telegram knobs in force (after environment overrides and clamping), the listen port, the version, whether OTLP trace export is on, and what each reconciler did. |
+| `/.tele-s3/introspect` | Introspection: the effective runtime state — the three Telegram knobs in force (after configuration resolution and clamping), the listen port, the version, whether OTLP trace export is on, and what each reconciler did. |
 
 The `/.tele-s3` prefix is reserved deliberately: an S3 bucket name must begin and end with a lowercase letter or a digit, so `.tele-s3` can never be a bucket and these paths can never shadow `/{bucket}/{key}` (a bare `/healthz` would have been read as bucket `healthz`). Anything else under the prefix is a `404`.
 
