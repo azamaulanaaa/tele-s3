@@ -12,7 +12,10 @@
 //! Row values are JSON documents. Table keys are ordered, so prefix and range
 //! scans stay possible.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -256,6 +259,28 @@ pub(crate) enum Fault {
 struct Faults {
     flags: [AtomicBool; 5],
     fail_blob_insert: std::sync::Mutex<Option<String>>,
+}
+
+/// The file name of the SQLite database that releases before 0.8 used.
+const LEGACY_SQLITE_FILE_NAME: &str = "storage.db";
+
+/// Return the legacy SQLite database path that the service ignores.
+///
+/// The function returns `Some` only when `database_path` does not exist and
+/// `storage.db` exists in the same directory. It never opens or reads the
+/// legacy file.
+pub fn ignored_legacy_sqlite_path(database_path: impl AsRef<Path>) -> Option<PathBuf> {
+    let database_path = database_path.as_ref();
+    if database_path.exists() {
+        return None;
+    }
+
+    let legacy_path = database_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(LEGACY_SQLITE_FILE_NAME);
+
+    legacy_path.is_file().then_some(legacy_path)
 }
 
 /// The shared redb store.
@@ -588,5 +613,66 @@ mod test_support {
             }
             txn.commit().expect("commit");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "tele-s3-storage-legacy-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// The helper names the legacy file only when the redb file is absent.
+    #[test]
+    fn the_helper_returns_the_legacy_path_when_only_storage_db_exists() {
+        let dir = temp_dir();
+        let database_path = dir.join("storage.redb");
+        let legacy_path = dir.join("storage.db");
+        std::fs::write(&legacy_path, b"legacy").expect("write legacy database");
+
+        assert_eq!(
+            ignored_legacy_sqlite_path(&database_path),
+            Some(legacy_path)
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// An existing redb file means the service already migrated.
+    #[test]
+    fn the_helper_returns_none_when_the_redb_file_exists() {
+        let dir = temp_dir();
+        let database_path = dir.join("storage.redb");
+        std::fs::write(&database_path, b"redb").expect("write redb database");
+        std::fs::write(dir.join("storage.db"), b"legacy").expect("write legacy database");
+
+        assert_eq!(ignored_legacy_sqlite_path(&database_path), None);
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// No legacy file means there is nothing to warn about.
+    #[test]
+    fn the_helper_returns_none_when_no_legacy_file_exists() {
+        let dir = temp_dir();
+        let database_path = dir.join("storage.redb");
+
+        assert_eq!(ignored_legacy_sqlite_path(&database_path), None);
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 }
