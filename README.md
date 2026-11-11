@@ -63,14 +63,26 @@ cargo run -- --config config.toml
 
 ### Docker
 
-Prebuilt multi-arch images are published to `ghcr.io/azamaulanaaa/tele-s3` on each release (see `.github/workflows/release-container-image.yaml`, tags `<version>` and `latest`).
+Prebuilt multi-arch images are published to `ghcr.io/azamaulanaaa/tele-s3` on each release (see `.github/workflows/release-container-image.yaml`, tags `<version>` and `latest`). The image runs as the non-root user `nonroot` (UID/GID 65532).
 
-Local build:
+Local build. `.dockerignore` keeps `target/` out of the build context. Copy the built binary to the repository root before the build:
 
 ```bash
 cargo build --profile dist
-docker build -f .github/Dockerfile --build-arg BINARY_NAME=target/x86_64-unknown-linux-gnu/dist/tele-s3 -t tele-s3 .
-docker run -p 8000:8000 -v ./config.toml:/config.toml tele-s3 --config /config.toml
+cp target/dist/tele-s3 .
+docker build -f .github/Dockerfile --build-arg BINARY_NAME=tele-s3 -t tele-s3 .
+rm tele-s3
+```
+
+Run. The process needs a writable data directory for the redb store. The image uses `/data` as the working directory. Create a host directory owned by UID/GID 65532. Mount the config read-only and point `--database-path` into the data directory:
+
+```bash
+mkdir -p ./data
+sudo chown 65532:65532 ./data
+docker run -p 8000:8000 \
+  -v "$PWD/config.toml:/config.toml:ro" \
+  -v "$PWD/data:/data" \
+  tele-s3 --config /config.toml --database-path /data/storage.redb
 ```
 
 ## Usage
