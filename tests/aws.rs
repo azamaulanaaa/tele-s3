@@ -1072,7 +1072,7 @@ async fn test_list_objects_v2_with_start_after() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_create_multipart_upload() -> anyhow::Result<()> {
-    let config = config::<2, 1024>().await?;
+    let config = config::<6, { 1024 * 1024 }>().await?;
     let client = Client::new(&config);
 
     let bucket_name = "multipart-upload";
@@ -1109,7 +1109,8 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
     }
 
     let object_name = "test";
-    let objects_content = ["part1", "part2"];
+    // The first part is at the S3 minimum size. The last part can be short.
+    let objects_content = [vec![b'a'; 5 * 1024 * 1024], b"part2".to_vec()];
 
     let upload_id = {
         let res = client
@@ -1132,7 +1133,7 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
             .upload_id(&upload_id)
             .key(object_name)
             .part_number(part_number)
-            .body(ByteStream::from_static(content.as_bytes()))
+            .body(ByteStream::from(content.clone()))
             .send()
             .await
             .context("upload part")?;
@@ -1151,6 +1152,78 @@ async fn test_create_multipart_upload() -> anyhow::Result<()> {
         .send()
         .await
         .context("complete multipart upload")?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_complete_multipart_rejects_a_small_non_last_part() -> anyhow::Result<()> {
+    let config = config::<3, 1024>().await?;
+    let client = Client::new(&config);
+
+    let bucket_name = "multipart-part-too-small";
+
+    {
+        let location = BucketLocationConstraint::from(REGION);
+        let cfg = CreateBucketConfiguration::builder()
+            .location_constraint(location)
+            .build();
+
+        let _ = client
+            .create_bucket()
+            .create_bucket_configuration(cfg)
+            .bucket(bucket_name)
+            .send()
+            .await
+            .context("create bucket")?;
+    }
+
+    let upload_id = {
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket_name)
+            .key("test")
+            .send()
+            .await
+            .context("create multipart upload")?;
+
+        res.upload_id.context("missing upload id")?
+    };
+
+    for part_number in [1, 2] {
+        let _ = client
+            .upload_part()
+            .bucket(bucket_name)
+            .upload_id(&upload_id)
+            .key("test")
+            .part_number(part_number)
+            .body(ByteStream::from_static(b"x".as_slice()))
+            .send()
+            .await
+            .context("upload part")?;
+    }
+
+    let completed = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).build())
+        .parts(CompletedPart::builder().part_number(2).build())
+        .build();
+
+    let err = {
+        let res = client
+            .complete_multipart_upload()
+            .bucket(bucket_name)
+            .upload_id(upload_id)
+            .key("test")
+            .multipart_upload(completed)
+            .send()
+            .await;
+        res.err()
+    };
+
+    assert_eq!(
+        err.and_then(|e| e.code().map(std::borrow::ToOwned::to_owned)),
+        Some("EntityTooSmall".to_string())
+    );
 
     Ok(())
 }

@@ -30,6 +30,29 @@ use crate::backend::{
     Backend, ChainReaders, IntegrityDigests, IntegrityReader, ReaderWithHasher, new_publish_id,
 };
 
+/// The S3 minimum size for a multipart part.
+///
+/// S3 rejects every part below 5 MiB except the last part.
+const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Check the S3 minimum part size rule.
+///
+/// Every part except the part with the highest part number must be at least
+/// 5 MiB. A single short part is valid. A short last part is valid.
+fn validate_multipart_part_sizes(parts: &[(i32, u64)]) -> S3Result<()> {
+    let Some(last_part_number) = parts.iter().map(|(part_number, _)| *part_number).max() else {
+        return Ok(());
+    };
+
+    for (part_number, size) in parts {
+        if *part_number != last_part_number && *size < MIN_MULTIPART_PART_SIZE {
+            return Err(S3Error::new(S3ErrorCode::EntityTooSmall));
+        }
+    }
+
+    Ok(())
+}
+
 impl<B: Backend> TeleS3<B> {
     #[instrument(skip(self), err)]
     pub(crate) async fn create_multipart_upload_inner(
@@ -304,6 +327,19 @@ impl<B: Backend> TeleS3<B> {
             .map(|index| content.remove(index))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| S3Error::new(S3ErrorCode::InvalidPart))?;
+
+        // The precondition gate above runs first. A stale If-Match must fail
+        // as PreconditionFailed, not as EntityTooSmall.
+        let part_sizes: Vec<(i32, u64)> = requested_parts
+            .iter()
+            .copied()
+            .zip(
+                filtered_content
+                    .iter()
+                    .map(|part| part.metadata_items.iter().map(|item| item.size).sum()),
+            )
+            .collect();
+        validate_multipart_part_sizes(&part_sizes)?;
 
         let metadata_json = {
             let metadata_items = filtered_content
@@ -946,6 +982,39 @@ mod tests {
             bytes::Bytes::from_static(b"x"),
         ));
         req
+    }
+
+    #[test]
+    fn part_below_the_minimum_size_is_rejected() {
+        let parts = [
+            (1, MIN_MULTIPART_PART_SIZE - 1),
+            (2, MIN_MULTIPART_PART_SIZE),
+        ];
+
+        let err =
+            validate_multipart_part_sizes(&parts).expect_err("a short non-last part must fail");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooSmall);
+    }
+
+    #[test]
+    fn part_at_the_minimum_size_is_accepted() {
+        let parts = [(1, MIN_MULTIPART_PART_SIZE), (2, MIN_MULTIPART_PART_SIZE)];
+
+        validate_multipart_part_sizes(&parts).expect("a part at the minimum size must pass");
+    }
+
+    #[test]
+    fn a_short_last_part_is_accepted() {
+        let parts = [(1, MIN_MULTIPART_PART_SIZE), (2, 1)];
+
+        validate_multipart_part_sizes(&parts).expect("a short last part must pass");
+    }
+
+    #[test]
+    fn a_single_short_part_is_accepted() {
+        let parts = [(1, 1)];
+
+        validate_multipart_part_sizes(&parts).expect("a single short part must pass");
     }
 
     fn abort_upload_req(upload_id: &str) -> S3Request<AbortMultipartUploadInput> {
