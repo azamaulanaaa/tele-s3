@@ -314,4 +314,4 @@ The store is synchronous. Repository methods remain `async` and run redb work th
 
 ## License
 
-`LICENSE` (GPL-2.0 — the file in this repo is the GPLv2 text, and `Cargo.toml` uses `license-file = "LICENSE"`).
+This crate uses the GPL-2.0-only licence. `Cargo.toml` sets `license = "GPL-2.0-only"`. The `LICENSE` file contains the GPLv2 text.
