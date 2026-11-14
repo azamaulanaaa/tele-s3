@@ -7,7 +7,7 @@ SPDX-FileCopyrightText = "Copyright (C) 2025-2026 Aza Maulana"
 SPDX-License-Identifier = "GPL-2.0-only"
 
 [[annotations]]
-path = ["Cargo.toml", "Cargo.lock", "deny.toml", "mise.toml", "dist-workspace.toml", "README.md", "LICENSE", "BENCHMARKS.md", "config.example.toml", ".gitignore", ".clippy.toml", "rustfmt.toml", "REUSE.toml"]
+path = ["Cargo.toml", "Cargo.lock", "deny.toml", "mise.toml", "dist-workspace.toml", "README.md", "LICENSE", "BENCHMARKS.md", "CHANGELOG.md", "config.example.toml", ".gitignore", ".clippy.toml", "rustfmt.toml", "REUSE.toml"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Copyright (C) 2025-2026 Aza Maulana"
 SPDX-License-Identifier = "GPL-2.0-only"
