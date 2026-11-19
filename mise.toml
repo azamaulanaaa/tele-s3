@@ -1,101 +1,20 @@
-# Toolchain and task aliases, so every check is one word and the versions are
-# pinned in one place:
-#
-#   mise install     # fetch the tools below
-#   mise run check   # everything
-#
-# Tasks are named after the CI jobs that run the same check, so a failure in CI
-# is reproducible locally with `mise run <name>`.
+# mise installs local development dependencies only.
+# Git hooks and make do not use mise.
 
 [tools]
-rust = { version = "stable", components = "rust-analyzer" }
-# Coverage: llvm-cov instruments the test binary rather than sampling, so the
-# numbers are exact and reproducible. Pinned to the version CI installs.
-"cargo:cargo-llvm-cov" = "0.9.1"
-# Advisories, licences and duplicate-version checks over the resolved graph.
-# Pinned to the version CI installs.
-"cargo:cargo-deny" = "0.20.2"
-# Release artifacts: builds the platform archives and drives the release CI.
-# Pinned to the version CI installs.
-"cargo:cargo-dist" = "0.32.0"
-
-[tasks.build]
-run = "cargo build --all-targets --all-features"
-
-[tasks.test]
-run = [
-  "cargo test --all-targets --all-features --locked",
-  "cargo test --doc --locked",
-]
-
-[tasks.cov]
-run = "cargo llvm-cov --all-features --summary-only --locked"
-description = "Print a coverage summary for the test suite"
-
-[tasks.fmt]
-run = "cargo fmt --all --check"
-
-[tasks.clippy]
-run = "cargo clippy --all-targets --all-features --locked -- -D warnings"
-
-[tasks.lint]
-depends = ["fmt", "clippy"]
-
-[tasks.licenses]
-run = "cargo deny check licenses"
-description = "Every locked dependency's licence must be compatible with GPL-2.0-only"
-
-[tasks.advisories]
-run = "cargo deny check advisories"
-description = "Known vulnerabilities and yanked releases in the resolved graph"
-
-[tasks.bans]
-run = "cargo deny check bans"
-description = "Wildcard dependencies and duplicate versions"
-
-[tasks.deps]
-depends = ["licenses", "advisories", "bans"]
-
-[tasks.msrv]
-run = '''
-floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-echo "building against the declared floor: $floor"
-cargo "+$floor" check --all-targets --all-features --locked
-'''
-description = "Build against the declared minimum supported Rust version"
-
-[tasks.doc]
-run = "cargo doc --no-deps --all-features"
-env = { RUSTDOCFLAGS = "-D warnings" }
-
-[tasks.check]
-depends = ["lint", "test", "deps", "msrv", "doc", "dist-check"]
-description = "Run every check CI runs"
-
-[tasks.dist-plan]
-run = "dist plan"
-description = "List the artifacts a release would produce, without building"
-
-[tasks.dist-check]
-run = '''
-set -eu
-workflow=.github/workflows/release.yml
-
-if ! grep -q 'uses: ./.github/workflows/ci.yml' "$workflow"; then
-  echo "::error::$workflow no longer calls ci.yml; re-apply the 'checks' job"
-  exit 1
-fi
-
-if ! grep -A4 'build-local-artifacts:' "$workflow" | grep -q '^ *- checks$'; then
-  echo "::error::$workflow no longer waits for checks before building; re-apply it to build-local-artifacts needs"
-  exit 1
-fi
-
-echo "release workflow is gated on CI"
-dist plan --output-format=human > /dev/null
-'''
-description = "Check that the release plan resolves and the release workflow still gates on CI"
-
-[tasks.dist-build]
-run = "dist build --artifacts=local --target=\"$(rustc -vV | sed -n 's/^host: //p')\""
-description = "Build the release archive for this machine into target/distrib"
+cargo-deny = "0"
+cocogitto = "7"
+editorconfig-checker = "4"
+"github:reteps/dockerfmt" = "0"
+gitleaks = "8"
+hadolint = "2"
+jactionlint = "2"
+make = "4"
+# The npm tools need the Node.js runtime.
+node = "24"
+"npm:dclint" = "3"
+"npm:markdownlint-cli2" = "0"
+rust = "stable"
+shellcheck = "0"
+shfmt = "3"
+zizmor = "1"
