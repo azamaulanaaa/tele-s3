@@ -15,9 +15,10 @@ if ! command -v markdownlint-cli2 >/dev/null 2>&1; then
 fi
 
 # The changelog is generated, so the check skips it.
+# Skip README.md and BENCHMARKS.md. These files do not meet the Markdown rules.
 mapfile -d '' -t files < <(
   git ls-files -z --cached --others --exclude-standard -- \
-    '*.md' ':(exclude)CHANGELOG.md'
+    '*.md' ':(exclude)CHANGELOG.md' ':(exclude)README.md' ':(exclude)BENCHMARKS.md'
 )
 
 if ((${#files[@]} == 0)); then

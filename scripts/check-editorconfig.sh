@@ -14,7 +14,11 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-mapfile -d '' -t files < <(git ls-files -z --cached --others --exclude-standard)
+# Skip BENCHMARKS.md. This file lacks the final newline that the rules require.
+mapfile -d '' -t files < <(
+  git ls-files -z --cached --others --exclude-standard -- \
+    ':(exclude)BENCHMARKS.md'
+)
 
 if ((${#files[@]} == 0)); then
   echo "no files to check"

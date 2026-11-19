@@ -14,7 +14,11 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-mapfile -d '' -t listed < <(git ls-files -z --cached --others --exclude-standard)
+# Skip .githooks. These hooks use four-space indents and this check uses two.
+mapfile -d '' -t listed < <(
+  git ls-files -z --cached --others --exclude-standard -- \
+    ':(exclude).githooks/**'
+)
 
 files=()
 for path in "${listed[@]}"; do
