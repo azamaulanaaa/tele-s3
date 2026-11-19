@@ -7,6 +7,8 @@ on:
       - 'feature/**'
   pull_request:
   workflow_dispatch:
+  # Let release.yml gate publishing on these checks.
+  workflow_call:
   schedule:
     # Run every Monday at 03:00 UTC.
     - cron: '0 3 * * 1'
