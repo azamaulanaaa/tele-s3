@@ -105,6 +105,10 @@ ignore = [
     # executed. No upgrade is available in the 1.x aws-sdk-s3 line, and
     # pulling sigv4a out of s3s-aws would break the integration-test client.
     "RUSTSEC-2026-0387",
+    # RUSTSEC-2026-0543 (unmaintained): the chrono crate has no maintainer, and
+    # the advisory states that no safe upgrade exists. tele-s3 uses chrono as
+    # a direct dependency. grammers-client and s3s also depend on chrono.
+    "RUSTSEC-2026-0543",
 ]
 
 [sources]
