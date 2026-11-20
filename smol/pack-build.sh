@@ -9,7 +9,7 @@
 set -euo pipefail
 
 if [[ -n "${SMOLVM_ADDR:-}" ]]; then
-  echo "error: smolvm-pack does not run when SMOLVM_ADDR is set. Unset the variable to build a local pack." >&2
+  echo "error: smolvm-pack does not run when you set SMOLVM_ADDR. Unset the variable to build a local pack." >&2
   exit 1
 fi
 
@@ -84,7 +84,8 @@ fi
 
 mkdir -p "$pack_dir"
 
-build_name="smolvm-build-${hash:0:16}"
+owner="$(smolvm_resources_owner_token "$PWD")" || exit 1
+build_name="smolvm-build-${owner}-${hash:0:16}"
 smolfile_dir=""
 
 # Delete with --force --cascade, as the smolvm makefile does. Without
