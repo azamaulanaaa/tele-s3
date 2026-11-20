@@ -5,6 +5,12 @@
 /.cargo/registry
 /.cargo/git
 
+# Ignore the local smolvm cache.
+.cache/
+
+# smolvm runtime state. Created by any smolvm CLI call from this directory.
+.smolvm/
+
 # redb store files. `database_path` names one, and the default
 # `storage.redb` lives in the working directory. A test that opens the store
 # outside a temporary directory leaves one here, and `git add -A` will
