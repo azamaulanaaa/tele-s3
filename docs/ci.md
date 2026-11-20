@@ -43,7 +43,7 @@ and 512 MiB. Each value must be a positive integer. The local machine
 and the remote machine both use the values. The scripts stop when a
 value is not valid. See the [smolvm document](smolvm.md).
 
-Set `SMOLVM_SERVE_ADDR` to send the checks to a remote `smolvm serve`
+Set `SMOLVM_ADDR` to send the checks to a remote `smolvm serve`
 endpoint. `scripts/ci.sh` then calls `scripts/smolvm.sh`, which uses HTTP.
 The checks run in a machine on that server. The working tree is uploaded
 for each run with a portable copy of the git metadata. The client
@@ -55,7 +55,7 @@ boundary. A live run verified the API calls and remote exec. Remote mode
 starts from `SMOLVM_SERVE_IMAGE`, which defaults to `debian:stable-slim`.
 The `smol/init.sh` script installs the tools on every run. Remote mode
 uses no pack cache. `make smolvm-pack` refuses to run while
-`SMOLVM_SERVE_ADDR` is set. Unset the variable to build a local pack.
+`SMOLVM_ADDR` is set. Unset the variable to build a local pack.
 With a remote address, `make smolvm-clean` also deletes
 `smolvm-remote-*` machines on the server. The full check run is not
 verified over HTTP yet.
@@ -81,7 +81,7 @@ These commands and files form the pipeline:
 - `smol/pack-build.sh` builds the cached pack that the microVM runs
   from. `smol/init.sh` holds the provisioning steps for that build and
   for the remote run. `make smolvm-pack` calls the build script and
-  refuses to run with `SMOLVM_SERVE_ADDR` set. `make smolvm-clean`
+  refuses to run with `SMOLVM_ADDR` set. `make smolvm-clean`
   removes the cached packs and deletes dangling `smolvm-build-*` and
   `smolvm-run-*` machines. With a remote address it also deletes
   `smolvm-remote-*` machines on the server. `make smolvm-exec` runs one
@@ -120,7 +120,7 @@ optional. Run `make help` to list the available targets.
 `kern.hv_support=1` on macOS with Apple Silicon). Without them it
 prints a warning to stderr and runs the checks on the host. Set
 `SMOLVM_ENABLED=1` to require smolvm. The run then fails with exit
-code 3 instead of using the host. Set `SMOLVM_SERVE_ADDR` to use a
+code 3 instead of using the host. Set `SMOLVM_ADDR` to use a
 remote server instead. The remote path needs `curl` and `tar` on
 `PATH`. The [smolvm document](smolvm.md) lists the requirements.
 
