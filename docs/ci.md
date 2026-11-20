@@ -51,14 +51,24 @@ resolves a worktree pointer on the host before upload. The checks need
 the git history. The upload leaves out `.cache`, so no data comes from
 the local pack cache. No host fallback exists in that mode. The
 [smolvm document](smolvm.md) describes the remote flow and its security
-boundary. A live run verified the API calls and remote exec. Remote mode
-starts from `SMOLVM_SERVE_IMAGE`, which defaults to `debian:stable-slim`.
-The `smol/init.sh` script installs the tools on every run. Remote mode
-uses no pack cache. `make smolvm-pack` refuses to run while
-`SMOLVM_ADDR` is set. Unset the variable to build a local pack.
-With a remote address, `make smolvm-clean` also deletes
-`smolvm-remote-*` machines on the server. The full check run is not
-verified over HTTP yet.
+boundary.
+
+Remote mode starts from `SMOLVM_SERVE_IMAGE`, which defaults to
+`debian:stable-slim`. The `smol/init.sh` script installs the tools on
+every run. Remote mode uses no pack cache. `make smolvm-pack` refuses to
+run while `SMOLVM_ADDR` is set. Unset the variable to build a local
+pack.
+
+Each checkout gets an owner token. The token is the first 12 hex
+characters of the SHA-256 of the canonical checkout path. Resource names
+carry it: `smolvm-build-<owner>-<hash>`, `smolvm-run-<owner>-*`,
+`smolvm-remote-<owner>-*`, and `smolvm-ci-<owner>-<key>.qcow2`. With a
+remote address, `make smolvm-clean` deletes only resources with this
+owner token. It prints the plan and asks one time. `--dry-run` prints
+the plan only. `--yes`, `-y`, or `SMOLVM_CLEAN_ASSUME_YES=1` skips the
+prompt. A non-interactive run without a skip flag stops with an error.
+A moved checkout gets a new token, so its old resources become foreign
+and are reported, not deleted.
 
 `make hooks` sets the hook path and makes the hooks executable.
 `scripts/check-mise.sh` uses `mise` only to check `mise.toml`. It skips
@@ -81,11 +91,13 @@ These commands and files form the pipeline:
 - `smol/pack-build.sh` builds the cached pack that the microVM runs
   from. `smol/init.sh` holds the provisioning steps for that build and
   for the remote run. `make smolvm-pack` calls the build script and
-  refuses to run with `SMOLVM_ADDR` set. `make smolvm-clean`
-  removes the cached packs and deletes dangling `smolvm-build-*` and
-  `smolvm-run-*` machines. With a remote address it also deletes
-  `smolvm-remote-*` machines on the server. `make smolvm-exec` runs one
-  command inside the microVM.
+  refuses to run with `SMOLVM_ADDR` set. `make smolvm-clean` removes the
+  cached packs and deletes the dangling `smolvm-build-<owner>-*` and
+  `smolvm-run-<owner>-*` machines of this checkout. With a remote
+  address it also deletes the `smolvm-remote-<owner>-*` machines and
+  the `smolvm-ci-<owner>-<key>.qcow2` cache bases. The target prints
+  the plan and asks one time. `make smolvm-exec` runs one command
+  inside the microVM.
 - `scripts/format.sh` runs every `scripts/format-*.sh` in name order. It
   stops when a formatter fails.
 - `make format` runs `scripts/format.sh`.
@@ -418,6 +430,14 @@ A check script follows these rules:
 - Write short output. Print a result line. Print the tool output when a
   check fails.
 - Exit non-zero when a check fails.
+
+## Compatibility and limits
+
+Live remote runs verified the API calls and remote exec against
+`smolvm serve` v1.35.4 and v1.33.0. The full `make ci` run over HTTP is
+not verified yet. Live remote runs used `make smolvm-exec`, which uses
+the same remote flow with one guest command. Check the remote path on
+your server before you rely on it for a full check run.
 
 ## Troubleshooting
 
