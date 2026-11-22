@@ -13,7 +13,7 @@ SPDX-FileCopyrightText = "Copyright (C) 2025-2026 Aza Maulana"
 SPDX-License-Identifier = "GPL-2.0-only"
 
 [[annotations]]
-path = [".githooks/pre-commit", ".github/Dockerfile", ".github/actions/setup-rust/action.yml", ".github/workflows/ci.yml", ".github/workflows/release-container-image.yaml"]
+path = [".github/Dockerfile", ".github/jactionlint.yaml", ".github/workflows/ci.yml", ".github/workflows/release-container-image.yaml", "zizmor.yml"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Copyright (C) 2025-2026 Aza Maulana"
 SPDX-License-Identifier = "GPL-2.0-only"
