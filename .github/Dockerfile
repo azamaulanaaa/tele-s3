@@ -6,6 +6,6 @@ WORKDIR /data
 
 COPY --chown=nonroot:nonroot ${BINARY_NAME} /usr/local/bin/tele-s3
 
-USER nonroot:nonroot
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/tele-s3"]
