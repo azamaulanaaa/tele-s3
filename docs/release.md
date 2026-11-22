@@ -67,8 +67,10 @@ branch only. Run this command:
 make release
 ```
 
-The target runs `cog bump --auto` on the local machine. The command has
-three steps:
+The target runs `cog bump --auto` through `scripts/release.sh`. `--auto`
+is the default selector. A version flag replaces `--auto`. When smolvm is
+available, the bump runs in a writable guest clone. The command has three
+steps:
 
 1. It updates `CHANGELOG.md`.
 2. It creates a version commit.
@@ -88,8 +90,75 @@ event starts `.github/workflows/release-container-image.yaml`. That
 workflow publishes the container image for the tag. For a stable release,
 it also publishes the `latest` tag.
 
-The version bump runs on the local machine. The artifact build and the
-container publish run in CI on the tag and on the release.
+The version bump runs on the host or in the smolvm guest through
+`scripts/release.sh`. The artifact build and the container publish run in
+CI on the tag and on the release.
+
+## Sandbox release flow
+
+`scripts/release.sh` uses the same execution modes as the checks:
+
+- `SMOLVM_ENABLED=0` runs `cog bump --auto` on the host. The script
+  uses no sandbox.
+- `SMOLVM_ENABLED=1` requires smolvm. The script uses a local machine
+  or a remote server. When neither is available, it prints an error and
+  exits 3.
+- An unset value or any other value selects auto mode. The script uses
+  the remote server when `SMOLVM_ADDR` is set. It uses a local machine
+  when `smolvm` is on `PATH` and the accelerator works. Otherwise it
+  prints a warning and runs `cog bump --auto` on the host.
+
+Local mode needs a normal checkout, not a linked worktree. The
+repository mount must contain the git directory. Remote mode stages the
+git data and can use a linked worktree.
+
+In local mode, the script mounts the repository at `/workspace` with
+the `:ro` flag. The mount stays read-only. The guest runs
+`scripts/release-guest.sh`. That script does these steps:
+
+1. It clones `/workspace` with `git clone --no-hardlinks` to a
+    writable temp directory.
+2. It removes the `origin` remote.
+3. It checks out the host branch at the captured HEAD.
+4. It sets the hooks path, the user name, and the user email.
+5. It runs `cog bump` with the arguments from the host.
+
+The guest runs no second sandbox. The pre-commit hook runs
+`scripts/ci.sh` with `SMOLVM_ENABLED=0`, so the checks do not recurse.
+
+The guest builds a git bundle. The bundle holds the new version commit
+and the tag. The guest prints the bundle as base64 between two markers.
+The host reads the markers and removes them from the printed output.
+
+Before the host changes a ref, it checks these items:
+
+- The bundle verifies.
+- The bundle holds exactly one `v*` tag.
+- The tag does not exist on the host.
+- The commit has one parent, and the parent is the captured HEAD.
+- The commit adds one commit.
+- The commit changes only `CHANGELOG.md`.
+- The author and committer email match the host email.
+- The host HEAD, branch, and worktree still match the preflight state.
+
+The host fetches the tag from the bundle. It applies the commit with
+`git merge --ff-only`. It creates no merge commit. A failure after the
+fetch deletes the fetched tag. It resets the host to the captured HEAD
+only when the host is on the captured branch at the guest commit and
+the worktree is clean. Otherwise it leaves HEAD and the worktree alone.
+A user commit or a dirty file from the guest run stays.
+
+The tag stays local. Push it with `git push origin v1.2.3` when you
+want the GitHub Release workflow to run.
+
+A guest run that makes no commit prints `SMOLVM_RELEASE_NONE=1`. The
+host prints a short message and exits 0. This covers `--dry-run` and a
+history with no releasable commits.
+
+Remote mode uses `scripts/smolvm-serve.sh` and the `serve_run_remote`
+helper. It uses no new transport. The guest command has the same shape.
+The remote server needs `SMOLVM_OWNER` and a reachable address. See the
+[smolvm documentation](smolvm.md#remote-mode).
 
 ## Optional GitHub Release
 
@@ -122,18 +191,36 @@ cog bump --dry-run --auto
 The command prints the next version and changes nothing. It does not
 write the changelog, create a commit, or create a tag.
 
+Run the dry run through the release path to test the sandbox:
+
+```bash
+make release ARGS='--dry-run'
+```
+
+The guest makes no commit. It prints `SMOLVM_RELEASE_NONE=1`. The host
+prints a short message and exits 0. The host repository does not change.
+
 ## First release
 
 When the repository has no tag, select the first version before the
 first release. Run one of these commands:
 
 ```bash
-cog bump --version 1.0.0
-cog bump --version 0.1.0
+make release ARGS='--version 1.0.0'
+make release ARGS='--version 0.1.0'
 ```
 
 The maintainer decides the first version. Use `1.0.0` when the public
-interface is stable. Use `0.1.0` when the interface can change.
+interface is stable. Use `0.1.0` when the interface can change. The
+flags `--major`, `--minor`, and `--patch` also replace `--auto`.
+
+## Limits
+
+The release path passed a simulation with a fake `cog`. The remote
+release path ran on `smolvm serve` v1.35.5 with `SMOLVM_SERVE_CACHE=0`.
+The guest ran a cold init with real cocogitto 7.0.0. A live local
+`smolvm machine run` release has not run. The pack build and cache reuse
+path for a release is not tested.
 
 ## Troubleshooting
 
@@ -145,6 +232,9 @@ the tool is absent:
 ```text
 error: cog is not on PATH. Install cocogitto first.
 ```
+
+With `SMOLVM_ENABLED=1`, the release runs `cog` inside the sandbox. In
+remote mode, also set `SMOLVM_OWNER`.
 
 ### The commit check rejects a message
 
