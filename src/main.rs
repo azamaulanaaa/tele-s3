@@ -696,7 +696,7 @@ mod tests {
     #[allow(clippy::expect_used)]
     fn admin_endpoints_publish_no_config_credentials() {
         const SENTINELS: [&str; 5] = [
-            "AKIAEXAMPLEACCESSKEY",
+            "example-access-key-value",
             "s3cr3t-signing-key-value",
             "0123456789abcdef0123456789abcdef",
             "12345678:telegram-bot-token-value",
