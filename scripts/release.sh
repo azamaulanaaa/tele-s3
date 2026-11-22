@@ -298,8 +298,20 @@ validate_release() {
   fi
 
   mapfile -t changed < <(git diff-tree --no-commit-id --name-only -r "$commit")
-  if ((${#changed[@]} != 1)) || [[ "${changed[0]}" != "CHANGELOG.md" ]]; then
-    echo "error: the version commit must change only CHANGELOG.md." >&2
+  local path
+  local has_changelog=0
+  for path in "${changed[@]}"; do
+    case "$path" in
+    CHANGELOG.md) has_changelog=1 ;;
+    Cargo.toml | Cargo.lock) ;;
+    *)
+      echo "error: the version commit changed an unexpected path: ${path}" >&2
+      return 1
+      ;;
+    esac
+  done
+  if ((has_changelog == 0)); then
+    echo "error: the version commit must change CHANGELOG.md." >&2
     return 1
   fi
 
