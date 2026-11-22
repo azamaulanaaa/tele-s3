@@ -627,11 +627,17 @@ impl<B: Backend> TeleS3<B> {
         let metadata: Metadata =
             serde_json::from_value(model.content).map_err(S3Error::internal_error)?;
 
-        let (mut offset, mut remain_length) = if let Some(range) = req.input.range {
-            let r = range.check(u64::from(model.size))?;
-            (r.start, r.end - r.start)
+        let full_size = u64::from(model.size);
+        let (mut offset, mut remain_length, content_range) = if let Some(range) = req.input.range {
+            let r = range.check(full_size)?;
+            // `check` yields a half-open range. Content-Range uses an
+            // inclusive end, so subtract one from the exclusive end.
+            let first = r.start;
+            let last = r.end.saturating_sub(1);
+            let content_range = format!("bytes {first}-{last}/{full_size}");
+            (first, r.end - first, Some(content_range))
         } else {
-            (0, u64::from(model.size))
+            (0, full_size, None)
         };
 
         let content_length = remain_length;
@@ -685,8 +691,10 @@ impl<B: Backend> TeleS3<B> {
         };
 
         let res = S3Response::new(GetObjectOutput {
+            accept_ranges: Some("bytes".to_string()),
             content_type: model.content_type,
             content_length: Some(content_length as i64),
+            content_range,
             last_modified: Some(chrono_to_timestamp(model.last_modified)),
             e_tag: model.etag.map(ETag::Strong),
             metadata: object_metadata,
@@ -1336,6 +1344,8 @@ fn delete_key_error(key: String, version_id: Option<String>, err: &S3Error) -> E
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
     use super::*;
+    use futures::io::AsyncReadExt;
+
     use crate::backend::{BackendError, Memory};
     use crate::s3::TeleS3;
     use crate::storage::{Fault, PublishIntentRow, Store};
@@ -1488,6 +1498,110 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    /// A service with enough backend capacity for the ranged GET fixtures.
+    async fn ranged_get_service() -> TeleS3<Memory<8, 8>> {
+        let store = Store::in_memory().expect("store");
+        TeleS3::init(Memory::default(), store).await.expect("init")
+    }
+
+    /// Put a known object into a fresh bucket for the ranged GET tests.
+    async fn service_with_known_object(svc: &TeleS3<Memory<8, 8>>) {
+        svc.repo
+            .create_bucket("b".into(), None)
+            .await
+            .expect("create bucket");
+        svc.put_object_inner(put_body_req("b", "k", Some(10), b"0123456789".to_vec()))
+            .await
+            .expect("put object");
+    }
+
+    /// A ranged GET sets `content_range` and returns only the requested bytes.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn ranged_get_reports_content_range_and_sliced_body() {
+        let svc = ranged_get_service().await;
+        service_with_known_object(&svc).await;
+
+        let mut req = get_req("b", "k", None);
+        req.input.range = Some(s3s::dto::Range::Int {
+            first: 2,
+            last: Some(5),
+        });
+
+        let res = svc.get_object_inner(req).await.expect("ranged get");
+        assert_eq!(
+            res.output.content_range.as_deref(),
+            Some("bytes 2-5/10"),
+            "Content-Range must use an inclusive end and the full object size"
+        );
+        assert_eq!(
+            res.output.accept_ranges.as_deref(),
+            Some("bytes"),
+            "a ranged GET advertises byte ranges"
+        );
+        assert_eq!(
+            res.output.content_length,
+            Some(4),
+            "content length equals the four requested bytes"
+        );
+
+        let mut reader = res.output.body.expect("body").into_boxed_reader();
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("read body");
+        assert_eq!(body, b"2345", "the body holds only the requested bytes");
+    }
+
+    /// A GET without a Range header keeps the full body and no `content_range`.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn full_get_has_no_content_range_and_returns_full_body() {
+        let svc = ranged_get_service().await;
+        service_with_known_object(&svc).await;
+
+        let res = svc
+            .get_object_inner(get_req("b", "k", None))
+            .await
+            .expect("full get");
+        assert_eq!(
+            res.output.content_range, None,
+            "a GET without a Range has no content_range"
+        );
+        assert_eq!(
+            res.output.content_length,
+            Some(10),
+            "content length covers the full object"
+        );
+
+        let mut reader = res.output.body.expect("body").into_boxed_reader();
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("read body");
+        assert_eq!(body, b"0123456789", "the body holds the full object");
+    }
+
+    /// An unsatisfiable range still returns `InvalidRange`.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn unsatisfiable_range_returns_invalid_range() {
+        let svc = ranged_get_service().await;
+        service_with_known_object(&svc).await;
+
+        let mut req = get_req("b", "k", None);
+        req.input.range = Some(s3s::dto::Range::Int {
+            first: 10,
+            last: None,
+        });
+
+        let err = svc
+            .get_object_inner(req)
+            .await
+            .expect_err("range past the object size must fail");
+        assert_eq!(
+            *err.code(),
+            S3ErrorCode::InvalidRange,
+            "an unsatisfiable range returns InvalidRange"
+        );
     }
 
     fn head_req(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
