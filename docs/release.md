@@ -72,7 +72,7 @@ is the default selector. A version flag replaces `--auto`. When smolvm is
 available, the bump runs in a writable guest clone. The command has three
 steps:
 
-1. It updates `CHANGELOG.md`.
+1. It updates `CHANGELOG.md` and the crate version in `Cargo.toml` and `Cargo.lock`.
 2. It creates a version commit.
 3. It creates a tag with the `v` prefix.
 
@@ -137,7 +137,7 @@ Before the host changes a ref, it checks these items:
 - The tag does not exist on the host.
 - The commit has one parent, and the parent is the captured HEAD.
 - The commit adds one commit.
-- The commit changes only `CHANGELOG.md`.
+- The commit changes only `CHANGELOG.md`, `Cargo.toml`, and `Cargo.lock`.
 - The author and committer email match the host email.
 - The host HEAD, branch, and worktree still match the preflight state.
 
