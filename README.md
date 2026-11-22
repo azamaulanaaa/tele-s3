@@ -44,7 +44,7 @@ cp config.example.toml config.toml
 
 ```toml
 api_id = 1234567
-api_hash = "344583e45741c457fe1862106095a5eb"
+api_hash = "your_api_hash_here"
 bot_token = "1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0"
 # Destination chat/channel/peer objects are sent to (resolved via `resolve_username`, `send_message` to this peer).
 username = "your_storage_channel_username"
@@ -212,7 +212,7 @@ CLI only:
 ```bash
 cargo run -- \
   --api-id 1234567 \
-  --api-hash 344583e45741c457fe1862106095a5eb \
+  --api-hash your_api_hash_here \
   --bot-token '1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0' \
   --username your_username \
   --database-path storage.redb \
@@ -225,7 +225,7 @@ Environment only:
 
 ```bash
 export TELE_S3_API_ID=1234567
-export TELE_S3_API_HASH=344583e45741c457fe1862106095a5eb
+export TELE_S3_API_HASH=your_api_hash_here
 export TELE_S3_BOT_TOKEN='1234567890:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0'
 export TELE_S3_USERNAME=your_username
 export TELE_S3_DATABASE_PATH=storage.redb
@@ -289,13 +289,13 @@ curl -s localhost:8000/.tele-s3/introspect # {"status":"ok","version":"0.8.0","l
 
 ```
 Client (aws-cli/sdk, curl) -> hyper -> S3ServiceBuilder{ TeleS3<Grammers>, SimpleAuth } -> TeleS3 (S3 trait)
-                                                                                     |
-                                                                                     v
-                                                                           Repository (redb store)
-                                                                     buckets / objects (versioned) / blobs (ref-count) / multipart uploads
-                                                                                     |
-                                                                                     v
-                                                                               Backend (Grammers -> Telegram MTProto, Memory -> HashMap)
+                                                                                    |
+                                                                                    v
+                                                                          Repository (redb store)
+                                                                    buckets / objects (versioned) / blobs (ref-count) / multipart uploads
+                                                                                    |
+                                                                                    v
+                                                                              Backend (Grammers -> Telegram MTProto, Memory -> HashMap)
 ```
 
 (`tests/config.rs` additionally sets `SingleDomain("localhost:9000")` for virtual-hosted-style test URLs; the production server in `src/main.rs` is path-style.)
