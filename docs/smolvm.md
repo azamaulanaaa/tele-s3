@@ -204,6 +204,13 @@ database.
   `http://127.0.0.1:8080` or `https://host:8443`. Use a bare `host:port`
   value to get an `http://` prefix. Use a socket path such as
   `/run/smolvm.sock` or a `unix://` value for a Unix socket.
+- `SMOLVM_OWNER` sets the owner name for this repository. In local mode
+  the default is the first 12 hex characters of the SHA-256 of the
+  canonical checkout path. Remote mode requires this variable. An empty
+  value stops the command before any API call. The value uses lowercase
+  letters, digits, hyphen, and underscore. It starts with a letter or a
+  digit. It has at most 16 characters. Two repositories must use
+  different values. See [Clean the sandbox](#clean-the-sandbox).
 - `SMOLVM_SERVE_TOKEN` is optional. When set, every API call carries an
   `Authorization: Bearer` header. The scripts never print the token value.
 - `SMOLVM_SERVE_IMAGE` names the base image for the machine. The default
@@ -484,14 +491,17 @@ around the floor.
 Set `SMOLVM_SERVE_CACHE=1` to ask the server for a cache disk. The
 default is `1`. Set `0` to turn the feature off. The create body then
 gains `cacheDisk` with `mountPath` `/cache` and a base named
-`smolvm-ci-<owner>-<key>.qcow2`. The `<owner>` is the first 12 hex
-characters of the SHA-256 of the canonical checkout path. Two checkout
-paths get different tokens. The same path gives the same token on every
-run. The `<key>` is the same SHA-256 that the local pack cache uses. A
-change to `mise.toml`, one `smol/*.smolfile`, `smol/pack-build.sh`, or
-`smol/init.sh` names a new base. Base names are immutable on the
-server, so one repository state owns one base name. Another checkout
-has different names, so it cannot delete or overwrite this base.
+`smolvm-ci-<owner>-<key>.qcow2`. In local mode `<owner>` is the first 12
+hex characters of the SHA-256 of the canonical checkout path. Set
+`SMOLVM_OWNER` to use a name instead. Remote mode requires
+`SMOLVM_OWNER`. Set a different value for each repository so two
+repositories never share a base. The same owner and the same repository
+state name the same base. The `<key>` is the same
+SHA-256 that the local pack cache uses. A change to `mise.toml`, one
+`smol/*.smolfile`, `smol/pack-build.sh`, or `smol/init.sh` names a new
+base. Base names are immutable on the server, so one repository state
+owns one base name. A repository with another owner has different
+names, so it cannot delete or overwrite this base.
 
 The machine reads the base through its own copy-on-write layer mounted
 at `/cache`. `smol/init.sh` puts the apt archives, the mise download
@@ -548,13 +558,13 @@ Edit `mise.toml` or `smol/init.sh` for that.
 
 The clean step: `make smolvm-clean` deletes the cache bases it can
 name, `DELETE /api/v1/cache-bases/{base}`. The current names carry the
-owner token, so only this checkout's base for the current repository
-state and for the default resource values are known. The serve API has
-no list route for bases. A base of another checkout or another
-repository state is not derivable. Remove such a base by hand on the
-server after you check its owner. The seed base always stays. When the
-seed name matches a derivable name, the client prints one `note:` line
-and skips it. See [Compatibility and limits](#compatibility-and-limits).
+owner, so only this owner's base for the current repository state and
+for the default resource values are known. The serve API has no list
+route for bases. A base of another owner or another repository state is
+not derivable. Remove such a base by hand on the server after you check
+its owner. The seed base always stays. When the seed name matches a
+derivable name, the client prints one `note:` line and skips it. See
+[Compatibility and limits](#compatibility-and-limits).
 
 #### Local data upload
 
@@ -908,8 +918,14 @@ guide describes that pattern.
 `make smolvm-clean` removes the cache and the machines of this checkout.
 It builds the full plan first. Then it asks one time for confirmation.
 
-The owner token is the first 12 hex characters of the SHA-256 of the
-canonical checkout path. Every resource name carries it:
+In local mode the owner token is the first 12 hex characters of the
+SHA-256 of the canonical checkout path. Set `SMOLVM_OWNER` to use a
+name instead. Remote mode requires `SMOLVM_OWNER`. An empty value stops
+the command before any API call, and no local cache removal happens.
+The value uses lowercase letters, digits, hyphen, and underscore. It
+starts with a letter or a digit. It has at most 16 characters. Use one
+unique value for each repository. Every resource name carries the
+owner:
 
 - `smolvm-build-<owner>-<hash16>` for a local pack build machine.
 - `smolvm-run-<owner>-*` for the older run path.
@@ -917,8 +933,10 @@ canonical checkout path. Every resource name carries it:
 - `smolvm-ci-<owner>-<key>.qcow2` for a remote cache base.
 
 Two checkout paths get different tokens. The same path gives the same
-token on every run. A moved checkout gets a new token. Its old resources
-become foreign. The target reports them and does not delete them.
+token on every run. When `SMOLVM_OWNER` is unset, a moved checkout gets
+a new token. Its old resources become foreign. The target reports them
+and does not delete them. Two repositories must use different
+`SMOLVM_OWNER` values.
 
 The plan covers four groups:
 
@@ -930,10 +948,13 @@ The plan covers four groups:
     current repository state and for the default resource values.
 4. The `.cache/smolvm/` directory.
 
-The script prints one `plan_machine=`, `plan_remote_machine=`,
-`plan_cache_base=`, or `plan_cache=` line per planned item. It prints
-`kept=<N>` with the count of machines that stay. It prints one `note:`
-line for an untagged legacy machine and for a seed base that must stay.
+The script prints `owner=<value>` before the plan. It prints one
+`plan_machine=`, `plan_remote_machine=`, `plan_cache_base=`, or
+`plan_cache=` line per planned item. It prints `kept=<N>` with the count
+of machines that stay.
+It can print an informational `note:` line for a machine that does not
+match the owner and for a seed base that must stay. The note never
+changes the deletion plan.
 
 The options:
 
@@ -962,14 +983,13 @@ and a note that the local machine cleanup was skipped. Listing machines
 reads state. It does not boot a machine.
 
 The serve API lists no cache bases. A base of another repository state
-is not derivable even when it has the owner token. Remove such a base by
-hand on the server after you check its owner.
+is not derivable even when it has the owner. Remove such a base by hand
+on the server after you check its owner.
 
 The cleanup is idempotent. Run it as often as you want. A machine of
-another checkout stays, because its name has another owner token. An
-untagged legacy machine also stays. The target never adds a flag that
-deletes foreign or legacy resources. Remove such a resource by hand
-after you check its owner.
+another owner stays, because its name does not match. A legacy machine
+also stays. The target never adds a flag that deletes foreign or legacy
+resources. Remove such a resource by hand after you check its owner.
 
 ## Run a command in the sandbox
 
@@ -1021,6 +1041,41 @@ make smolvm-exec ARGS='touch /workspace/ISOLATION_PROBE'
 
 The last example fails. The mount is read-only.
 
+## Release in the sandbox
+
+`make release` runs `cog bump --auto` in the sandbox when smolvm is
+available. The bump needs a writable repository. The repository mount
+stays read-only. The guest clones `/workspace` to a writable temp
+directory. It runs the bump in the clone. It returns the changelog, one
+version commit, and the tag as a git bundle. The host validates the
+bundle and applies it.
+
+The guest removes the `origin` remote before the bump. The release
+cannot push or fetch. The pre-commit hook runs `scripts/ci.sh` in the
+clone. `SMOLVM_ENABLED=0` stops a second sandbox run.
+
+The host checks the bundle before it changes a ref. It checks the tag,
+the commit parent, the changed path, and the email. It applies the
+commit with `git merge --ff-only`. A failure deletes the fetched tag. It
+resets the host only when the host is on the captured branch at the
+guest commit with a clean worktree. A user commit or a dirty file stays.
+The tag stays local.
+
+Local mode needs a normal checkout, not a linked worktree. The
+repository mount must contain the git directory. Remote mode stages the
+git data and can use a linked worktree.
+
+Set `SMOLVM_ENABLED=0` to force the host path. Set
+`SMOLVM_ENABLED=1` to require smolvm. The run then exits 3 when no
+sandbox is available. Set `SMOLVM_ADDR` to use a remote server. See
+[SMOLVM_ENABLED](#smolvm_enabled) and [Remote mode](#remote-mode).
+
+A dry run changes nothing. Run:
+
+```bash
+make release ARGS='--dry-run'
+```
+
 ## Targets
 
 - `make ci` runs the checks. It uses a remote machine when
@@ -1045,6 +1100,12 @@ The last example fails. The mount is read-only.
   [Clean the sandbox](#clean-the-sandbox).
 - `make smolvm-exec` runs one command inside the sandbox. See
   [Run a command in the sandbox](#run-a-command-in-the-sandbox).
+- `make release` runs `cog bump --auto` in the sandbox when smolvm is
+  available. The repository mount stays read-only. The guest clones it
+  to a writable directory. The host applies the returned bundle. In auto
+  mode without a sandbox it prints a warning and runs the bump on the
+  host. With `SMOLVM_ENABLED=1` it exits 3 when no sandbox is available.
+  See [Release in the sandbox](#release-in-the-sandbox).
 - `make smolvm-preflight` probes the host and prints key=value
   lines. Exits 0 when ready, 1 when blocked.
 - `make smolvm-verify` verifies the isolation from inside the guest
@@ -1151,7 +1212,8 @@ propagation, and `smolvm-clean` ran on that host.
 Remote runs used `smolvm serve` v1.35.4 and v1.33.0. The session flow
 on v1.35.4 ran start, read, stdin, local-directory upload, and delete.
 The v1.33.0 server has no session routes. Those runs used the stream
-and buffered paths.
+and buffered paths. The remote release path ran on v1.35.5 with the
+cache disk off and a cold init.
 
 These paths are not verified:
 
@@ -1160,6 +1222,7 @@ These paths are not verified:
   publish. Each run paid full provisioning.
 - The full `make ci` run over HTTP. Live remote runs used
   `make smolvm-exec`.
+- The local release path. No live `smolvm machine run` release ran.
 - Remote cleanup of a real cache base.
 - The isolation check on a KVM host. `make smolvm-verify` has not
   printed `result=isolation_held` there.
