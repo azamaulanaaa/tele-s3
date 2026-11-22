@@ -102,7 +102,7 @@ format-dclint: ## Fix the Docker Compose files with dclint.
 
 hooks: ## Install the git hooks in .githook.
 	git config core.hooksPath .githook
-	chmod +x .githook/commit-msg .githook/pre-commit .githook/pre-push
+	chmod +x .githook/pre-commit .githook/pre-push
 
 release: ## Bump the version and update the changelog.
 	cog bump --auto
