@@ -101,16 +101,14 @@ These commands and files form the pipeline:
 - `scripts/format.sh` runs every `scripts/format-*.sh` in name order. It
   stops when a formatter fails.
 - `make format` runs `scripts/format.sh`.
-- `.githook/commit-msg` runs `cog verify` on the commit message. A bad
-  message stops the commit.
 - `.githook/pre-commit` runs `scripts/ci.sh` before each commit.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push.
 - `make hooks` sets `core.hooksPath` to `.githook`. It makes the hooks
   executable.
 
 The `pre-commit` and `pre-push` hooks call `scripts/ci.sh` directly.
-The `commit-msg` hook calls `cog verify`. No hook calls `mise`. If a
-required tool is missing from `PATH`, the hook fails.
+No hook calls `mise`. If a required tool is missing from `PATH`, the
+hook fails.
 
 `scripts/ci.sh` prints `run: <script>` before each check. It prints
 `all checks passed (N scripts)` after the last check. A failed check
@@ -388,8 +386,11 @@ on each run.
 One matrix job runs the ten check scripts. Each matrix entry sets the
 tool that its check needs. The matrix entry for `mise` installs no tool.
 
-The workflow has no release job. The release stays local. The
-[release workflow](release.md) describes the release steps.
+You run the version bump locally with `make release` (cog). On a tag
+push, `.github/workflows/release.yml` runs and calls `ci.yml` through
+`workflow_call`. The workflow then builds the cargo-dist artifacts and
+creates the GitHub Release. The [release workflow](release.md) describes
+the steps.
 
 ### Required status checks
 

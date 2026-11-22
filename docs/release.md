@@ -29,10 +29,8 @@ A `BREAKING CHANGE:` footer also marks a breaking change.
 
 ## Enforcement
 
-The repository enforces the commit format in three places:
+The repository enforces the commit format in two places:
 
-- `.githook/commit-msg` runs `cog verify --file` on the message before
-  Git creates the commit. A bad message stops the commit.
 - `scripts/check-commits.sh` runs `cog check` from `scripts/ci.sh`.
   `make ci` and both Git hooks run this script.
 - `.githook/pre-push` runs `scripts/ci.sh` before each push. A bad
@@ -69,36 +67,49 @@ branch only. Run this command:
 make release
 ```
 
-The target runs `cog bump --auto`. The command has three steps:
+The target runs `cog bump --auto` on the local machine. The command has
+three steps:
 
 1. It updates `CHANGELOG.md`.
 2. It creates a version commit.
 3. It creates a tag with the `v` prefix.
 
-No CI release job exists. The release runs on the local machine.
+Push `main` and then push the tag:
+
+```bash
+git push origin main
+git push origin v1.2.3
+```
+
+The tag starts `.github/workflows/release.yml`. The workflow runs the
+checks in `.github/workflows/ci.yml`, builds the cargo-dist artifacts,
+uploads them, and creates the GitHub Release. The `release: published`
+event starts `.github/workflows/release-container-image.yaml`. That
+workflow publishes the container image for the tag. For a stable release,
+it also publishes the `latest` tag.
+
+The version bump runs on the local machine. The artifact build and the
+container publish run in CI on the tag and on the release.
 
 ## Optional GitHub Release
 
-A GitHub Release is optional. The local `make release` flow stays the
-default. It updates the changelog, creates the version commit, and creates
-the tag. It does not create a GitHub Release.
-
-The workflow `.github/workflows/release.yml` creates the release. It runs
-only when you opt in. To opt in, push the version tag to GitHub. The tag
-must match `v*`, for example `v1.2.3`. Push the tag that `make release`
-created:
+The `make release` flow does not create a GitHub Release. The workflow
+`.github/workflows/release.yml` creates the release when you push the
+version tag. Push the tag that `make release` created:
 
 ```bash
 git push origin v1.2.3
 ```
 
-The workflow then creates a GitHub Release for that tag. It uses the
-changelog section for that version as the release notes. If the changelog
-has no section for the version, the workflow uses the tag name as the
-release title.
+The tag must match `v*`, for example `v1.2.3`. The workflow runs the
+`ci.yml` checks, builds the cargo-dist artifacts, uploads them, and
+creates a GitHub Release for that tag. The changelog gives the release
+notes. The `release: published` event then starts
+`.github/workflows/release-container-image.yaml`, which publishes the
+container image.
 
-To stay local, do not push the tag. The workflow does not run. No GitHub
-Release is created.
+To keep the tag local, do not push it. The workflow does not run. No
+GitHub Release is created and no container image is published.
 
 ## Dry run
 
@@ -113,8 +124,8 @@ write the changelog, create a commit, or create a tag.
 
 ## First release
 
-The repository has no tag. Select the first version before the first
-release. Run one of these commands:
+When the repository has no tag, select the first version before the
+first release. Run one of these commands:
 
 ```bash
 cog bump --version 1.0.0
@@ -135,16 +146,25 @@ the tool is absent:
 error: cog is not on PATH. Install cocogitto first.
 ```
 
-### The commit hook rejects a message
+### The commit check rejects a message
 
-The commit hook runs `cog verify`. Read the error. Write the message in
-the commit format. Run this command to correct the last commit:
+`scripts/ci.sh` runs `scripts/check-commits.sh`. That script runs
+`cog check`. The `make ci` command and the `pre-commit` and `pre-push`
+hooks run `scripts/ci.sh`. A bad message fails the check.
+
+To correct the last commit, run this command:
 
 ```bash
 git commit --amend
 ```
 
-Do not use `--no-verify`.
+To correct an older commit, use an interactive rebase:
+
+```bash
+git rebase -i HEAD~<n>
+```
+
+Then run `make ci` again. Do not use `--no-verify`.
 
 ### The Markdown check skips `CHANGELOG.md`
 
