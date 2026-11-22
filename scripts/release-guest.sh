@@ -80,6 +80,13 @@ if ! command -v base64 >/dev/null 2>&1; then
   echo "error: base64 is not on PATH in the guest. Install coreutils first." >&2
   exit 1
 fi
+# The upload keeps the host ownership. Trust the source in this guest only.
+if ! git config --global --add safe.directory /workspace ||
+  ! git config --global --add safe.directory /workspace/.git; then
+  echo "error: git cannot trust /workspace." >&2
+  exit 1
+fi
+
 if ! git -C /workspace rev-parse --git-dir >/dev/null 2>&1; then
   echo "error: /workspace is not a git repository." >&2
   exit 1
